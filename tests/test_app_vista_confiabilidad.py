@@ -132,6 +132,17 @@ def test_las_limitaciones_empiezan_por_el_inventario_inicial_y_la_demanda_atendi
     assert lineas[0].startswith("El resultado depende del inventario inicial supuesto")
     assert "demanda atendida" in lineas[1]
     assert sum("demanda atendida" in linea for linea in lineas) == 1  # no se repite la del reporte
+    # La tercera: muchos traslados pequeños, con las medianas de validación (regla histórica).
+    rec = datos.recomendaciones()
+    rec = rec[(rec["politica"] == "historical") & (rec["bicis"] != 0)]
+    tipica = datos.visitas_tipicas()
+    assert tipica["estaciones"] == rec.groupby(["fecha", "franja"]).size().median()
+    assert tipica["bicis"] == rec["bicis"].abs().median()
+    assert lineas[2].startswith("La simulación no limita camiones ni visitas, así que reparte muchos traslados")
+    assert f"una ronda típica visita {datos.cifra(tipica['estaciones'])} estaci" in lineas[2]
+    assert f"con una mediana de {datos.cifra(tipica['bicis'])} bici" in lineas[2]
+    assert lineas[2].endswith("Un operador priorizaría las de mayor movimiento.")
+    lineas = lineas[:2] + lineas[3:]
     ind = datos.indicadores()
     if ind.get("limitaciones"):
         assert len(lineas) == 6

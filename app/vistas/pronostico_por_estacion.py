@@ -92,22 +92,23 @@ def grafica(modelo: pd.DataFrame, promedio: pd.DataFrame, titulo_y: str) -> alt.
 
 
 def tarjeta(fila: pd.Series, riesgo_sin_mover, ronda: dict | None = None) -> None:
-    """Lo que hizo una política en una franja: la acción en grande y, en un renglón, los niveles de riesgo.
+    """Lo que hizo una política en una franja: la acción en grande y UN renglón de riesgo.
 
-    El nivel de la tabla es el previsto con el inventario ANTES del traslado de esa política (no el que
-    queda después): por eso se escribe "Riesgo previsto" y no "Riesgo tras el traslado".
+    El renglón es el nivel de esa estación, día y franja en la simulación sin intervención: el riesgo
+    que el traslado busca evitar. No se escribe el nivel de la política (es el previsto ANTES de su
+    traslado, no el que queda después): dos niveles iguales se leían como si mover no sirviera.
     """
-    nivel = fila["nivel_riesgo"]
+    nivel = fila["nivel_riesgo"]  # el de la política: solo decide la nota del presupuesto
     with st.container(border=True):
         st.caption(f"{datos.etiqueta(datos.FRANJAS, fila['franja'])} · "
                    f"{datos.hora(fila['hora_inicio'])} a {datos.hora(fila['hora_fin'])}")
         st.markdown(f"### {datos.accion(fila['bicis'], fila['hora_inicio'], ronda)}")
-        fondo = datos.COLORES_RIESGO.get(nivel, "#8A8F98")
-        letra = COLOR_TEXTO_RIESGO.get(nivel, "#FFFFFF")
+        fondo = datos.COLORES_RIESGO.get(riesgo_sin_mover, "#8A8F98")
+        letra = COLOR_TEXTO_RIESGO.get(riesgo_sin_mover, "#FFFFFF")
         st.markdown(
             f'<span style="background:{fondo};color:{letra};padding:3px 12px;border-radius:12px;'
-            f'font-weight:600">Riesgo previsto: {datos.etiqueta(datos.RIESGOS, nivel).lower()}.</span> '
-            f"Sin intervenir: {datos.etiqueta(datos.RIESGOS, riesgo_sin_mover).lower()}",
+            f'font-weight:600">Riesgo previsto si no se interviene: '
+            f"{datos.etiqueta(datos.RIESGOS, riesgo_sin_mover).lower()}</span>",
             unsafe_allow_html=True)
         st.markdown(f"En la estación: **{datos.inventario(fila['inventario_antes'], fila['inventario'])}**")
         if not datos._falta(fila["factible"]) and not bool(fila["factible"]):
@@ -233,7 +234,6 @@ else:
                 tarjeta(fila, sin_mover.get(fila["franja"]), rondas.get(fila["franja"]))
     datos.como_se_calculo([
         f"Presupuesto de referencia: {datos.num(presupuesto)} bicis al día en todo el sistema.",
-        "El riesgo previsto es el nivel de riesgo simulado con las bicis que hay en la estación antes del "
-        "traslado de esa franja, siguiendo la política elegida; no es el nivel que queda después de moverlas.",
-        f"«{datos.POLITICAS['none']}» es el mismo nivel en la simulación en la que no se mueve ninguna bici.",
+        "El riesgo previsto si no se interviene es el nivel de riesgo simulado de esa estación, ese día y esa "
+        "franja en la simulación en la que no se mueve ninguna bici; no es el nivel que queda después del traslado.",
     ])

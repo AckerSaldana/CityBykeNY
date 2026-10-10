@@ -128,6 +128,10 @@ prueba anteriores.
 - La distancia entre estaciones es en línea recta: ignora ríos y puentes.
 - Los traslados son instantáneos y no hay camiones: no se modela su número,
   su capacidad ni su ruta. El único límite es el presupuesto de bicis.
+- La simulación no limita camiones ni visitas, así que reparte muchos
+  traslados pequeños: en validación, con la regla histórica y el presupuesto
+  de referencia, una ronda típica visita 853 estaciones, con una mediana de
+  2 bicis por visita. Un operador priorizaría las de mayor movimiento.
 - Los días no son independientes (el inventario pasa de un día al siguiente y
   son 13 y 14 días): los intervalos son indicativos.
 - El inventario inicial es un supuesto: sale de una captura de GBFS de octubre

@@ -15,7 +15,7 @@ import datos  # app/datos.py: el único archivo que sabe dónde están los datos
 
 POLITICAS_CON_TRASLADO = ("historical", "model")  # la primera es la que se muestra al abrir
 ORDEN_RIESGO = {"alto": 0, "medio": 1, "bajo": 2}
-FILAS_VISIBLES = 200  # la tabla muestra las primeras; debajo se dice cuántas más hay
+FILAS_VISIBLES = 25  # al abrir, las de más bicis movidas; un control deja ver todas
 ZOOM = 10.8  # el mismo acercamiento del mapa de demanda
 ACCIONES = {"llevar": ("Llevar", datos.COLOR_LLEVAR, "se llevan bicis a la estación"),
             "retirar": ("Retirar", datos.COLOR_RETIRAR, "se retiran bicis de la estación")}
@@ -149,7 +149,7 @@ plan = rec[(rec["dia"] == dia) & (rec["franja"] == franja) & (rec["politica"] ==
 plan = plan.merge(datos.estaciones()[["estacion_id", "nombre", "tipo", "lat", "lon"]], on="estacion_id", how="left")
 plan = (plan.assign(_riesgo=plan["nivel_riesgo"].map(ORDEN_RIESGO).fillna(len(ORDEN_RIESGO)),
                     _movidas=plan["bicis"].abs())
-        .sort_values(["_riesgo", "_movidas", "nombre"], ascending=[True, False, True]).reset_index(drop=True))
+        .sort_values(["_movidas", "_riesgo", "nombre"], ascending=[False, True, True]).reset_index(drop=True))
 
 # --------------------------------------------------------------------------- #
 # Titular e indicadores
@@ -182,7 +182,10 @@ st.markdown(f"Resultado de la simulación con el presupuesto de referencia ({dat
 # --------------------------------------------------------------------------- #
 
 st.subheader("Estaciones a visitar")
-visibles = plan.head(FILAS_VISIBLES)
+st.markdown(datos.traslados_pequenos(
+    f"{datos.num(n)} {'estación' if n == 1 else 'estaciones'} en esta ronda", datos.mediana_de_bicis(plan)))
+todas = n > FILAS_VISIBLES and st.toggle("Ver todas las estaciones", key="plan_todas")
+visibles = plan if todas or n <= FILAS_VISIBLES else plan.head(FILAS_VISIBLES)
 tabla = pd.DataFrame({
     "Estación": visibles["nombre"].map(datos.texto),
     "Tipo": visibles["tipo"].map(lambda t: datos.etiqueta(datos.TIPOS_ESTACION, t)),
@@ -192,10 +195,10 @@ tabla = pd.DataFrame({
     "Riesgo simulado": visibles["nivel_riesgo"].map(lambda r: datos.etiqueta(datos.RIESGOS, r)),
 })
 st.dataframe(tabla, hide_index=True, width="stretch", height=460)
-orden = "Ordenadas por riesgo simulado (alto primero) y luego por bicis movidas."
-if n > FILAS_VISIBLES:
-    resto = n - FILAS_VISIBLES
-    orden += (f" Se muestran las primeras {datos.num(FILAS_VISIBLES)}; hay {datos.num(resto)} "
+orden = "Ordenadas por bicis movidas (de más a menos) y, con las mismas bicis, por riesgo simulado (alto primero)."
+if len(visibles) < n:
+    resto = n - len(visibles)
+    orden += (f" Se muestran las {datos.num(len(visibles))} con más bicis movidas; hay {datos.num(resto)} "
               f"{'estación' if resto == 1 else 'estaciones'} más.")
 st.caption(orden)
 

@@ -149,9 +149,12 @@ def test_abre_con_selectores_grafica_y_acciones(datos):
         sin_errores(at)
         del_dia = rec[(rec["fecha"] == dia_simulado(datos, estacion_id)) & (rec["politica"] == clave)]
         assert len(ACCION.findall(textos(at))) == len(del_dia) > 0
-        # Un renglón por tarjeta: el nivel previsto con esa política (antes del traslado) y sin intervenir.
-        assert textos(at).count("Riesgo previsto:") == len(del_dia)
-        assert textos(at).count("Sin intervenir:") == len(del_dia)
+        # UN renglón de riesgo por tarjeta: el nivel de la simulación sin intervención.
+        assert textos(at).count("Riesgo previsto") == len(del_dia)
+        assert "Riesgo previsto:" not in textos(at) and "Sin intervenir:" not in textos(at)
+        sin_mover = rec[(rec["fecha"] == dia_simulado(datos, estacion_id)) & (rec["politica"] == "none")]
+        for nivel, veces in sin_mover["nivel_riesgo"].map(datos.RIESGOS).str.lower().value_counts().items():
+            assert textos(at).count(f"Riesgo previsto si no se interviene: {nivel}<") == veces
         for fila in del_dia.itertuples():  # "13 bicis antes, 2 después"
             assert datos.inventario(fila.inventario_antes, fila.inventario) in textos(at)
 

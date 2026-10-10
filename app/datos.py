@@ -451,12 +451,14 @@ def sensibilidad() -> pd.DataFrame:
 DEMANDA_ATENDIDA = "Los datos solo registran demanda atendida."
 
 
-def limitaciones(n: int = 6) -> list[str]:
+def limitaciones(n: int = 7) -> list[str]:
     """Hasta `n` limitaciones de la simulación (vacía si no hubo simulación).
 
     Las dos primeras van siempre: el resultado depende del inventario inicial
     supuesto (con el rango que reportó la simulación, si lo hay) y los datos solo
-    registran demanda atendida. Después, las que escribió la simulación.
+    registran demanda atendida. La tercera, si hay traslados simulados, dice que
+    la simulación reparte muchos traslados pequeños. Después, las que escribió
+    la simulación.
     """
     ind = indicadores()
     reporte = [str(x) for x in ind.get("limitaciones") or []]
@@ -469,7 +471,15 @@ def limitaciones(n: int = 6) -> list[str]:
                     f"{rango_pct(rango['pct_min'], rango['pct_max'])} según el supuesto")
     atendida = next((x for x in reporte if "demanda atendida" in x.lower()), DEMANDA_ATENDIDA)
     resto = [x for x in reporte if x != atendida and "inventario inicial" not in x.lower()]
-    return ([inicial + ".", atendida] + resto)[:n]
+    pequenos = []
+    if n > 2:  # tercera: muchos traslados pequeños, con las cifras típicas de validación
+        tipica = visitas_tipicas()
+        if not _falta(tipica["estaciones"]):
+            una = float(tipica["estaciones"]) == 1
+            pequenos = [traslados_pequenos(
+                f"con la {POLITICAS['historical'].lower()}, una ronda típica visita "
+                f"{cifra(tipica['estaciones'])} {'estación' if una else 'estaciones'}", tipica["bicis"])]
+    return ([inicial + ".", atendida] + [x for x in pequenos if x] + resto)[:n]
 
 
 # Las filas de la comparación de Inicio, en orden: clave del archivo, texto en pantalla y unidad
@@ -793,3 +803,39 @@ def recomendaciones() -> pd.DataFrame:
     """Lo que hizo cada política en TODAS las estaciones, con el presupuesto de referencia
     (la usa "Plan de la ronda"). Las mismas columnas que `recomendaciones_estacion()`."""
     return _leer("recomendaciones")
+
+
+def cifra(x) -> str:
+    """Una mediana en pantalla: entera si lo es ("2"), con un decimal si no ("2.5")."""
+    if _falta(x):
+        return SIN_DATO
+    return num(x, 0 if float(x) == round(float(x)) else 1)
+
+
+def mediana_de_bicis(visitas: pd.DataFrame):
+    """Mediana de bicis movidas por visita (llevar o retirar), o None si no hay visitas."""
+    movidas = visitas["bicis"].dropna().abs()
+    movidas = movidas[movidas > 0]
+    return None if movidas.empty else float(movidas.median())
+
+
+def visitas_tipicas(politica: str = "historical") -> dict:
+    """Con una política, en todos los días y rondas de validación (presupuesto de referencia):
+    {"estaciones": mediana de estaciones visitadas por ronda, "bicis": mediana de bicis por visita}.
+    Los dos valores son None si la simulación no movió bicis."""
+    rec = recomendaciones()
+    rec = rec[(rec["politica"] == politica) & rec["fecha"].notna() & rec["bicis"].notna() & (rec["bicis"] != 0)]
+    if rec.empty:
+        return {"estaciones": None, "bicis": None}
+    por_ronda = rec.groupby([pd.to_datetime(rec["fecha"]).dt.normalize(), "franja"]).size()
+    return {"estaciones": float(por_ronda.median()), "bicis": mediana_de_bicis(rec)}
+
+
+def traslados_pequenos(cuantas: str, bicis) -> str:
+    """La frase de los muchos traslados pequeños. `cuantas` dice cuántas estaciones se visitan
+    ("853 estaciones en esta ronda"); `bicis` es la mediana por visita. Vacía si falta la mediana."""
+    if _falta(bicis):
+        return ""
+    return ("La simulación no limita camiones ni visitas, así que reparte muchos traslados pequeños: "
+            f"{cuantas}, con una mediana de {cifra(bicis)} {'bici' if float(bicis) == 1 else 'bicis'} por visita. "
+            "Un operador priorizaría las de mayor movimiento.")

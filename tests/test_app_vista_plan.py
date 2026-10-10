@@ -111,22 +111,31 @@ def revisar_contenido(at: AppTest) -> None:
     assert len(at.dataframe) == 1
     tabla = at.dataframe[0].value
     assert list(tabla.columns) == COLUMNAS
-    assert len(tabla) == min(n, 200)
+    todas = bool(at.toggle) and at.toggle[0].value
+    assert len(at.toggle) == (1 if n > 25 else 0)  # el control solo sale si hay más de 25
+    assert len(tabla) == (n if todas else min(n, 25))
     assert tabla["Acción"].str.fullmatch(r"(Llevar|Retirar) [\d,]+").all()  # solo estaciones con traslado
     assert set(tabla["Riesgo simulado"]) <= {"Alto", "Medio", "Bajo"}
-    # Riesgo alto primero y, dentro de cada nivel, de más a menos bicis movidas.
+    # De más a menos bicis movidas y, con las mismas bicis, riesgo alto primero.
     orden = tabla["Riesgo simulado"].map({"Alto": 0, "Medio": 1, "Bajo": 2})
-    assert orden.is_monotonic_increasing
     movidas = tabla["Acción"].str.split().str[1].map(entero)
-    for _, grupo in movidas.groupby(orden):
-        assert grupo.is_monotonic_decreasing
-    if n <= 200:  # la tabla está completa: sus sumas son los indicadores
+    assert movidas.is_monotonic_decreasing
+    for _, grupo in orden.groupby(movidas):
+        assert grupo.is_monotonic_increasing
+    if len(tabla) == n:  # la tabla está completa: sus sumas son los indicadores
         assert movidas[tabla["Acción"].str.startswith("Llevar")].sum() == llevar
         assert movidas[tabla["Acción"].str.startswith("Retirar")].sum() == retirar
         assert not any("más." in c.value for c in at.caption)
     else:
-        assert any(f"hay {n - 200:,} estaciones más" in c.value or f"hay {n - 200:,} estación más" in c.value
+        assert any(f"hay {n - 25:,} estaciones más" in c.value or f"hay {n - 25:,} estación más" in c.value
                    for c in at.caption)
+
+    # La línea de los traslados pequeños lleva las estaciones de la ronda y una mediana de bicis por visita.
+    linea = next(m.value for m in at.markdown if "muchos traslados pequeños" in m.value)
+    assert linea.startswith("La simulación no limita camiones ni visitas")
+    assert f"{n:,} estaciones en esta ronda" in linea or (n == 1 and "1 estación en esta ronda" in linea)
+    assert re.search(r"con una mediana de [\d,]+(\.\d)? bicis? por visita\. "
+                     r"Un operador priorizaría las de mayor movimiento\.$", linea)
 
     assert len(at.get("deck_gl_json_chart")) == 1
     leyenda = next(m.value for m in at.markdown if "Llevar" in m.value and "Retirar" in m.value)
@@ -197,6 +206,30 @@ def test_los_indicadores_salen_de_la_tabla_de_recomendaciones(datos):
         "Bicis a llevar": datos.num(plan.loc[plan["bicis"] > 0, "bicis"].sum()),
         "Bicis a retirar": datos.num(-plan.loc[plan["bicis"] < 0, "bicis"].sum()),
     }
+
+
+def test_al_abrir_salen_las_25_de_mas_bicis_y_un_control_las_muestra_todas(datos):
+    at = abrir()
+    rec = datos.recomendaciones()
+    dia = sorted(rec["fecha"].unique())[0]
+    franja = rec.sort_values("hora_inicio")["franja"].iloc[0]
+    plan = rec[(rec["fecha"] == dia) & (rec["franja"] == franja) & (rec["politica"] == "historical")
+               & (rec["bicis"] != 0)]
+    movidas = plan["bicis"].abs().sort_values(ascending=False)
+
+    # La mediana de la línea sale de la tabla, con la selección de la pantalla.
+    linea = next(m.value for m in at.markdown if "muchos traslados pequeños" in m.value)
+    assert f"con una mediana de {datos.cifra(movidas.median())} bici" in linea
+    assert datos.mediana_de_bicis(plan) == movidas.median()
+
+    tabla = at.dataframe[0].value
+    assert list(tabla["Acción"].str.split().str[1].map(entero)) == list(movidas.head(25))
+    if len(plan) <= 25:
+        pytest.skip("La ronda tiene 25 estaciones o menos: no hace falta el control")
+    assert at.toggle[0].label == "Ver todas las estaciones" and not at.toggle[0].value
+    at.toggle[0].set_value(True).run()
+    revisar_contenido(at)
+    assert len(at.dataframe[0].value) == len(plan)
 
 
 def test_no_se_ven_nombres_internos_ni_valores_vacios(datos):
