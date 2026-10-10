@@ -61,6 +61,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt -c constraints.txt
 pytest                         # no usa la red ni los datos reales
+python scripts/build_app_tables.py --datos data/sample --salida data/processed/app   # tablas del dashboard con la muestra
 streamlit run app/Inicio.py    # abre con la muestra de data/sample
 ```
 
