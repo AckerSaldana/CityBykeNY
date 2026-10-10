@@ -144,20 +144,20 @@ def validate_operacion(cfg: dict) -> list[str]:
             problems.append(f"estrategia_por_tipo: los tipos deben ser exactamente {list(STATION_TYPES)}")
         for tipo, regla in estrategia.items():
             if not isinstance(regla, dict):
-                problems.append(f"estrategia_por_tipo.{tipo}: falta prioridad y ocupacion_objetivo")
+                problems.append(f"estrategia_por_tipo.{tipo}: falta prioridad y ocupacion_respaldo")
                 continue
             if regla.get("prioridad") not in (1, 2, 3) or isinstance(regla.get("prioridad"), bool):
                 problems.append(f"estrategia_por_tipo.{tipo}.prioridad: debe ser 1, 2 o 3")
-            ocupacion = regla.get("ocupacion_objetivo")
+            ocupacion = regla.get("ocupacion_respaldo")
             if not isinstance(ocupacion, dict) or set(ocupacion) != set(nombres):
                 problems.append(
-                    f"estrategia_por_tipo.{tipo}.ocupacion_objetivo: debe tener un valor por franja {nombres}"
+                    f"estrategia_por_tipo.{tipo}.ocupacion_respaldo: debe tener un valor por franja {nombres}"
                 )
                 continue
             for franja, valor in ocupacion.items():
                 if not _es_numero(valor) or not 0 <= valor <= 1:
                     problems.append(
-                        f"estrategia_por_tipo.{tipo}.ocupacion_objetivo.{franja}: debe estar entre 0 y 1"
+                        f"estrategia_por_tipo.{tipo}.ocupacion_respaldo.{franja}: debe estar entre 0 y 1"
                         f"{_pista_coma(valor)}"
                     )
     return problems

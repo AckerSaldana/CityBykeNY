@@ -1,7 +1,11 @@
 """Datos SINTÉTICOS de muestra para construir el dashboard antes de tener datos reales.
 
-Genera los cinco archivos de contrato en data/sample con números INVENTADOS.
+Genera los seis archivos de contrato en data/sample con números INVENTADOS.
 No son resultados: ningún número de aquí se puede citar en el pitch.
+
+Primero se inventan los viajes (de qué estación a cuál, en qué hora). De esos
+mismos viajes salen station_hour (salidas y llegadas por hora) y routes (viajes
+entre pares de estaciones en todo el periodo), así que las dos tablas cuadran.
 
 Para que nadie los confunda con datos reales, las estaciones tienen id
 "SIM-001", "SIM-002", ... y nombres "Sintética 01 - ...", y la carpeta lleva un
@@ -50,7 +54,21 @@ VAL_START = pd.Timestamp("2025-10-27", tz=TZ)   # antes de esto: historia del ba
 TEST_START = pd.Timestamp("2025-11-03", tz=TZ)  # val = 27 oct a 2 nov, test = 3 a 9 nov
 
 DEFAULT_CAPACITY = 20        # capacidad que se supone cuando capacity viene vacío
+DEFAULT_OCCUPANCY = 0.5      # ocupación de respaldo que se supone cuando station_type viene vacío
 MAX_TOTAL_BYTES = 1_500_000  # la carpeta va en Git: debe seguir siendo pequeña
+
+# Estaciones que no cubren todo el periodo: (primer día con viajes, último día
+# con viajes). None = desde el inicio o hasta el final. Fuera de esos días la
+# estación no tiene viajes, y por eso tampoco filas: station_hour solo lleva
+# filas entre el primer y el último viaje de cada estación.
+# Al cambiarlas, cuidar dos cosas (el generador se detiene si no se cumplen):
+# todas cubren el día de 25 horas, y las que empiezan tarde tienen una semana
+# completa antes de VAL_START, que es la historia del baseline.
+PARTIAL_STATIONS = {
+    "SIM-015": ("2025-10-19", None),          # instalada a medio periodo
+    "SIM-004": (None, "2025-11-04"),          # retirada antes del final
+    "SIM-029": ("2025-10-17", "2025-11-06"),  # las dos cosas
+}
 
 # Zonas donde se colocan las estaciones: (tipo, cuántas, lat, lon, radio en grados).
 # Son puntos aproximados de Manhattan (debajo de la calle 59) y Brooklyn cercano.
@@ -88,6 +106,16 @@ PROFILES = {
 # Fracción de salidas hechas por miembros (baja un poco en fin de semana).
 MEMBER_SHARE = {"oficinas": 0.88, "residencial": 0.85, "recreativa": 0.55, "mixta": 0.75}
 
+# A qué estación va cada viaje: peso inventado de cada par (inicio, fin).
+ROUTE_SCALE_KM = 2.0  # cada 2 km de distancia el peso del par cae a cerca de un tercio
+ROUTE_MAX_KM = 6.0    # más lejos que esto no hay viajes: no todos los pares existen
+COMMUTE_BOOST = 2.5   # entre una estación residencial y una de oficinas el peso se multiplica
+# Peso de volver a la misma estación (viaje redondo), frente a 1.0 de una estación pegada.
+ROUND_TRIP = {"oficinas": 0.03, "residencial": 0.05, "recreativa": 0.40, "mixta": 0.08}
+EARTH_RADIUS_KM = 6371.0
+MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre",
+          "noviembre", "diciembre")
+
 # Texto de la tabla del LEEME: qué contiene cada archivo.
 DESCRIPTIONS = {
     "stations": (
@@ -95,11 +123,12 @@ DESCRIPTIONS = {
         "`capacity` y `station_type` traen vacíos a propósito."
     ),
     "station_hour": (
-        "Salidas y llegadas por estación y hora, 28 días. "
-        "Cada estación tiene todas las horas, también las que valen cero."
+        "Salidas y llegadas por estación y hora, 28 días. Tabla densa: una fila por estación y hora, "
+        "también las que valen cero, solo entre el primer y el último viaje de cada estación."
     ),
     "predictions": (
-        "Pronóstico por estación y hora de los últimos 14 días, modelos `baseline` y `lgbm`. "
+        "Pronóstico por estación y hora de los últimos 14 días, modelos `baseline` y `lgbm`, "
+        "para las horas que tienen fila en `station_hour`. "
         "Las filas `lgbm` son relleno simulado, no un modelo."
     ),
     "recommendations": (
@@ -109,6 +138,10 @@ DESCRIPTIONS = {
     "policy_curve": (
         "Curva de riesgo contra presupuesto diario, por política. "
         "Números inventados para acomodar la gráfica."
+    ),
+    "routes": (
+        "Viajes entre pares de estaciones, sumados sobre los 28 días. "
+        "Son viajes de usuarios de una estación a otra, NO rutas de camiones de rebalanceo."
     ),
 }
 
@@ -127,6 +160,9 @@ reales.
   simulado**. No salen de ningún modelo entrenado.
 - Las recomendaciones y la curva de `policy_curve.parquet` son números
   inventados para acomodar las gráficas. No miden nada.
+- `routes.parquet` son **viajes de usuarios entre estaciones**, también
+  inventados. **No son rutas de camiones de rebalanceo**: de qué estación a
+  cuál mover bicis no está en ningún archivo.
 
 ## Qué contiene cada archivo
 
@@ -146,15 +182,49 @@ columnas.
   horas y la 01:00 aparece dos veces. Es a propósito.
 - Estaciones sin `capacity`: {no_capacity}.
 - Estaciones sin `station_type`: {no_type}.
+- `station_hour.parquet` es densa: cada estación tiene una fila por cada hora
+  entre su primer y su último viaje, también las horas en cero ({zero_rows}
+  filas sin ningún viaje). Antes del primer viaje y después del último no hay
+  filas. Por eso no todas las estaciones empiezan ni terminan a la misma
+  hora, y la tabla no es una malla completa de estaciones por horas.
+- Estaciones que no cubren todo el periodo:
+  {partial}.
+  Fuera de esos días no tienen filas en `station_hour`, ni pronóstico, ni
+  recomendaciones. Las demás empiezan el 13 de octubre y terminan el 9 de
+  noviembre.
+- Cada viaje inventado llega en la misma hora en que sale. Por eso, en cada
+  hora, las llegadas de todas las estaciones suman lo mismo que las salidas.
+- `routes.parquet`: una fila por par (estación de inicio, estación de fin) con
+  al menos un viaje en el periodo. Sale de los mismos viajes inventados que
+  `station_hour` y cuadra exacto por los dos lados: para cada estación, la
+  suma de `trips` de las rutas que empiezan en ella es igual a sus
+  `departures` de todo el periodo, y la suma de las rutas que terminan en ella
+  es igual a sus `arrivals`. Hay más viajes entre estaciones cercanas y entre
+  zonas residenciales y de oficinas. Hay {round_trips} rutas de una estación a sí
+  misma (viajes redondos). No todos los pares existen: tienen fila
+  {routes} de los {pairs} pares posibles.
 - `predictions.parquet`: `split = "val"` es del 27 de octubre al 2 de
   noviembre; `split = "test"` es del 3 al 9 de noviembre. Las filas
   `baseline` son el promedio de los primeros 14 días de estos mismos datos
   inventados. Las filas `lgbm` son relleno simulado.
 - `recommendations.parquet`: una fila por día de test, franja de
-  `config/operacion.yaml`, estación y política. Con `policy = "none"` no se
-  mueve nada. En las otras dos, lo que reciben unas estaciones es lo que
-  entregan otras. Donde falta `capacity` se supuso {default_capacity}. Hay
-  filas con los tres niveles de riesgo y unas pocas con `feasible` en falso.
+  `config/operacion.yaml`, estación y política. Solo entran las estaciones
+  que tienen fila en `station_hour` a la hora en que empieza la franja.
+  - En estos datos inventados, las tres políticas empiezan cada franja con el
+    mismo inventario: la `ocupacion_respaldo` de esa franja (según el tipo de
+    la estación) por su capacidad, redondeado. Es una simplificación de la
+    muestra: cuál de los valores por franja dará el inventario inicial de la
+    simulación real sigue abierto (ver `config/operacion.yaml`).
+  - Con `policy = "none"` no se mueve nada: `start_inventory_target` es ese
+    inventario de respaldo.
+  - En las otras dos, lo que reciben unas estaciones es lo que entregan
+    otras. La regla histórica (`historical`) no usa `ocupacion_respaldo`: el
+    inventario que busca se inventa aparte.
+  - Unas pocas filas tienen `feasible` en falso. En ellas las tres políticas
+    se quedan con el inventario de respaldo y `bikes_to_move` es 0.
+  - Donde falta `capacity` se supuso {default_capacity}. Donde falta `station_type` se
+    supuso una ocupación de respaldo de {default_occupancy}.
+  - Hay filas con los tres niveles de riesgo.
 - `policy_curve.parquet`: una fila por política y presupuesto de
   `presupuestos_diarios`.
 
@@ -162,8 +232,9 @@ columnas.
 
     python scripts/make_sample_data.py
 
-El resultado es siempre el mismo (la semilla es fija). Si cambian las franjas o
-los presupuestos en `config/operacion.yaml`, hay que volver a correrlo.
+El resultado es siempre el mismo (la semilla es fija). Si cambian las franjas,
+los presupuestos o la `ocupacion_respaldo` en `config/operacion.yaml`, hay que
+volver a correrlo.
 
 No edites estos archivos a mano. Este LEEME lo escribe el mismo script.
 """
@@ -212,6 +283,35 @@ def _balance(moves: np.ndarray) -> np.ndarray:
     return moves
 
 
+def _pair_weights(stations: pd.DataFrame, demand: pd.DataFrame) -> np.ndarray:
+    """Peso inventado de cada par de estaciones (fila: inicio, columna: fin).
+
+    Pesa más un par de estaciones cercanas y un par residencial-oficinas. Los
+    pares a más de ROUTE_MAX_KM pesan cero: no hay viajes entre ellos. La
+    diagonal es volver a la misma estación (viaje redondo).
+    """
+    lat = np.radians(stations["lat"].to_numpy(dtype=float))
+    lon = np.radians(stations["lon"].to_numpy(dtype=float))
+    # Distancia en línea recta. A esta escala basta tratar el mapa como plano.
+    north = (lat[:, None] - lat[None, :]) * EARTH_RADIUS_KM
+    east = (lon[:, None] - lon[None, :]) * EARTH_RADIUS_KM * math.cos(float(lat.mean()))
+    km = np.hypot(north, east)
+
+    weights = np.exp(-km / ROUTE_SCALE_KM)
+    weights[km > ROUTE_MAX_KM] = 0.0
+    kind = demand["profile"].to_numpy()
+    home, office = kind == "residencial", kind == "oficinas"
+    commute = (home[:, None] & office[None, :]) | (office[:, None] & home[None, :])
+    weights[commute] *= COMMUTE_BOOST
+    np.fill_diagonal(weights, [ROUND_TRIP[k] for k in kind])
+    return weights
+
+
+def _day_text(moment: pd.Timestamp) -> str:
+    """Día del reloj de Nueva York en palabras, por ejemplo "19 de octubre"."""
+    return f"{moment.day} de {MONTHS[moment.month - 1]}"
+
+
 # --------------------------------------------------------------------------- #
 # Una función por archivo
 # --------------------------------------------------------------------------- #
@@ -256,12 +356,21 @@ def build_stations(rng: np.random.Generator) -> tuple[pd.DataFrame, pd.DataFrame
 
 
 def build_station_hour(
-    stations: pd.DataFrame, demand: pd.DataFrame, rng: np.random.Generator
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Malla completa estación x hora con conteos Poisson alrededor de un perfil diario.
+    stations: pd.DataFrame, demand: pd.DataFrame, rng: np.random.Generator, rng_routes: np.random.Generator
+) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
+    """Viajes inventados y, con ellos, la tabla densa por estación y hora.
 
-    Devuelve la tabla del contrato y las tasas con las que se generó (misma
-    cantidad de filas, mismo orden), que luego usa el pronóstico de relleno.
+    Las salidas son conteos Poisson alrededor de un perfil diario. A cada viaje
+    se le elige destino con `rng_routes`, y las llegadas son esos mismos viajes
+    contados en la estación de destino, en la misma hora en que salen.
+
+    Devuelve tres cosas:
+    - La tabla del contrato: una fila por estación y hora, con ceros, solo
+      entre el primer y el último viaje de cada estación.
+    - Las tasas con las que se generó (misma cantidad de filas, mismo orden),
+      que luego usa el pronóstico de relleno.
+    - Los viajes de todo el periodo entre cada par de estaciones (fila: inicio,
+      columna: fin), de donde sale la tabla de rutas.
     """
     hours = pd.date_range(START, END, freq="h", tz=TZ, inclusive="left")
     hour = np.asarray(hours.hour)
@@ -282,25 +391,69 @@ def build_station_hour(
     lam_dep *= day_factor
     lam_arr *= day_factor
 
-    departures = rng.poisson(lam_dep)
-    arrivals = rng.poisson(lam_arr)
+    # Estaciones que no cubren todo el periodo: fuera de sus días no salen ni llegan viajes.
+    station_ids = stations["station_id"].tolist()
+    day = hours.tz_localize(None).normalize()
+    active = np.ones(lam_dep.shape, dtype=bool)
+    for station_id, (first_day, last_day) in PARTIAL_STATIONS.items():
+        i = station_ids.index(station_id)
+        if first_day is not None:
+            active[i] &= np.asarray(day >= pd.Timestamp(first_day))
+        if last_day is not None:
+            active[i] &= np.asarray(day <= pd.Timestamp(last_day))
+
+    departures = rng.poisson(lam_dep) * active
+    lam_dep = lam_dep * active
     share = np.array([MEMBER_SHARE[p] for p in demand["profile"]])[:, None] - 0.10 * weekend[None, :]
     member = rng.binomial(departures, share)
 
-    grid = pd.MultiIndex.from_product([stations["station_id"], hours], names=["station_id", "ts_hour"])
+    # Destino de cada viaje. La probabilidad de ir de la estación i a la j en una
+    # hora es el peso del par por las llegadas que el perfil de j espera a esa hora.
+    pull = lam_arr * active
+    chance = _pair_weights(stations, demand)[:, None, :] * pull.T[None, :, :]  # (inicio, hora, fin)
+    total = chance.sum(axis=2, keepdims=True)
+    assert (total[departures > 0] > 0).all(), "hay viajes sin ningún destino posible"
+    chance = np.divide(chance, total, out=np.zeros_like(chance), where=total > 0)
+    trips = rng_routes.multinomial(departures, chance)  # (inicio, hora, fin)
+    arrivals = trips.sum(axis=0).T                      # (fin, hora)
+    flows = trips.sum(axis=1)                           # (inicio, fin)
+    lam_arr = np.einsum("ih,ihj->jh", lam_dep, chance)  # llegadas esperadas con esos destinos
+
+    grid = pd.MultiIndex.from_product([station_ids, hours], names=["station_id", "ts_hour"])
     frame = grid.to_frame(index=False)
     frame["departures"] = departures.ravel()
     frame["arrivals"] = arrivals.ravel()
     frame["net_flow"] = frame["arrivals"] - frame["departures"]
     frame["departures_member"] = member.ravel()
     frame["departures_casual"] = frame["departures"] - frame["departures_member"]
+    rates = pd.DataFrame({"dep": lam_dep.ravel(), "arr": lam_arr.ravel()})
+
+    # Tabla densa: de cada estación quedan solo las horas entre su primer y su
+    # último viaje. Dentro de ese tramo se conservan las horas en cero.
+    busy = (departures + arrivals) > 0
+    assert busy.any(axis=1).all(), "hay estaciones sin ningún viaje"
+    first = busy.argmax(axis=1)
+    last = busy.shape[1] - 1 - busy[:, ::-1].argmax(axis=1)
+    position = np.arange(len(hours))
+    keep = ((position >= first[:, None]) & (position <= last[:, None])).ravel()
+    frame, rates = frame[keep].reset_index(drop=True), rates[keep].reset_index(drop=True)
 
     # El día del cambio de horario debe traer 25 horas por estación.
     per_station = frame[frame["ts_hour"].dt.normalize() == DST_DAY].groupby("station_id").size()
     assert len(per_station) == len(stations) and (per_station == 25).all(), "el 2025-11-02 debe tener 25 horas"
+    return frame, rates, flows
 
-    rates = pd.DataFrame({"dep": lam_dep.ravel(), "arr": lam_arr.ravel()})
-    return frame, rates
+
+def build_routes(stations: pd.DataFrame, flows: np.ndarray) -> pd.DataFrame:
+    """Viajes entre pares de estaciones en todo el periodo: una fila por par con al menos un viaje.
+
+    Son viajes de usuarios de una estación a otra. NO son rutas de camiones de rebalanceo.
+    """
+    start, end = np.nonzero(flows)
+    station_ids = stations["station_id"].to_numpy()
+    return pd.DataFrame(
+        {"start_station_id": station_ids[start], "end_station_id": station_ids[end], "trips": flows[start, end]}
+    )
 
 
 def build_predictions(station_hour: pd.DataFrame, rates: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
@@ -345,41 +498,67 @@ def build_predictions(station_hour: pd.DataFrame, rates: pd.DataFrame, rng: np.r
     return pd.concat(parts, ignore_index=True)[PREDICTIONS.columns]
 
 
-def build_recommendations(stations: pd.DataFrame, cfg: dict, rng: np.random.Generator) -> pd.DataFrame:
-    """Recomendaciones inventadas: día de test x franja x estación x política."""
-    n = len(stations)
+def build_recommendations(
+    stations: pd.DataFrame, station_hour: pd.DataFrame, cfg: dict, rng: np.random.Generator
+) -> pd.DataFrame:
+    """Recomendaciones inventadas: día de test x franja x estación x política.
+
+    `ocupacion_respaldo` de config/operacion.yaml se usa como quedó decidido:
+
+    - Es el inventario inicial común de las tres políticas. Aquí, las tres
+      empiezan cada franja con ocupacion_respaldo x capacidad, redondeado.
+      Es una simplificación de la muestra: cuál de los valores por franja da
+      el inventario inicial de la simulación real sigue abierto.
+    - Es el valor que se usa cuando no hay solución factible. Aquí, en las
+      filas con feasible en falso las tres políticas se quedan con ese
+      inventario y no mueven nada.
+    - La regla histórica NO lo usa: el inventario que busca se inventa aparte.
+
+    Una estación entra en una franja solo si tiene fila en station_hour a la
+    hora en que la franja empieza (ver PARTIAL_STATIONS).
+    """
     capacity = stations["capacity"].fillna(DEFAULT_CAPACITY).to_numpy(dtype=int)
+    span = station_hour.groupby("station_id")["ts_hour"].agg(["min", "max"]).reindex(stations["station_id"])
     parts = []
     for day in pd.date_range(TEST_START.tz_localize(None), END, freq="D", inclusive="left"):
         for franja in cfg["franjas"]:
-            # Ocupación objetivo de la franja según el tipo; 0.5 si la estación no tiene tipo.
+            window_start = pd.Timestamp(f"{day:%Y-%m-%d} {franja['inicio']}", tz=TZ)
+            window_end = pd.Timestamp(f"{day:%Y-%m-%d} {franja['fin']}", tz=TZ)
+            present = ((span["min"] <= window_start) & (window_start <= span["max"])).to_numpy()
+            n, cap = int(present.sum()), capacity[present]
+
+            # Ocupación de respaldo de la franja según el tipo de la estación.
             rules = cfg["estrategia_por_tipo"]
-            by_type = {kind: rule["ocupacion_objetivo"][franja["nombre"]] for kind, rule in rules.items()}
-            occupancy = np.array([by_type.get(kind, 0.5) for kind in stations["station_type"]])
-            # Bicis que habría al empezar la franja si nadie interviene.
-            inventory = np.rint(capacity * rng.uniform(0.1, 0.9, size=n)).astype(int)
-            # Inventario que de verdad convendría ese día (el del tipo, con algo de ruido).
-            noisy = occupancy + rng.normal(0.0, 0.10, size=n)
-            ideal = np.clip(np.rint(capacity * noisy), 0, capacity).astype(int)
-            # Inventario con el que cada política quiere empezar la franja.
+            by_type = {kind: rule["ocupacion_respaldo"][franja["nombre"]] for kind, rule in rules.items()}
+            kinds = stations.loc[present, "station_type"]
+            occupancy = np.array([by_type.get(kind, DEFAULT_OCCUPANCY) for kind in kinds])
+            # Inventario de respaldo: con él empiezan la franja las tres políticas.
+            fallback = np.rint(cap * occupancy).astype(int)
+            # Inventario que de verdad convendría ese día. Inventado: no sale del respaldo.
+            ideal = np.rint(cap * rng.uniform(0.15, 0.85, size=n)).astype(int)
+            # Inventario con el que cada política quiere empezar la franja. La regla
+            # histórica y el modelo se acercan a lo que conviene, el modelo con menos error.
             wanted = {
-                "none": inventory,
-                "historical": np.rint(capacity * occupancy).astype(int),
-                "model": np.clip(ideal + rng.integers(-2, 3, size=n), 0, capacity),
+                "none": fallback,
+                "historical": np.clip(ideal + rng.integers(-6, 7, size=n), 0, cap),
+                "model": np.clip(ideal + rng.integers(-2, 3, size=n), 0, cap),
             }
             # feasible es de la estación y la franja, no de la política: en unas pocas
             # ningún inventario inicial evita a la vez vaciarse y llenarse.
             feasible = rng.random(n) >= 0.06
             for policy in POLICIES:
-                moves = _balance(wanted[policy] - inventory)  # "none" queda en ceros
-                target = inventory + moves
-                gap = np.abs(ideal - target) / capacity
+                # Sin solución factible la estación se queda con el inventario de
+                # respaldo. "none" queda en ceros en todas.
+                moves = _balance(np.where(feasible, wanted[policy] - fallback, 0))
+                target = fallback + moves
+                assert ((target >= 0) & (target <= cap)).all(), "inventario fuera de la capacidad"
+                gap = np.abs(ideal - target) / cap
                 parts.append(
                     pd.DataFrame(
                         {
-                            "station_id": stations["station_id"].to_numpy(),
-                            "window_start": pd.Timestamp(f"{day:%Y-%m-%d} {franja['inicio']}", tz=TZ),
-                            "window_end": pd.Timestamp(f"{day:%Y-%m-%d} {franja['fin']}", tz=TZ),
+                            "station_id": stations.loc[present, "station_id"].to_numpy(),
+                            "window_start": window_start,
+                            "window_end": window_end,
                             "policy": policy,
                             "start_inventory_target": target,
                             "bikes_to_move": moves,
@@ -393,8 +572,6 @@ def build_recommendations(stations: pd.DataFrame, cfg: dict, rng: np.random.Gene
     # Las bicis se conservan: en cada ventana y política los traslados suman cero.
     moved = frame.groupby(["window_start", "policy"])["bikes_to_move"].sum()
     assert (moved == 0).all(), "los traslados no suman cero"
-    limit = np.tile(capacity, len(frame) // n)
-    assert frame["start_inventory_target"].between(0, pd.Series(limit)).all(), "inventario fuera de la capacidad"
     assert set(frame["risk_level"]) == set(RISK_LEVELS), "deben aparecer los tres niveles de riesgo"
     return frame
 
@@ -419,25 +596,55 @@ def build_policy_curve(cfg: dict) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def build_sample(cfg: dict | None = None) -> dict[str, pd.DataFrame]:
-    """Arma las cinco tablas sintéticas. Cada una usa su propio generador de azar."""
+    """Arma las seis tablas sintéticas. Cada una usa su propio generador de azar.
+
+    El generador de "routes" elige el destino de cada viaje. De esos viajes
+    salen las llegadas de station_hour y la tabla de rutas.
+    """
     cfg = load_operacion() if cfg is None else cfg
     rng = {name: np.random.default_rng([SEED, i]) for i, name in enumerate(CONTRACTS)}
 
     stations, demand = build_stations(rng["stations"])
     assert set(demand["profile"]) == set(STATION_TYPES), "hay tipos de estación sin perfil"
-    station_hour, rates = build_station_hour(stations, demand, rng["station_hour"])
+    station_hour, rates, flows = build_station_hour(stations, demand, rng["station_hour"], rng["routes"])
+    routes = build_routes(stations, flows)
+
+    # Las rutas cuadran con station_hour por los dos lados, estación por estación.
+    totals = station_hour.groupby("station_id")[["departures", "arrivals"]].sum()
+    leaving = routes.groupby("start_station_id")["trips"].sum().reindex(totals.index, fill_value=0)
+    arriving = routes.groupby("end_station_id")["trips"].sum().reindex(totals.index, fill_value=0)
+    assert (leaving == totals["departures"]).all(), "las rutas no suman las salidas de station_hour"
+    assert (arriving == totals["arrivals"]).all(), "las rutas no suman las llegadas de station_hour"
     return {
         "stations": stations,
         "station_hour": station_hour,
         "predictions": build_predictions(station_hour, rates, rng["predictions"]),
-        "recommendations": build_recommendations(stations, cfg, rng["recommendations"]),
+        "recommendations": build_recommendations(stations, station_hour, cfg, rng["recommendations"]),
         "policy_curve": build_policy_curve(cfg),
+        "routes": routes,
     }
+
+
+def _partial_text(station_hour: pd.DataFrame) -> str:
+    """Estaciones que empiezan después del primer día o terminan antes del último, con sus fechas."""
+    first_day, last_day = pd.Timestamp(START), pd.Timestamp(END) - pd.Timedelta(days=1)
+    span = station_hour.groupby("station_id")["ts_hour"].agg(["min", "max"])
+    notes = []
+    for station_id, first, last in span.itertuples():
+        starts_late = first.tz_localize(None).normalize() > first_day
+        ends_early = last.tz_localize(None).normalize() < last_day
+        if starts_late and ends_early:
+            notes.append(f"{station_id} (del {_day_text(first)} al {_day_text(last)})")
+        elif starts_late:
+            notes.append(f"{station_id} (primer viaje el {_day_text(first)})")
+        elif ends_early:
+            notes.append(f"{station_id} (último viaje el {_day_text(last)})")
+    return ", ".join(notes)
 
 
 def write_leeme(tables: dict[str, pd.DataFrame], out_dir: Path) -> Path:
     """Escribe el LEEME.md de la carpeta con los conteos reales de cada tabla."""
-    stations = tables["stations"]
+    stations, station_hour, routes = tables["stations"], tables["station_hour"], tables["routes"]
     file_rows = "\n".join(
         f"| `{CONTRACTS[name].filename}` | {len(table)} | {DESCRIPTIONS[name]} |" for name, table in tables.items()
     )
@@ -445,7 +652,13 @@ def write_leeme(tables: dict[str, pd.DataFrame], out_dir: Path) -> Path:
         file_rows=file_rows,
         no_capacity=", ".join(stations.loc[stations["capacity"].isna(), "station_id"]),
         no_type=", ".join(stations.loc[stations["station_type"].isna(), "station_id"]),
+        zero_rows=int(((station_hour["departures"] + station_hour["arrivals"]) == 0).sum()),
+        partial=_partial_text(station_hour),
+        round_trips=int((routes["start_station_id"] == routes["end_station_id"]).sum()),
+        routes=len(routes),
+        pairs=len(stations) ** 2,
         default_capacity=DEFAULT_CAPACITY,
+        default_occupancy=DEFAULT_OCCUPANCY,
     )
     path = out_dir / "LEEME.md"
     path.write_text(text, encoding="utf-8")
@@ -475,7 +688,7 @@ def check_output_folder(out_dir: str | Path) -> Path:
 
 
 def write_sample(out_dir: str | Path = DATA_SAMPLE) -> dict[str, Path]:
-    """Genera, guarda y vuelve a validar los cinco archivos. Imprime un resumen."""
+    """Genera, guarda y vuelve a validar los seis archivos. Imprime un resumen."""
     out_dir = check_output_folder(out_dir)  # antes de crear o escribir nada
     out_dir.mkdir(parents=True, exist_ok=True)
     tables = build_sample()

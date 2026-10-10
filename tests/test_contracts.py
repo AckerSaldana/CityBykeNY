@@ -1,4 +1,4 @@
-"""Pruebas de los contratos de datos (los cinco archivos que conectan al equipo).
+"""Pruebas de los contratos de datos (los seis archivos que conectan al equipo).
 
 Qué revisan:
 
@@ -7,11 +7,14 @@ Qué revisan:
 2. Los archivos de data/processed cumplen su contrato. Mientras un archivo no
    exista, su prueba se SALTA (sale como "skipped" con el motivo). En cuanto
    alguien lo genera, `pytest` lo valida solo.
-3. Los archivos de una misma carpeta son coherentes entre sí, y en
-   data/processed no hay datos sintéticos (ni estaciones "SIM-..." ni copias
-   de data/sample).
+3. Los archivos de una misma carpeta son coherentes entre sí (toda estación
+   usada en otra tabla, también en las dos puntas de una ruta, existe en
+   stations), y en data/processed no hay datos sintéticos (ni estaciones
+   "SIM-..." ni copias de data/sample).
 4. El validador sí detecta cada error: tablas pequeñas hechas a mano a las que
-   se les rompe una sola cosa.
+   se les rompe una sola cosa. Incluye la regla de tabla densa de station_hour
+   (una fila por estación y hora, con ceros, solo entre el primer y el último
+   viaje de cada estación), también en los días de 25 y de 23 horas.
 5. Nadie cambió por accidente las definiciones de src/contracts.py.
 
 Cómo leer un fallo de los puntos 1 a 3: el mensaje trae la lista de problemas
@@ -106,26 +109,51 @@ def test_el_archivo_cumple_su_contrato(folder, name):
 # 3) Coherencia entre archivos de la misma carpeta
 # --------------------------------------------------------------------------- #
 
+def _station_id_columns(name: str) -> list[str]:
+    """Columnas de un contrato que llevan un id de estación.
+
+    Son station_id y, en las rutas, start_station_id y end_station_id.
+    policy_curve no tiene ninguna.
+    """
+    return [column for column in CONTRACTS[name].columns if column.endswith("station_id")]
+
+
 @pytest.mark.parametrize(
-    "folder, name",
+    "folder, name, column",
     [
-        pytest.param(folder, name, id=f"{folder}/{name}")
+        pytest.param(folder, name, column, id=f"{folder}/{name}.{column}")
         for folder in FOLDERS
-        for name in ("station_hour", "predictions", "recommendations")
+        for name in CONTRACTS
+        if name != "stations"
+        for column in _station_id_columns(name)
     ],
 )
-def test_toda_estacion_usada_existe_en_stations(folder, name):
+def test_toda_estacion_usada_existe_en_stations(folder, name, column):
+    """También las dos puntas de cada ruta: start_station_id y end_station_id."""
     stations_path = _existing_file(folder, "stations")
     path = _existing_file(folder, name)
     known = set(_read(stations_path, ["station_id"])["station_id"].unique().to_pylist())
-    used = set(_read(path, ["station_id"])["station_id"].unique().to_pylist()) - {None}
+    used = set(_read(path, [column])[column].unique().to_pylist()) - {None}
     unknown = sorted(used - known)
     if unknown:
         pytest.fail(
-            f"{_short(path)} usa {len(unknown)} station_id que no están en {_short(stations_path)}.\n"
+            f"{_short(path)} usa {len(unknown)} {column} que no están en {_short(stations_path)}.\n"
             f"Primeros casos: {unknown[:10]}",
             pytrace=False,
         )
+
+
+def test_la_revision_de_estaciones_cubre_las_dos_puntas_de_las_rutas():
+    """Si alguien renombra una columna de id, esta prueba avisa que la revisión de arriba la perdió."""
+    checked = {name: _station_id_columns(name) for name in CONTRACTS}
+    assert checked == {
+        "stations": ["station_id"],
+        "station_hour": ["station_id"],
+        "predictions": ["station_id"],
+        "recommendations": ["station_id"],
+        "policy_curve": [],
+        "routes": ["start_station_id", "end_station_id"],
+    }
 
 
 def test_en_la_muestra_validacion_va_antes_que_prueba_final():
@@ -166,12 +194,12 @@ def test_data_processed_no_trae_datos_sinteticos(name):
         "Borra ese archivo: en data/processed solo van salidas reales del flujo. "
         "Mientras falte, el dashboard usa data/sample y lo avisa."
     )
-    if "station_id" in CONTRACTS[name].columns:
-        ids = _read(path, ["station_id"])["station_id"]
+    for column in _station_id_columns(name):  # en las rutas se revisan las dos puntas
+        ids = _read(path, [column])[column]
         fake = pc.sum(pc.starts_with(ids.cast(pa.string()), "SIM-")).as_py() or 0
         if fake:
             pytest.fail(
-                f"{_short(path)} trae {fake} filas de estaciones sintéticas (station_id que empieza con 'SIM-'). {fix}",
+                f"{_short(path)} trae {fake} filas de estaciones sintéticas ({column} que empieza con 'SIM-'). {fix}",
                 pytrace=False,
             )
     if _is_copy_of_sample(path):
@@ -208,15 +236,27 @@ def test_si_falta_un_archivo_real_se_salta_y_si_falta_uno_de_muestra_falla(tmp_p
         test_el_archivo_cumple_su_contrato("sample", "station_hour")
 
 
-def test_una_estacion_que_no_esta_en_stations_hace_fallar_la_prueba(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "name, column, values",
+    [
+        pytest.param("station_hour", "station_id", ["A", "A", "Z"], id="station_hour"),
+        pytest.param("routes", "start_station_id", ["Z", "B", "A"], id="inicio de una ruta"),
+        pytest.param("routes", "end_station_id", ["B", "Z", "A"], id="fin de una ruta"),
+    ],
+)
+def test_una_estacion_que_no_esta_en_stations_hace_fallar_la_prueba(name, column, values, tmp_path, monkeypatch):
     pq.write_table(_valid("stations"), tmp_path / "stations.parquet")
-    pq.write_table(_with(_valid("station_hour"), "station_id", ["A", "A", "Z"]), tmp_path / "station_hour.parquet")
+    pq.write_table(_with(_valid(name), column, values), tmp_path / f"{name}.parquet")
     monkeypatch.setitem(FOLDERS, "processed", tmp_path)
     with pytest.raises(pytest.fail.Exception) as failure:
-        test_toda_estacion_usada_existe_en_stations("processed", "station_hour")
+        test_toda_estacion_usada_existe_en_stations("processed", name, column)
     message = str(failure.value)
-    assert "usa 1 station_id que no están en" in message
+    assert f"usa 1 {column} que no están en" in message
     assert "['Z']" in message
+    # La otra punta de la ruta está bien y no se marca.
+    for other in _station_id_columns(name):
+        if other != column:
+            test_toda_estacion_usada_existe_en_stations("processed", name, other)
 
 
 def test_la_muestra_copiada_a_data_processed_hace_fallar_la_prueba(tmp_path, monkeypatch):
@@ -226,8 +266,8 @@ def test_la_muestra_copiada_a_data_processed_hace_fallar_la_prueba(tmp_path, mon
     monkeypatch.setitem(FOLDERS, "processed", tmp_path)
     for name in CONTRACTS:
         test_el_archivo_cumple_su_contrato("processed", name)  # la prueba de contrato no lo nota
-        # policy_curve no tiene station_id: se reconoce por ser idéntica a la de la muestra.
-        expected = "estaciones sintéticas" if "station_id" in CONTRACTS[name].columns else "es una copia de data/sample"
+        # policy_curve no tiene ids de estación: se reconoce por ser idéntica a la de la muestra.
+        expected = "estaciones sintéticas" if _station_id_columns(name) else "es una copia de data/sample"
         with pytest.raises(pytest.fail.Exception, match=expected) as failure:
             test_data_processed_no_trae_datos_sinteticos(name)
         assert f"{name}.parquet" in str(failure.value) and "Borra ese archivo" in str(failure.value)
@@ -245,6 +285,21 @@ def test_un_archivo_real_no_se_confunde_con_la_muestra(tmp_path, monkeypatch):
     shifted = _with(sample_curve, "ci_high", [value + 1.0 for value in sample_curve["ci_high"].to_pylist()])
     pq.write_table(shifted, tmp_path / "policy_curve.parquet")
     test_data_processed_no_trae_datos_sinteticos("policy_curve")
+
+
+@pytest.mark.parametrize("column", ["start_station_id", "end_station_id"])
+def test_una_ruta_con_una_sola_punta_sintetica_tambien_se_detecta(column, tmp_path, monkeypatch):
+    """Rutas con ids reales salvo una punta de una fila: no es copia de la muestra, pero trae una estación SIM-."""
+    values = _valid("routes")[column].to_pylist()
+    values[1] = "SIM-001"
+    pq.write_table(_with(_valid("routes"), column, values), tmp_path / "routes.parquet")
+    monkeypatch.setitem(FOLDERS, "processed", tmp_path)
+    test_el_archivo_cumple_su_contrato("processed", "routes")  # la prueba de contrato no lo nota
+    with pytest.raises(pytest.fail.Exception) as failure:
+        test_data_processed_no_trae_datos_sinteticos("routes")
+    message = str(failure.value)
+    assert f"trae 1 filas de estaciones sintéticas ({column} que empieza con 'SIM-')" in message
+    assert "Borra ese archivo" in message
 
 
 def test_sin_archivo_real_la_prueba_de_sinteticos_se_salta(tmp_path, monkeypatch):
@@ -279,6 +334,9 @@ def _valid_frame(name: str) -> pd.DataFrame:
             }
         )
     if name == "station_hour":
+        # Densa: A tiene sus dos horas seguidas, las dos con viajes; B tiene una
+        # sola hora, con una llegada. Las tablas con horas en cero están más
+        # abajo, en las pruebas de la regla de tabla densa.
         return pd.DataFrame(
             {
                 "station_id": ["A", "A", "B"],
@@ -328,6 +386,15 @@ def _valid_frame(name: str) -> pd.DataFrame:
                 "ci_high": [440.0, 320.0, 270.0],
             }
         )
+    if name == "routes":
+        # De A a B y de B a A son rutas distintas. De A a A es un viaje redondo.
+        return pd.DataFrame(
+            {
+                "start_station_id": ["A", "B", "A"],
+                "end_station_id": ["B", "A", "A"],
+                "trips": [12, 9, 2],
+            }
+        )
     raise KeyError(name)
 
 
@@ -369,6 +436,8 @@ WRONG_COLUMNS = _cases(
          "sobran columnas: ['zona']"),
         ("columnas en otro orden", "policy_curve", lambda t: t.select(list(reversed(t.schema.names))),
          "orden de columnas distinto"),
+        ("ruta sin estación de fin", "routes", lambda t: t.drop_columns(["end_station_id"]),
+         "faltan columnas: ['end_station_id']"),
     ]
 )
 
@@ -391,6 +460,9 @@ WRONG_TYPES = _cases(
         ("window_start en UTC", "recommendations", "window_start", pa.timestamp("us", tz="UTC"),
          "window_start: tipo timestamp[us, tz=UTC]"),
         ("fecha sin zona", "station_hour", "ts_hour", pa.timestamp("us"), "ts_hour: tipo timestamp[us] (esperado"),
+        ("trips como decimal", "routes", "trips", pa.float64(), "trips: tipo double (esperado int64)"),
+        ("id de ruta large_string", "routes", "end_station_id", pa.large_string(),
+         "end_station_id: tipo large_string (esperado string)"),
     ]
 )
 
@@ -466,6 +538,14 @@ WRONG_VALUES = _cases(
          "ci_low/ci_high: 1 filas donde el intervalo no contiene"),
         ("NaN en la curva", "policy_curve", {"risk_station_hours": [420.0, NAN, 250.0]},
          "risk_station_hours: 1 valores NaN o infinitos"),
+        # --- routes ---
+        ("ruta con cero viajes", "routes", {"trips": [0, 9, 2]}, "trips: 1 rutas con menos de 1 viaje"),
+        ("ruta con viajes negativos", "routes", {"trips": [12, -3, 2]}, "trips: 1 rutas con menos de 1 viaje"),
+        ("mismo par de estaciones dos veces", "routes", {"end_station_id": ["B", "A", "B"]},
+         "1 filas duplicadas por llave ['start_station_id', 'end_station_id']"),
+        ("nulo en start_station_id", "routes", {"start_station_id": [None, "B", "A"]}, "start_station_id: 1 nulos"),
+        ("nulo en end_station_id", "routes", {"end_station_id": ["B", None, "A"]}, "end_station_id: 1 nulos"),
+        ("nulo en trips", "routes", {"trips": [12, None, 2]}, "trips: 1 nulos"),
     ]
 )
 
@@ -512,6 +592,149 @@ def test_el_validador_detecta_fracciones_de_segundo_en_ts_hour():
     table = _valid("station_hour")
     shifted = pc.add(table["ts_hour"], pa.scalar(500_000, pa.duration("us")))  # 08:00:00.5
     _assert_single_problem(validate_table(_with(table, "ts_hour", shifted.to_pylist()), "station_hour"), "hora exacta")
+
+
+# --- station_hour es una tabla densa ---
+# Una fila por estación y hora, también las horas en cero, pero solo entre el
+# primer y el último viaje de cada estación. Se cuenta en instantes, no en hora
+# del reloj: el día en que termina el horario de verano tiene 25 filas y el día
+# en que empieza tiene 23.
+
+def _hourly(station: str, first_hour: str, departures: list) -> pd.DataFrame:
+    """Filas de una estación en horas seguidas desde `first_hour` (reloj de Nueva York).
+
+    `departures` trae las salidas de cada hora. Un None deja esa hora SIN fila.
+    Las llegadas son siempre cero, así que una hora con 0 salidas es una hora sin viajes.
+    """
+    hours = pd.date_range(_ts(first_hour), periods=len(departures), freq="h")
+    rows = [(station, hour, count) for hour, count in zip(hours, departures) if count is not None]
+    frame = pd.DataFrame(rows, columns=["station_id", "ts_hour", "departures"])
+    frame["arrivals"] = 0
+    frame["net_flow"] = -frame["departures"]
+    frame["departures_member"] = frame["departures"]
+    frame["departures_casual"] = 0
+    return frame
+
+
+def _station_hour(*stations: pd.DataFrame) -> pa.Table:
+    """Junta las filas de varias estaciones en una tabla con los tipos exactos del contrato."""
+    frame = pd.concat(stations, ignore_index=True)
+    schema = CONTRACTS["station_hour"].schema
+    return pa.table({column: frame[column].tolist() for column in schema.names}, schema=schema)
+
+
+def _rows_on(table: pa.Table, day: str) -> int:
+    """Cuántas filas de la tabla caen en ese día del reloj de Nueva York."""
+    local = table.to_pandas()["ts_hour"].dt.tz_localize(None)
+    return int((local.dt.normalize() == pd.Timestamp(day)).sum())
+
+
+MISSING_HOURS = "estaciones con horas faltantes"
+PADDED = "estaciones con filas en cero antes de su primer viaje o después del último"
+NO_TRIPS = "estaciones sin ningún viaje"
+
+# Cada renglón: qué se prueba, estaciones de la tabla.
+DENSE_TABLES = _cases(
+    [
+        ("horas en cero en medio", [_hourly("A", "2025-10-13 08:00", [5, 0, 0, 3])]),
+        ("una sola hora", [_hourly("A", "2025-10-13 08:00", [1])]),
+        # Una estación instalada después y otra retirada antes: cada una con su propio tramo.
+        ("estaciones con tramos distintos", [
+            _hourly("A", "2025-10-13 08:00", [5, 0, 3]),
+            _hourly("B", "2025-10-20 14:00", [2, 0, 0, 0, 1]),
+            _hourly("C", "2025-10-13 06:00", [1, 1]),
+        ]),
+        # Empieza el 1 de noviembre a las 22:00 y termina el 3 a la 01:00: 2 + 25 + 2 horas.
+        ("cruza el día de 25 horas", [_hourly("A", "2025-11-01 22:00", [1] + [0] * 27 + [1])]),
+        # Empieza el 7 de marzo a las 22:00 y termina el 9 a la 01:00: 2 + 23 + 2 horas.
+        ("cruza el día de 23 horas", [_hourly("A", "2026-03-07 22:00", [1] + [0] * 25 + [1])]),
+    ]
+)
+
+# Cada renglón: qué se rompe, estaciones de la tabla, texto que debe salir en el problema.
+NOT_DENSE_TABLES = _cases(
+    [
+        ("falta una hora en cero", [_hourly("A", "2025-10-13 08:00", [5, None, 0, 3])], f"1 {MISSING_HOURS}"),
+        ("faltan todas las horas en cero", [_hourly("A", "2025-10-13 08:00", [5, None, None, 3])],
+         f"1 {MISSING_HOURS}"),
+        ("falta una hora con viajes", [_hourly("A", "2025-10-13 08:00", [5, 0, None, 2, 3])], f"1 {MISSING_HOURS}"),
+        ("falta una hora en dos estaciones", [
+            _hourly("A", "2025-10-13 08:00", [5, None, 3]),
+            _hourly("B", "2025-10-13 08:00", [1, 1]),
+            _hourly("C", "2025-10-14 08:00", [2, 0, None, 0, 2]),
+        ], f"2 {MISSING_HOURS}"),
+        ("filas en cero antes del primer viaje", [_hourly("A", "2025-10-13 08:00", [0, 0, 5, 3])], f"1 {PADDED}"),
+        ("filas en cero después del último viaje", [_hourly("A", "2025-10-13 08:00", [5, 3, 0])], f"1 {PADDED}"),
+        # Lo que sale de cruzar todas las estaciones con todas las horas del periodo.
+        ("malla completa de estaciones por horas", [
+            _hourly("A", "2025-10-13 00:00", [1, 0, 2, 0, 1]),
+            _hourly("B", "2025-10-13 00:00", [0, 0, 4, 0, 0]),
+        ], f"1 {PADDED}"),
+        ("estación sin ningún viaje", [
+            _hourly("A", "2025-10-13 08:00", [5, 0, 3]),
+            _hourly("B", "2025-10-13 08:00", [0, 0, 0]),
+        ], f"1 {NO_TRIPS}"),
+        # En el día de 25 horas la 01:00 aparece dos veces: la malla hecha con la hora del reloj pierde una.
+        ("falta la segunda 01:00 del día de 25 horas", [_hourly("A", "2025-11-02 00:00", [1, 0, None, 0, 1])],
+         f"1 {MISSING_HOURS}"),
+        ("falta una hora en el día de 23 horas", [_hourly("A", "2026-03-08 00:00", [1, 0, None, 0, 1])],
+         f"1 {MISSING_HOURS}"),
+    ]
+)
+
+
+@pytest.mark.parametrize("stations", DENSE_TABLES)
+def test_una_tabla_densa_cumple(stations):
+    assert validate_table(_station_hour(*stations), "station_hour") == []
+
+
+def test_las_tablas_densas_de_prueba_si_cruzan_los_cambios_de_horario():
+    """Que las dos tablas de arriba pasen no dice nada si no traen de verdad 25 y 23 filas ese día."""
+    long_day = _station_hour(_hourly("A", "2025-11-01 22:00", [1] + [0] * 27 + [1]))
+    assert long_day.num_rows == 29 and _rows_on(long_day, "2025-11-02") == 25
+    clock = long_day.to_pandas()["ts_hour"].dt.strftime("%d %H:%M").tolist()
+    assert clock.count("02 01:00") == 2  # la 01:00 repetida
+
+    short_day = _station_hour(_hourly("A", "2026-03-07 22:00", [1] + [0] * 25 + [1]))
+    assert short_day.num_rows == 27 and _rows_on(short_day, "2026-03-08") == 23
+    clock = short_day.to_pandas()["ts_hour"].dt.strftime("%d %H:%M").tolist()
+    assert "08 02:00" not in clock  # la 02:00 que no existe
+
+
+@pytest.mark.parametrize("stations, expected_text", NOT_DENSE_TABLES)
+def test_el_validador_detecta_una_tabla_que_no_es_densa(stations, expected_text):
+    _assert_single_problem(validate_table(_station_hour(*stations), "station_hour"), expected_text)
+
+
+def test_el_validador_dice_los_dos_problemas_de_una_tabla_que_no_es_densa():
+    table = _station_hour(
+        _hourly("A", "2025-10-13 08:00", [5, None, 3]),  # le falta una hora
+        _hourly("B", "2025-10-13 08:00", [0, 4, 1]),     # trae una fila en cero antes de su primer viaje
+        _hourly("C", "2025-10-13 08:00", [2, 0, 2]),     # está bien
+    )
+    problems = validate_table(table, "station_hour")
+    assert len(problems) == 2, problems
+    assert f"1 {MISSING_HOURS}" in problems[0] and f"1 {PADDED}" in problems[1]
+
+
+def test_una_hora_con_solo_llegadas_cuenta_como_viaje():
+    """El primer y el último viaje de una estación pueden ser llegadas."""
+    frame = _hourly("A", "2025-10-13 08:00", [0, 0, 0])
+    frame["arrivals"] = [2, 0, 1]
+    frame["net_flow"] = frame["arrivals"] - frame["departures"]
+    assert validate_table(_station_hour(frame), "station_hour") == []
+
+
+def test_write_contract_no_guarda_una_tabla_que_no_es_densa(tmp_path):
+    """El caso real: un GROUP BY sobre los viajes deja fuera las horas sin viajes."""
+    sparse = _hourly("A", "2025-10-13 08:00", [5, None, None, 3])
+    with pytest.raises(ContractError, match=MISSING_HOURS):
+        write_contract(sparse, "station_hour", tmp_path / "station_hour.parquet")
+    assert _files(tmp_path) == []
+
+    dense = _hourly("A", "2025-10-13 08:00", [5, 0, 0, 3])
+    path = write_contract(dense, "station_hour", tmp_path / "station_hour.parquet")
+    assert validate_file(path, "station_hour") == []
 
 
 # --- to_contract_table ---
@@ -602,6 +825,12 @@ WRONG_KINDS = _cases(
          "feasible llegó como int64 y el contrato pide bool"),
         ("feasible como texto", "recommendations", "feasible", ["true", "false", "true"],
          "feasible llegó como (large_)?string y el contrato pide bool"),
+        ("inicio de ruta decimal", "routes", "start_station_id", [6289.06, 5470.10, 72.0],
+         "start_station_id llegó como double y el contrato pide string.*pierde los ceros finales"),
+        ("fin de ruta entero", "routes", "end_station_id", [6289, 5470, 72],
+         "end_station_id llegó como int64 y el contrato pide string"),
+        ("trips como texto", "routes", "trips", ["12", "9", "2"],
+         "trips llegó como (large_)?string y el contrato pide int64"),
     ]
 )
 
@@ -889,11 +1118,23 @@ SPEC = {
         "nullable": set(),
         "allowed": {"policy": {"none", "historical", "model"}},
     },
+    # Viajes entre pares de estaciones en todo el periodo. No son rutas de camiones.
+    "routes": {
+        "columns": [
+            ("start_station_id", STR),
+            ("end_station_id", STR),
+            ("trips", INT),
+        ],
+        "key": ["start_station_id", "end_station_id"],
+        "nullable": set(),
+        "allowed": {},
+    },
 }
 
 
-def test_son_exactamente_los_cinco_contratos_acordados():
+def test_son_exactamente_los_seis_contratos_acordados():
     assert list(CONTRACTS) == list(SPEC)
+    assert len(SPEC) == 6
 
 
 @pytest.mark.parametrize("name", list(SPEC))

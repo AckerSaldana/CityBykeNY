@@ -1,6 +1,6 @@
 """Contratos de datos: la única fuente de verdad de nombres y tipos.
 
-Estos cinco archivos conectan el trabajo de los dos integrantes. Quien los
+Estos seis archivos conectan el trabajo de los dos integrantes. Quien los
 produce debe escribirlos con `write_contract` (convierte a los tipos exactos y
 valida antes de guardar) y quien los consume puede leerlos con `read_contract`.
 
@@ -146,8 +146,22 @@ POLICY_CURVE = Contract(
     allowed={"policy": POLICIES},
 )
 
+# Viajes entre pares de estaciones, sumados sobre todo el periodo. Es para la
+# vista de ranking de estaciones y rutas. NO son rutas de rebalanceo (camiones).
+ROUTES = Contract(
+    name="routes",
+    schema=pa.schema(
+        [
+            ("start_station_id", pa.string()),
+            ("end_station_id", pa.string()),
+            ("trips", pa.int64()),          # viajes de inicio a fin en el periodo
+        ]
+    ),
+    key=("start_station_id", "end_station_id"),
+)
+
 CONTRACTS: dict[str, Contract] = {
-    c.name: c for c in (STATIONS, STATION_HOUR, PREDICTIONS, RECOMMENDATIONS, POLICY_CURVE)
+    c.name: c for c in (STATIONS, STATION_HOUR, PREDICTIONS, RECOMMENDATIONS, POLICY_CURVE, ROUTES)
 }
 
 
@@ -235,6 +249,48 @@ def _check_values(t: pa.Table, name: str) -> list[str]:
         if n:
             problems.append(f"ci_low/ci_high: {n} filas donde el intervalo no contiene risk_station_hours")
 
+    elif name == "routes":
+        n = _count(pc.less(t["trips"], 1))
+        if n:
+            problems.append(f"trips: {n} rutas con menos de 1 viaje")
+
+    return problems
+
+
+def _check_dense(t: pa.Table) -> list[str]:
+    """station_hour es densa: una fila por estación y hora, con ceros, solo
+    entre el primer y el último viaje observado de cada estación.
+
+    Se cuenta en instantes, no en hora de reloj: el día de 25 horas del cambio
+    de horario tiene 25 filas y el de 23 horas tiene 23.
+    """
+    problems: list[str] = []
+    hours = t.group_by("station_id").aggregate([("ts_hour", "min"), ("ts_hour", "max"), ("ts_hour", "count")])
+    span = pc.subtract(hours["ts_hour_max"], hours["ts_hour_min"]).cast(pa.int64())  # microsegundos
+    expected = pc.add(pc.divide(span, 3_600_000_000), 1)
+    n = _count(pc.not_equal(hours["ts_hour_count"], expected))
+    if n:
+        problems.append(
+            f"{n} estaciones con horas faltantes: debe haber una fila por hora, con ceros, "
+            "entre su primera y su última hora"
+        )
+
+    with_trips = t.filter(pc.greater(pc.add(t["departures"], t["arrivals"]), 0))
+    trips = with_trips.group_by("station_id").aggregate([("ts_hour", "min"), ("ts_hour", "max")])
+    trips = trips.select(["station_id", "ts_hour_min", "ts_hour_max"]).rename_columns(
+        ["station_id", "first_trip", "last_trip"]
+    )
+    joined = hours.join(trips, keys="station_id", join_type="left outer")
+    n = joined["first_trip"].null_count
+    if n:
+        problems.append(f"{n} estaciones sin ningún viaje")
+    padded = pc.or_(
+        pc.not_equal(joined["ts_hour_min"], joined["first_trip"]),
+        pc.not_equal(joined["ts_hour_max"], joined["last_trip"]),
+    )
+    n = _count(padded)
+    if n:
+        problems.append(f"{n} estaciones con filas en cero antes de su primer viaje o después del último")
     return problems
 
 
@@ -294,6 +350,10 @@ def validate_table(table: pa.Table, contract: Contract | str) -> list[str]:
 
     # 7) Reglas de contenido.
     problems.extend(_check_values(table, c.name))
+
+    # 8) Tabla densa. Solo tiene sentido revisarla si todo lo anterior está bien.
+    if c.name == "station_hour" and not problems:
+        problems.extend(_check_dense(table))
     return problems
 
 

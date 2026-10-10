@@ -37,7 +37,7 @@ presupuestos_diarios: [0, 50, 100]
 distancia_maxima_km: 3.0
 estrategia_por_tipo:
 """ + "".join(
-    f"  {tipo}:\n    prioridad: 2\n    ocupacion_objetivo:\n      manana: 0.5\n      tarde: 0.5\n"
+    f"  {tipo}:\n    prioridad: 2\n    ocupacion_respaldo:\n      manana: 0.5\n      tarde: 0.5\n"
     for tipo in STATION_TYPES
 )
 BASE = yaml.safe_load(TEXTO_BASE)
@@ -75,6 +75,12 @@ def test_la_configuracion_de_prueba_es_valida():
     assert validate_operacion(BASE) == []
 
 
+def _con_el_nombre_anterior(c):
+    """Deja 'oficinas' con la clave como se llamaba antes: ocupacion_objetivo."""
+    regla = c["estrategia_por_tipo"]["oficinas"]
+    regla["ocupacion_objetivo"] = regla.pop("ocupacion_respaldo")
+
+
 @pytest.mark.parametrize(
     "cambio, texto_esperado",
     [
@@ -88,8 +94,11 @@ def test_la_configuracion_de_prueba_es_valida():
         (lambda c: c.update(distancia_maxima_km=0), "distancia_maxima_km"),
         (lambda c: c["estrategia_por_tipo"].pop("mixta"), "los tipos deben ser exactamente"),
         (lambda c: c["estrategia_por_tipo"]["oficinas"].update(prioridad=5), "prioridad"),
-        (lambda c: c["estrategia_por_tipo"]["oficinas"]["ocupacion_objetivo"].update(manana=1.5), "entre 0 y 1"),
-        (lambda c: c["estrategia_por_tipo"]["oficinas"]["ocupacion_objetivo"].pop("tarde"), "un valor por franja"),
+        (lambda c: c["estrategia_por_tipo"]["oficinas"]["ocupacion_respaldo"].update(manana=1.5), "entre 0 y 1"),
+        (lambda c: c["estrategia_por_tipo"]["oficinas"]["ocupacion_respaldo"].pop("tarde"), "un valor por franja"),
+        (lambda c: c["estrategia_por_tipo"].update(oficinas=None), "falta prioridad y ocupacion_respaldo"),
+        # Un archivo que todavía use el nombre anterior no pasa: el mensaje pide la clave nueva.
+        (_con_el_nombre_anterior, "oficinas.ocupacion_respaldo: debe tener un valor por franja"),
         (lambda c: c.update(estado="confirmado"), "confirmado_por"),
         (lambda c: c.update(estado="listo"), "estado"),
         (lambda c: c.update(presupuestos_diarios=[0, 100, 50]), "de menor a mayor"),

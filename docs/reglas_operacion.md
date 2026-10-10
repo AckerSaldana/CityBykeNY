@@ -144,23 +144,38 @@ para mover tres bicis.
 ## Pregunta 5. ¿Qué estrategia seguimos según el tipo de estación?
 
 **Qué significa.** Clasificamos las estaciones en cuatro tipos: oficinas,
-residencial, recreativa y mixta. Para cada tipo se define a quién atender
-primero cuando el presupuesto no alcanza (prioridad) y qué tan llena conviene
-dejar la estación al iniciar cada franja (ocupación objetivo, de 0 % vacía a
-100 % llena).
+residencial, recreativa y mixta. Para cada tipo se definen dos cosas: a quién
+atender primero cuando el presupuesto no alcanza (prioridad) y qué tan llena
+empieza cada estación, como fracción de su capacidad (ocupación de respaldo,
+de 0 % vacía a 100 % llena).
 
-Interpretación de programación, pendiente de confirmar: se usaría como
-respaldo cuando ningún inventario inicial evite a la vez que la estación se
-vacíe y se llene; falta decidir si es eso o la meta de la regla histórica.
+La ocupación de respaldo tiene dos usos:
+
+1. Es el inventario inicial común de las tres políticas (sin intervención,
+   regla histórica y modelo predictivo): las tres empiezan con las mismas
+   bicis en cada estación, para compararlas desde el mismo punto.
+2. Es el valor que se usa cuando ningún inventario inicial evita a la vez que
+   la estación se vacíe y se llene.
+
+La regla histórica no usa este valor para decidir.
+
+El significado ya está decidido; los valores siguen siendo provisionales.
+
+Queda un detalle abierto: el parámetro tiene un valor por franja y la decisión
+no dice cuál de esos valores da el inventario inicial de la simulación;
+programación usará el de la primera franja del día, salvo que logística diga
+otra cosa.
 
 **Por qué importa.** Una estación de oficinas se llena en la mañana y se vacía
 en la tarde; una residencial hace lo contrario. La misma regla no sirve para
-todas.
+todas. Además, como las tres políticas empiezan desde este valor, cambiarlo
+cambiará el riesgo simulado de las tres, también el de no intervenir.
 
 **Para pensarlo.** ¿Qué tipo de estación duele más cuando falla? ¿En qué
-franja conviene dejar bicis y en cuál conviene dejar lugares libres?
+franja conviene que una estación empiece con bicis y en cuál con lugares
+libres?
 
-| Tipo | Prioridad (3 alta, 1 baja) | Ocupación al iniciar la mañana | Ocupación al iniciar la tarde | Estado |
+| Tipo | Prioridad (3 alta, 1 baja) | Ocupación de respaldo en la mañana | Ocupación de respaldo en la tarde | Estado |
 |---|---|---|---|---|
 | oficinas | 3 | 30 % | 70 % | provisional |
 | residencial | 3 | 70 % | 30 % | provisional |
@@ -171,21 +186,37 @@ franja conviene dejar bicis y en cuál conviene dejar lugares libres?
 
 **Justificación:** _pendiente_
 
-**Parámetro en el YAML:** `estrategia_por_tipo` (la ocupación se escribe como
-fracción: 30 % es `0.30`).
+**Parámetro en el YAML:** `estrategia_por_tipo`, con `prioridad` y
+`ocupacion_respaldo` para cada tipo (la ocupación se escribe como fracción:
+30 % es `0.30`).
 
 ---
 
 ## Pendientes que también decide logística
 
-- **Cómo se clasifica cada estación en un tipo.** Todavía no existe la regla.
-  Mientras no exista, `station_type` queda vacío en los datos reales.
-- **Rutas de camión.** Hoy las recomendaciones dicen cuántas bicis llevar o
-  retirar por estación, pero no de qué estación a cuál. Si el dashboard debe
-  mostrar rutas, hay que acordar ese dato con programación.
+- **Umbrales para clasificar cada estación en un tipo.** Ya está decidido cómo
+  se asigna el tipo: con una regla de comportamiento calculada solo con el
+  tramo de entrenamiento (el primero de los tres tramos de datos, el que se
+  usa para ajustar el modelo), a partir de tres indicadores: el flujo neto de
+  la mañana entre semana (llegadas menos salidas), la proporción de fin de
+  semana y la proporción de usuarios ocasionales. Lo que sigue pendiente son
+  los umbrales: desde qué valor de cada indicador una estación cuenta como
+  oficinas, residencial, recreativa o mixta. Los fija logística. Mientras no
+  existan, `station_type` queda vacío en los datos reales.
+
+Ya decidido (se anota para tenerlo presente; no hay nada que responder):
+
+- **Rutas.** El dashboard muestra los pares de estaciones más transitados:
+  los viajes de una estación a otra, sumados en todo el periodo. Las rutas de
+  camión quedan fuera por ahora: las recomendaciones dicen cuántas bicis
+  llevar o retirar por estación, no de qué estación a cuál.
+- **Captura de GBFS.** No se traslapa con los meses de viajes. Se usa solo
+  para la capacidad de las estaciones, el modo en vivo y el perfil de
+  ocupación por hora. No se usa para validar la posible demanda insatisfecha.
 
 ## Registro de cambios
 
 | Fecha | Quién | Qué cambió y por qué |
 |---|---|---|
 | _pendiente_ | _pendiente_ | Versión inicial con valores provisionales |
+| 2026-10-10 | Acker (programación) | En la pregunta 5, `ocupacion_objetivo` pasa a llamarse `ocupacion_respaldo` y queda decidido su significado. Se anota cómo se asigna el tipo de estación, qué rutas muestra el dashboard y para qué se usa la captura de GBFS. Ningún valor cambió. |

@@ -71,31 +71,38 @@ distancia_maxima_km: 3.0           # PROVISIONAL
 # -----------------------------------------------------------------------------
 # prioridad: a quién se atiende primero cuando el presupuesto no alcanza
 #   (3 = alta, 2 = media, 1 = baja).
-# ocupacion_objetivo: qué tan llena conviene dejar la estación al iniciar cada
-#   franja, como fracción de su capacidad (0.0 = vacía, 1.0 = llena).
-#   Interpretación de programación, pendiente de confirmar: se usaría como
-#   respaldo cuando ningún inventario inicial evite a la vez que la estación
-#   se vacíe y se llene; falta decidir si es eso o la meta de la regla
-#   histórica.
+# ocupacion_respaldo: qué tan llena empieza cada estación, como fracción de su
+#   capacidad (0.0 = vacía, 1.0 = llena). Tiene dos usos:
+#   1. Es el inventario inicial común de las tres políticas (sin intervención,
+#      regla histórica y modelo predictivo): las tres empiezan con las mismas
+#      bicis en cada estación, para compararlas desde el mismo punto.
+#   2. Es el valor que se usa cuando ningún inventario inicial evita a la vez
+#      que la estación se vacíe y se llene.
+#   La regla histórica no usa este valor para decidir.
+#   El significado ya está decidido; los valores siguen siendo provisionales.
+#   Queda un detalle abierto: el parámetro tiene un valor por franja y la
+#   decisión no dice cuál de esos valores da el inventario inicial de la
+#   simulación; programación usará el de la primera franja del día, salvo que
+#   logística diga otra cosa.
 #   Debe haber un valor por cada franja definida arriba.
 estrategia_por_tipo:
   oficinas:
     prioridad: 3                   # PROVISIONAL
-    ocupacion_objetivo:
+    ocupacion_respaldo:
       manana: 0.30                 # PROVISIONAL (llegan muchas bicis: dejar lugares libres)
       tarde: 0.70                  # PROVISIONAL (salen muchas bicis: dejar bicis)
   residencial:
     prioridad: 3                   # PROVISIONAL
-    ocupacion_objetivo:
+    ocupacion_respaldo:
       manana: 0.70                 # PROVISIONAL
       tarde: 0.30                  # PROVISIONAL
   recreativa:
     prioridad: 1                   # PROVISIONAL
-    ocupacion_objetivo:
+    ocupacion_respaldo:
       manana: 0.50                 # PROVISIONAL
       tarde: 0.50                  # PROVISIONAL
   mixta:
     prioridad: 2                   # PROVISIONAL
-    ocupacion_objetivo:
+    ocupacion_respaldo:
       manana: 0.50                 # PROVISIONAL
       tarde: 0.50                  # PROVISIONAL
