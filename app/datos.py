@@ -67,8 +67,37 @@ COLORES_RIESGO = {"alto": "#D55E00", "medio": "#E69F00", "bajo": "#009E73"}
 COLORES_MODELO = {"baseline": "#E69F00", "lgbm": "#0072B2"}
 COLOR_AZAR = "#CC79A7"
 COLOR_OBSERVADO = "#222222"
-COLOR_SE_VACIA = "#D55E00"  # flujo neto negativo: salen más bicis de las que llegan
-COLOR_SE_LLENA = "#0072B2"  # flujo neto positivo: llegan más de las que salen
+# Mapa de demanda: par propio, distinto de los colores de las políticas.
+COLOR_SE_VACIA = "#7B3294"  # morado. Flujo neto negativo: salen más bicis de las que llegan
+COLOR_SE_LLENA = "#008837"  # verde. Flujo neto positivo: llegan más de las que salen
+# Plan de la ronda: otro par propio.
+COLOR_LLEVAR = "#44AA99"    # verde azulado: bicis que se llevan a la estación
+COLOR_RETIRAR = "#882255"   # vino: bicis que se retiran
+
+# --- Estilo y textos comunes a todas las páginas -----------------------------
+# Paleta fija: Sin intervención gris, Regla histórica naranja, Modelo azul
+# (COLORES_POLITICA) y Mover al azar rosa (COLOR_AZAR).
+FUENTE_EJE = 15       # tamaño de las etiquetas de los ejes y la leyenda (se verá en video)
+FUENTE_TITULO = 17    # tamaño de los títulos de ejes y leyenda
+QUE_ES_RIESGO = "una estación que pasa una hora casi vacía o casi llena"
+TITULO_DESPLEGABLE = "Cómo se calculó"
+
+
+def estilo_grafica(grafica):
+    """Letras grandes en ejes y leyenda de una gráfica de Altair. Úsala en todas."""
+    return (
+        grafica.configure_axis(labelFontSize=FUENTE_EJE, titleFontSize=FUENTE_TITULO)
+        .configure_legend(labelFontSize=FUENTE_EJE, titleFontSize=FUENTE_TITULO)
+        .configure_text(fontSize=FUENTE_EJE)
+    )
+
+
+def como_se_calculo(lineas) -> None:
+    """Desplegable al final de una sección con las aclaraciones técnicas y los límites."""
+    lineas = [linea for linea in lineas if linea]
+    if lineas:
+        with st.expander(TITULO_DESPLEGABLE):
+            st.markdown("\n".join(f"- {linea}" for linea in lineas))
 
 _MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
           "septiembre", "octubre", "noviembre", "diciembre"]
