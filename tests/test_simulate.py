@@ -1237,6 +1237,24 @@ def test_con_usar_prueba_final_escribe_aparte_y_lo_dice(project, capsys):
     assert "La prueba final no se simuló" not in capsys.readouterr().out
 
 
+def test_con_banda_la_banda_no_se_elige_y_solo_se_simula_esa(project, capsys):
+    """`--banda` fija el multiplicador (para la prueba final: el elegido en validación). Sin ella, se elige."""
+    assert run_script(project, "fija", "--banda", "1") == 0
+    band = json.loads((project / "fija" / "reports" / "simulacion.json").read_text(encoding="utf-8"))["banda"]
+    assert band["elegida"] == 1.0 and band["candidatas"] == [1.0] and band["fijada"] is True
+    assert [row["banda"] for row in band["resultados"]] == [1.0]
+    text = (project / "fija" / "reports" / "simulacion.md").read_text(encoding="utf-8")
+    assert "La banda llegó fijada de antemano en 1" in text and "Se eligió con estos mismos días" not in text
+    # Sin la opción todo sigue igual: se simulan las tres candidatas y la clave "fijada" no aparece.
+    assert run_script(project, "libre") == 0
+    free = json.loads((project / "libre" / "reports" / "simulacion.json").read_text(encoding="utf-8"))["banda"]
+    assert free["candidatas"] == [0.0, 0.5, 1.0] and "fijada" not in free
+    # Una banda que no es candidata se rechaza y no escribe nada.
+    capsys.readouterr()
+    assert run_script(project, "mala", "--banda", "0.3") == 1
+    assert "no es una de las candidatas" in capsys.readouterr().out and not (project / "mala").exists()
+
+
 @pytest.mark.parametrize("missing", ["trips", "stations", "station_hour", "predictions"])
 def test_el_script_dice_que_archivo_falta(project, missing, capsys):
     (project / "datos" / f"{missing}.parquet").unlink()

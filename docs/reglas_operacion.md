@@ -423,10 +423,10 @@ empieza cada estación, como fracción de su capacidad (ocupación de respaldo,
 de 0 % vacía a 100 % llena).
 
 **Tipos de estación.** La regla para clasificarlas ya está (ver los
-pendientes de abajo y `notebooks/b/tipo_estacion.sql`). Hasta que programación
-la aplique al tramo de entrenamiento y llene `station_type`, a todas las
-estaciones se les aplica la fila de `tipo_si_falta` (mixta). Después,
-`tipo_si_falta` solo se usa para las que sigan sin tipo.
+pendientes de abajo y `notebooks/b/tipo_estacion.sql`). Programación ya la
+aplicó al tramo de entrenamiento y llenó `station_type`. Una estación que
+sigue sin tipo (no tiene historia) no toma la estrategia de otro tipo: en una
+franja sin solución factible no se toca.
 
 La ocupación de respaldo tiene dos usos:
 
@@ -552,7 +552,7 @@ clasificación hace con las de poca actividad.
 
 **Parámetro en el YAML:** `estrategia_por_tipo`, con `prioridad` y
 `ocupacion_respaldo` para cada tipo (la ocupación se escribe como fracción:
-30 % es `0.30`), y `tipo_si_falta` (uno de los cuatro tipos, en minúsculas).
+30 % es `0.30`).
 
 ---
 
@@ -634,11 +634,11 @@ solución y qué ocupación de respaldo deja menos horas en riesgo en cada tipo 
 franja. Se corre desde la raíz del repositorio con
 `python notebooks/b/calibrar_reglas.py`; no escribe nada.
 
-### Qué estrategia usa una estación sin tipo (`tipo_si_falta`) (confirmado)
+### Qué pasa con una estación sin tipo (confirmado)
 
-Mixta: es la fila que la regla de clasificación ya usa para las estaciones de
-poca actividad, y su respaldo (50%) no empuja a la estación hacia ningún lado
-cuando no sabemos cómo se comporta.
+No toma la estrategia de ningún tipo. En una franja sin solución factible la
+estación sin tipo no se toca; en las demás franjas se trata como cualquier
+otra.
 
 Ya decidido (se anota para tenerlo presente; no hay nada que responder):
 
@@ -717,6 +717,7 @@ Ya decidido (se anota para tenerlo presente; no hay nada que responder):
 |---|---|---|
 | 2026-10-10 | Acker (programación) | Versión inicial con valores provisionales |
 | 2026-10-10 | Acker (programación) | En la pregunta 5, `ocupacion_objetivo` pasa a llamarse `ocupacion_respaldo` y queda decidido su significado. Se anota cómo se asigna el tipo de estación, qué rutas muestra el dashboard y para qué se usa la captura de GBFS. Ningún valor cambió. |
-| 2026-10-10 | Acker (programación) | La pregunta 3 cambia de unidad: el presupuesto ya no es el total de bicis del día sino bicis movidas por estación por día, porque el número de estaciones simuladas puede cambiar. `presupuestos_diarios` (0, 50, 100, 200, 400, 800) se sustituye por `presupuestos_por_estacion` (0, 0.1, 0.25, 0.5, 1.0, 2.0). Se agregan tres parámetros, todos provisionales: `presupuesto_de_referencia` (0.5), `parte_del_presupuesto` por franja (50 % y 50 %) y `tipo_si_falta` (mixta). Se anota cómo arranca la simulación, qué limita un movimiento y que la línea recta ignora ríos y puentes. Los demás valores no cambiaron. |
+| 2026-10-10 | Acker (programación) | La pregunta 3 cambia de unidad: el presupuesto ya no es el total de bicis del día sino bicis movidas por estación por día, porque el número de estaciones simuladas puede cambiar. `presupuestos_diarios` (0, 50, 100, 200, 400, 800) se sustituye por `presupuestos_por_estacion` (0, 0.1, 0.25, 0.5, 1.0, 2.0). Se agregan parámetros provisionales: `presupuesto_de_referencia` (0.5) y `parte_del_presupuesto` por franja (50 % y 50 %); el tercero, que daba un tipo a las estaciones sin tipo, se quitó después. Se anota cómo arranca la simulación, qué limita un movimiento y que la línea recta ignora ríos y puentes. Los demás valores no cambiaron. |
 | 2026-10-10 | Acker (programación) | Los ejemplos de la pregunta 3 pasan de 2,300 estaciones (un número redondo) a las 2,315 que se simulan hoy: la lista provisional da 0, 232, 579, 1,158, 2,315 y 4,630 bicis al día. Se anota cómo se redondea. El umbral de riesgo (pregunta 2) ya no acepta 0: va de 1 en adelante. Se anotan tres hechos de la corrida actual en "Ya decidido". Ningún valor cambió. |
-| 2026-10-10 | Rodrigo Gutiérrez (logística) | Se confirman las cinco reglas, `tipo_si_falta` y los umbrales de tipo de estación, con lo acordado con programación (inventario que pasa de un día al otro, cada tramo con su día de calentamiento, riesgo contado las 24 horas y reportado por franja y por día, la regla histórica y el modelo con la misma maquinaria y el mismo respaldo). Franjas 06:00-14:00 (intervención 05:00, 60 % del presupuesto) y 14:00-22:00 (intervención 14:00, 40 %); umbral 2 bicis y 3 lugares libres, sin contar las 6 estaciones con valet en sus horas; presupuestos de 0, 0.35, 0.7, 1.4, 2.6 y 4.3 bicis por estación por día, con 1.4 de referencia; 2.0 km, con Governors Island aislada; ocupación de respaldo 0.10/0.90 oficinas, 0.90/0.15 residencial y 0.50/0.50 recreativa y mixta; `tipo_si_falta` mixta. Tipos: índice de la mañana ±0.20 con cambio de signo de 16 a 19 y al menos 5 movimientos por día hábil en cada ventana; recreativa sin patrón de ir al trabajo, con 20 movimientos por día y percentiles 80 y 75 (`notebooks/b/tipo_estacion.sql`). Claves nuevas aceptadas por programación: `excepciones_valet` y `grupos_aislados`. Base: reportes mensuales de Citi Bike a NYC DOT, literatura y cálculo propio con los viajes de octubre de 2025. Los supuestos se declaran en cada justificación. |
+| 2026-10-10 | Rodrigo Gutiérrez (logística) | Se confirman las cinco reglas y los umbrales de tipo de estación, con lo acordado con programación (inventario que pasa de un día al otro, cada tramo con su día de calentamiento, riesgo contado las 24 horas y reportado por franja y por día, la regla histórica y el modelo con la misma maquinaria y el mismo respaldo). Franjas 06:00-14:00 (intervención 05:00, 60 % del presupuesto) y 14:00-22:00 (intervención 14:00, 40 %); umbral 2 bicis y 3 lugares libres, sin contar las 6 estaciones con valet en sus horas; presupuestos de 0, 0.35, 0.7, 1.4, 2.6 y 4.3 bicis por estación por día, con 1.4 de referencia; 2.0 km, con Governors Island aislada; ocupación de respaldo 0.10/0.90 oficinas, 0.90/0.15 residencial y 0.50/0.50 recreativa y mixta. Tipos: índice de la mañana ±0.20 con cambio de signo de 16 a 19 y al menos 5 movimientos por día hábil en cada ventana; recreativa sin patrón de ir al trabajo, con 20 movimientos por día y percentiles 80 y 75 (`notebooks/b/tipo_estacion.sql`). Claves nuevas aceptadas por programación: `excepciones_valet` y `grupos_aislados`. Base: reportes mensuales de Citi Bike a NYC DOT, literatura y cálculo propio con los viajes de octubre de 2025. Los supuestos se declaran en cada justificación. |
+| 2026-10-10 | Acker (programación) | Se quitan las menciones a la clave que daba un tipo a las estaciones sin tipo: ya no existe en `config/operacion.yaml`. Una estación sin tipo no se toca en las franjas sin solución factible. |

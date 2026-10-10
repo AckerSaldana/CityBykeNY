@@ -715,6 +715,7 @@ def run_simulation(
     *,
     prueba_final: Tramo | None = None,
     usar_prueba_final: bool = False,
+    banda_fija: float | None = None,
     progress=None,
 ) -> Resultado:
     """Corre las políticas con todos los presupuestos y arma tablas y reporte.
@@ -726,6 +727,8 @@ def run_simulation(
       alimentan. "historical" es obligatoria. Sin "model", esa política no se simula.
     - `ocupacion`: el archivo congelado de GBFS (short_name, capacity, ocupacion_inicial).
     - `ajustes`: el bloque `simulacion` de config/datos.yaml (`load_datos().simulacion`).
+    - `banda_fija`: si se pasa, la banda NO se elige en esta corrida: solo se simula ese multiplicador (debe
+      ser uno de `ajustes.bandas`). Es para la prueba final, que usa la banda elegida en validación.
     """
     check_final_test(tramo, prueba_final, usar_prueba_final)
     say = progress or (lambda message: None)
@@ -741,6 +744,13 @@ def run_simulation(
             'predictions no trae filas "baseline" del tramo. Primero corre: python scripts/run_baseline.py'
         )
     bands = tuple(float(band) for band in ajustes.bandas)
+    if banda_fija is not None:
+        if float(banda_fija) not in bands:
+            raise SimulacionError(
+                f"--banda {float(banda_fija):g} no es una de las candidatas de `simulacion.bandas` "
+                f"({', '.join(f'{b:g}' for b in bands)})."
+            )
+        bands = (float(banda_fija),)  # no se elige nada: las demás candidatas ni se simulan
     calendar = build_calendar(
         tramo.inicio, tramo.fin, reglas.franjas, int(ajustes.dias_de_calentamiento), tuple(ajustes.franja_noche)
     )
@@ -1023,6 +1033,8 @@ def run_simulation(
             "elegida": band,
             "presupuesto_del_dia_en_bicis": int(reference),
             "resultados": [band_row(candidate) for candidate in bands],
+            # Solo cuando la banda llegó fijada de fuera (no se eligió con los días de esta corrida).
+            **({"fijada": True} if banda_fija is not None else {}),
         },
         "informacion": _missing_info(calendar, reglas, with_history, info),
         "historia": {"filas": int(len(history)), "antes_de": tramo.inicio.isoformat()},
@@ -1162,9 +1174,14 @@ def limitations(report: dict) -> list[str]:
         f"el primer día evaluado ({days[0]}) tiene {_n(daily[0])} horas de estación en riesgo y el último "
         f"({days[-1]}), {_n(daily[-1])}.",
         "La capacidad es la más frecuente de la captura de GBFS de octubre de 2026, no la del periodo simulado.",
-        "La banda de incertidumbre se eligió con los mismos días de validación con los que se reporta el "
-        "resultado: el riesgo de la banda elegida sale favorecido. La diferencia entre políticas no, porque "
-        "todas usan la misma banda.",
+        (
+            "La banda de incertidumbre llegó fijada de antemano (`--banda`): no se eligió con los días de esta "
+            "corrida y las demás candidatas no se simularon."
+            if report["banda"].get("fijada")
+            else "La banda de incertidumbre se eligió con los mismos días de validación con los que se reporta el "
+            "resultado: el riesgo de la banda elegida sale favorecido. La diferencia entre políticas no, porque "
+            "todas usan la misma banda."
+        ),
         "Reparto del presupuesto: dentro de la misma prioridad se atiende primero la diferencia más pequeña. "
         "La regla que pidió el usuario, \"riesgo evitado por bici\", **no se implementó**: necesita un modelo "
         "del riesgo esperado por estación y franja que no existe. La diferencia más pequeña es su sustituto.",
@@ -1796,12 +1813,19 @@ def build_report(
         "banda; con 1 es la banda completa. Si el inventario ya está dentro del rango no se mueve nada; si "
         "está fuera, va solo hasta el borde más cercano.",
         "",
-        f"Se simularon los multiplicadores {', '.join(f'{b:g}' for b in band['candidatas'])} "
-        f"(`simulacion.bandas` de config/datos.yaml) con el presupuesto de referencia ({reference:,} bicis al "
-        "día). **Se eligió "
-        f"{band['elegida']:g}**: el de menor riesgo simulado medio, promediado entre las políticas con "
-        "pronóstico. Ese valor se aplica igual a todas y es el de la curva y las recomendaciones. Se eligió "
-        "con estos mismos días de validación.",
+        (
+            f"**La banda llegó fijada de antemano en {band['elegida']:g}** (`--banda`): no se eligió con los días "
+            "de esta corrida y las demás candidatas no se simularon. Ese valor se aplica igual a todas las "
+            f"políticas y es el de la curva y las recomendaciones (presupuesto de referencia: {reference:,} bicis "
+            "al día)."
+            if band.get("fijada")
+            else f"Se simularon los multiplicadores {', '.join(f'{b:g}' for b in band['candidatas'])} "
+            f"(`simulacion.bandas` de config/datos.yaml) con el presupuesto de referencia ({reference:,} bicis al "
+            "día). **Se eligió "
+            f"{band['elegida']:g}**: el de menor riesgo simulado medio, promediado entre las políticas con "
+            "pronóstico. Ese valor se aplica igual a todas y es el de la curva y las recomendaciones. Se eligió "
+            "con estos mismos días de validación."
+        ),
         "",
         _table(
             ["banda", "política", "horas en riesgo por día", "riesgo simulado evitado por día", f"intervalo {level}",
@@ -2494,6 +2518,14 @@ def build_parser() -> argparse.ArgumentParser:
             f"Escribe en la subcarpeta {FINAL_FOLDER}/ de --salida"
         ),
     )
+    options.add_argument(
+        "--banda", metavar="NUM", type=float, default=None,
+        help=(
+            "fija la banda de incertidumbre en ese multiplicador (uno de simulacion.bandas) en vez de elegirla "
+            "con los días de la corrida. Para la prueba final: ahí va la banda elegida en validación. "
+            "Por defecto se elige, como siempre"
+        ),
+    )
     options.add_argument("-h", "--help", action="help", help="muestra esta ayuda y termina")
     return parser
 
@@ -2543,6 +2575,7 @@ def main(argv: list[str] | None = None) -> int:
             stations, trips, history, forecasts, frozen.table, reglas, tramo, datos.simulacion,
             prueba_final=datos.tramos[FINAL_TRAMO],
             usar_prueba_final=args.usar_prueba_final,
+            banda_fija=args.banda,
             progress=lambda message: print(f"  corriendo: {message}", file=sys.stderr),
         )
         result.report["inventario_inicial"]["archivo"] = _short(gbfs)

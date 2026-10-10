@@ -202,6 +202,10 @@ python scripts/build_tables.py            # limpieza: stations, station_hour y r
 python scripts/run_baseline.py            # línea base: predictions y métricas de validación
 python scripts/run_lgbm.py                # LightGBM con cuantiles: predictions y métricas
 python scripts/run_simulation.py          # simulador: recommendations y policy_curve reales
+python scripts/run_piso_wape.py           # piso del WAPE y métricas por franja (validación)
+python scripts/build_station_context.py   # contexto de las estaciones (LODES)
+python scripts/build_app_tables.py        # tablas agregadas del dashboard
+python scripts/run_prueba_final.py        # rearma la tabla validación contra prueba (no califica nada)
 streamlit run app/Inicio.py               # dashboard
 
 python scripts/download_trips.py --listar 202609          # qué hay en el índice
@@ -441,10 +445,12 @@ la semana y hora local. En `predictions`, para `model = "baseline"`, **`q50`
 guarda ese promedio (no es una mediana)** y `q10`/`q90` son los cuantiles
 empíricos de la misma celda. Para validación la historia es el entrenamiento;
 para la prueba final, entrenamiento más validación. Las filas de la prueba
-final se escriben, pero **no se calculan sus métricas**: la prueba final se
-usa una sola vez (decisión 4): `src.models.metrics.evaluate` se niega a
-evaluarla si no se le pide de forma explícita. Las métricas de validación
-quedan en `data/processed/reports/metricas_validacion.md`.
+final se escriben, pero `run_baseline.py` y `run_lgbm.py` **no calculan sus
+métricas**: la prueba final se usa una sola vez (decisión 4) y
+`src.models.metrics.evaluate` se niega a evaluarla si no se le pide de forma
+explícita. Se calificó una vez, el 10 de octubre de 2026 (ver "Prueba
+final"). Las métricas de validación quedan en
+`data/processed/reports/metricas_validacion.md`.
 
 Línea base en validación (1 a 14 de septiembre de 2026, 784,929 filas):
 
@@ -609,6 +615,48 @@ casi no ayuda.
 - OJO: `metricas_validacion.md` y `metricas_lgbm.md` todavía desglosan con
   las franjas anteriores; las de hoy están en `piso_wape.md`.
 
+### Prueba final
+
+**La prueba final ya se usó: una sola vez, el 10 de octubre de 2026**
+(decisión 4). No se vuelve a correr para decidir nada. Comandos:
+`python scripts/run_simulation.py --tramo prueba --usar-prueba-final --banda 0`
+y `python scripts/run_prueba_final.py --usar-prueba-final` (este último se
+niega si ya existe `prueba_final/reports/metricas_prueba.json`). Salidas
+aparte: `data/processed/prueba_final/` y, en `data/processed/reports/`,
+`prueba_final.md` y `validacion_y_prueba.json` (lo lee el dashboard).
+
+Configuración congelada: mismas reglas, mismo `config/gbfs_congelado.csv`,
+mismas predicciones de `predictions.parquet` (sin reentrenar). **La banda no
+se volvió a elegir**: entró fijada en 0 con `--banda`, opción nueva del
+simulador que solo simula ese multiplicador; sin ella todo sigue igual. Las
+filas de prueba de LightGBM usan como rezago los conteos observados de días de
+prueba anteriores (aprobado por el usuario). 15 de septiembre es
+calentamiento; días evaluados, 16 a 29 (14 días); 2,338 estaciones.
+
+Intervalo del 90 % por remuestreo de días entre paréntesis. Diferencias:
+horas en riesgo del modelo menos las de la regla histórica (negativo: el
+modelo tiene menos riesgo).
+
+| | Validación (13 días) | Prueba final (14 días) |
+|---|---|---|
+| Riesgo sin intervención, horas por día | 12,477.5 | 12,360.1 |
+| % evitado, regla histórica (referencia: 3,241 / 3,273 bicis) | 56.9 (52.8 a 60.9) | 64.0 (59.5 a 68.8) |
+| % evitado, modelo (referencia) | 57.0 (53.9 a 60.1) | 63.3 (58.9 a 68.0) |
+| Modelo menos histórica, referencia | −7.5 (−194.9 a +129.5); mejor 4 de 13 días | +86.4 (+39.7 a +127.9); mejor 2 de 14 |
+| Modelo menos histórica, 1,620 / 1,637 bicis | −377.5 (−489.0 a −274.9); 12 de 13 | −428.0 (−649.0 a −212.6); 10 de 14 |
+| Puntos de % evitado al pasar a 6,019 / 6,079 bicis, histórica | +3.4 (1.3 a 6.3) | +0.9 (0.3 a 1.7) |
+| Lo mismo, modelo | +2.3 (0.9 a 3.9) | +0.7 (0.1 a 1.4) |
+| % evitado moviendo al azar | 7.9 | 8.6 |
+| Bloqueados por día: sin intervención / histórica / modelo | 4,983.2 / 3,424.9 / 3,476.7 | 4,168.7 / 2,698.1 / 2,676.4 |
+| WAPE salidas: línea base / LightGBM / media global | 49.1 / 45.8 / 115.9 | 55.8 / 49.5 / 125.3 |
+| MAE salidas: línea base / LightGBM | 1.518 / 1.414 | 1.573 / 1.395 |
+| Cobertura salidas: línea base / LightGBM | 80.0 / 84.0 | 83.0 / 84.9 |
+
+En la prueba, con el presupuesto de referencia, el modelo queda peor que la
+regla histórica; con la mitad del presupuesto queda mejor, igual que en
+validación. Los intervalos de % de esta tabla remuestrean a la vez el riesgo
+evitado y el riesgo sin intervención (`src/models/prueba_final.py`).
+
 Contexto de las estaciones (`docs/contexto_estaciones.md`, LODES 2023): la
 proporción de empleos a 300 m se relaciona con el índice de flujo neto de la
 mañana (Spearman 0.53, n 2,350). Mediana de la proporción: oficinas 0.87,
@@ -629,7 +677,8 @@ Lo que hay que saber antes de citar un número:
 - La línea recta ignora ríos y puentes. Los movimientos son instantáneos y
   sin límite de camiones.
 - Solo se conoce la demanda atendida: los viajes bloqueados son simulados.
-- La prueba final (15 a 29 de septiembre) no se ha simulado ni calificado.
+- La prueba final (15 a 29 de septiembre) se simuló y se calificó una sola
+  vez, el 10 de octubre de 2026 (sección "Prueba final").
 
 ## Sin fuga de información, en concreto
 
@@ -659,7 +708,8 @@ el pronóstico de clima emitido antes de decidir).
 - Nunca presentar como resultado algo que salió de `data/sample`. Son datos
   sintéticos; el dashboard lo avisa mientras los use.
 - No escribir números de operación en el código: van en `config/operacion.yaml`.
-- La prueba final se usa una sola vez. Cualquier ajuste se decide con validación.
+- La prueba final se usa una sola vez **y ya se usó** (10 de octubre de 2026).
+  Cualquier ajuste se decide con validación.
 
 ## Pendientes y decisiones abiertas
 
@@ -669,15 +719,13 @@ el pronóstico de clima emitido antes de decidir).
 - `ocupacion_respaldo` tiene un valor por franja y la decisión 14 no dice cuál
   da el inventario inicial de la simulación. Programación usará el de la
   primera franja del día salvo que logística diga otra cosa.
-- **Prueba final y rezagos:** las filas de prueba de LightGBM usan como rezago
-  lo observado en días de prueba anteriores. Falta que el usuario diga si eso
-  es aceptable antes del cierre.
-- `docs/reglas_operacion.md` todavía menciona `tipo_si_falta` en cuatro
-  lugares; es de logística.
+- **Prueba final y rezagos (resuelto):** las filas de prueba de LightGBM usan
+  como rezago lo observado en días de prueba anteriores. El usuario lo aprobó
+  antes de usar la prueba final.
 - Las seis tablas del dashboard ya son reales. `recommendations` y
   `policy_curve` son resultados simulados con reglas provisionales.
 - Aún no existen: regla de `station_type` y variables externas.
-- La prueba final (15 a 29 de septiembre) no se ha simulado ni calificado.
+- La prueba final (15 a 29 de septiembre) ya se usó; no queda pendiente.
 - Los 3,039 viajes con nombre de estación de fin pero sin id no cuentan como
   llegada. En 3,038 el nombre corresponde a una sola estación de las tablas,
   así que se podrían asignar si el equipo lo decide; sería una regla nueva. El
