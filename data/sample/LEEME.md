@@ -86,19 +86,19 @@ columnas.
     ocupación inventada de 0.5.
   - Los traslados de la muestra no respetan ningún presupuesto ni el reparto
     por franja (`parte_del_presupuesto`): son inventados. Aquí se llevan
-    entre 202 y 310 bicis al día, según el día y la política; el
-    presupuesto de referencia serían 20. Los reales salen de la
+    entre 316 y 423 bicis al día, según el día y la política; el
+    presupuesto de referencia serían 56. Los reales salen de la
     simulación con el presupuesto de referencia.
   - Hay filas con los tres niveles de riesgo.
 - `policy_curve.parquet`: una fila por política y presupuesto. `budget` es el
   total de bicis que se pueden mover en un día. `config/operacion.yaml` da
   los presupuestos en bicis por estación por día
-  (`presupuestos_por_estacion`: 0, 0.1, 0.25, 0.5, 1.0 y 2.0).
+  (`presupuestos_por_estacion`: 0, 0.35, 0.7, 1.4, 2.6 y 4.3).
   Aquí cada uno se multiplica por las 40 estaciones de la muestra y se
-  redondea: 0, 4, 10, 20, 40 y 80.
+  redondea: 0, 14, 28, 56, 104 y 172.
   Si dos valores dan el mismo total, queda una sola fila.
-  El presupuesto de referencia (`presupuesto_de_referencia`: 0.5) es
-  la fila con `budget` = 20.
+  El presupuesto de referencia (`presupuesto_de_referencia`: 1.4) es
+  la fila con `budget` = 56.
 
 ## Cómo regenerarlos
 
