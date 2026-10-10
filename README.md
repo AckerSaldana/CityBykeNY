@@ -158,6 +158,24 @@ histórica (sin intervención: 10,328.5), y fue peor que el modelo sin corregir
 en los 13 días. Se descartó. Son números de una versión anterior del simulador
 y no se recalcularon ([`docs/experimento_mediodia.md`](docs/experimento_mediodia.md)).
 
+## Notebooks
+
+Tres notebooks en `notebooks/`, guardados ya ejecutados (tablas y gráficas a
+la vista). No recalculan nada pesado: leen `data/processed` y sus reportes,
+así que antes hay que correr los comandos de "Cómo reproducir".
+
+- [`01_limpieza.ipynb`](notebooks/01_limpieza.ipynb): de los archivos crudos a
+  la tabla por estación y hora, con los hallazgos de la limpieza.
+- [`02_modelado.ipynb`](notebooks/02_modelado.ipynb): promedio histórico,
+  LightGBM, los tres tramos, la regla de no fuga y las métricas de pronóstico
+  en validación y en la prueba final.
+- [`03_evaluacion_y_simulacion.ipynb`](notebooks/03_evaluacion_y_simulacion.ipynb):
+  reglas de operación, las tres políticas, la curva de riesgo simulado contra
+  presupuesto, mover al azar, el experimento descartado y las limitaciones.
+
+Para volver a ejecutar uno:
+`python -m jupyter nbconvert --to notebook --execute --inplace notebooks/01_limpieza.ipynb`.
+
 ## Estructura
 
 ```
