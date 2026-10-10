@@ -11,11 +11,12 @@ Flujo: viajes históricos en Parquet (DuckDB) → tabla por estación y hora →
 línea base contra LightGBM con cuantiles → simulación de inventario →
 recomendación de bicis a mover → dashboard en Streamlit.
 
-> **Estado actual:** existen la limpieza, la tabla por estación y hora y la
-> línea base, con viajes reales de julio a septiembre de 2026. Todavía no hay
-> LightGBM ni simulador: las recomendaciones y la curva de riesgo del dashboard
-> siguen saliendo de `data/sample`, que son datos **sintéticos** y no se deben
-> citar. El dashboard avisa qué tablas son sintéticas.
+> **Estado actual:** existen la limpieza, la tabla por estación y hora, la
+> línea base y un simulador mínimo, con viajes reales de julio a septiembre de
+> 2026. Las seis tablas del dashboard ya salen de datos reales. Las
+> recomendaciones y la curva de riesgo son resultados **simulados** sobre los
+> días de validación, con reglas de operación todavía provisionales. Todavía
+> no hay LightGBM: la política "modelo" usa hoy el pronóstico de la línea base.
 
 El contexto completo, las decisiones del equipo y los contratos de datos están
 en [`CLAUDE.md`](CLAUDE.md).
@@ -94,19 +95,30 @@ python scripts/download_trips.py --desde 202607 --hasta 202609   # unos 3 GB
 python scripts/capture_gbfs.py --una-vez   # una foto de GBFS: de ahí sale la capacidad
 python scripts/build_tables.py     # limpieza: stations, station_hour y routes
 python scripts/run_baseline.py     # línea base: predictions y métricas de validación
+python scripts/run_simulation.py   # simulador: recommendations y policy_curve
 ```
 
 El periodo, los tres tramos (entrenamiento, validación y prueba final) y las
 reglas de limpieza están en `config/datos.yaml`. Las tablas quedan en
 `data/processed` y cada paso deja un reporte legible en
-`data/processed/reports/` (`limpieza.md` y `metricas_validacion.md`).
+`data/processed/reports/` (`limpieza.md`, `metricas_validacion.md` y
+`simulacion.md`). Las reglas del simulador (franjas, umbral de riesgo,
+presupuestos, distancia máxima) están en `config/operacion.yaml`.
 
-La limpieza tarda unos 15 segundos y necesita cerca de 2 GB libres mientras
-corre. La línea base tarda menos de 10 segundos. Si se reconstruyen las
-tablas, hay que volver a correr la línea base.
+La limpieza tarda unos 20 segundos y necesita cerca de 2 GB libres mientras
+corre; además deja `trips.parquet`, una tabla interna de unos 300 MB con los
+viajes limpios que usa el simulador. La línea base tarda menos de 10 segundos
+y la simulación unos 15. Los tres pasos van en ese orden: si se reconstruyen
+las tablas hay que volver a correr los dos siguientes, y `pytest` avisa si
+algo quedó desfasado.
 
-Las métricas se calculan solo en validación. La prueba final se usa una sola
-vez, al cierre.
+Las métricas y la simulación se calculan solo en validación. La prueba final
+se usa una sola vez, al cierre.
+
+El simulador reproduce los viajes reales uno por uno sobre un inventario
+supuesto. Sus resultados son riesgo simulado, no mediciones: dependen del
+inventario inicial, la distancia es en línea recta (ignora ríos y puentes) y
+los días no son independientes. `simulacion.md` lista las limitaciones.
 
 ### 6. Capturar el estado de las estaciones (GBFS)
 
