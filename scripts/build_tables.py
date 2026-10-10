@@ -14,9 +14,9 @@ Es una tabla interna, no uno de los seis contratos.
 El periodo, los meses y las reglas salen de config/datos.yaml. Los meses deben
 estar ya descargados (scripts/download_trips.py).
 
-La capacidad de las estaciones sale de la última foto de GBFS
-(scripts/capture_gbfs.py --una-vez). Sin ninguna foto la capacidad queda vacía
-y el script lo avisa al terminar (AVISO).
+La capacidad de las estaciones sale de config/gbfs_congelado.csv, el archivo
+congelado que escribe scripts/freeze_gbfs.py. Sin ese archivo la capacidad
+queda vacía y el script lo avisa al terminar (AVISO).
 
 La lógica está en src/data/build_tables.py.
 """

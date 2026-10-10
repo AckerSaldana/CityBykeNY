@@ -2,7 +2,7 @@
 
 No usan internet ni los datos reales: cada prueba escribe en una carpeta
 temporal unos pocos viajes INVENTADOS con el formato del Parquet crudo, una
-configuración y, si hace falta, una foto de GBFS. Después corre la limpieza
+configuración y, si hace falta, un archivo congelado de GBFS. Después corre la limpieza
 completa y revisa las tablas que salen.
 
 Cada corrida de prueba compara además trips.parquet (la tabla interna de
@@ -172,21 +172,19 @@ def write_config(
     return path
 
 
-def write_gbfs(folder: Path, stamp: str, capacities: dict) -> Path:
-    """Una foto de station_information como las de la captura: short_name -> capacidad."""
-    info = folder / "station_information"
-    info.mkdir(parents=True, exist_ok=True)
-    taken = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-    table = pa.table(
-        {
-            "snapshot_ts": pa.array([taken] * len(capacities), pa.timestamp("us", tz="UTC")),
-            "station_id": pa.array([f"gbfs-{i}" for i in range(len(capacities))], pa.string()),
-            "short_name": pa.array(list(capacities), pa.string()),
-            "capacity": pa.array(list(capacities.values()), pa.int64()),
-        }
-    )
-    path = info / f"info_{stamp}.parquet"
-    pq.write_table(table, path)
+def write_gbfs(path: Path, capacities: dict, until: str = "2026-10-10T17:00:00Z") -> Path:
+    """Un archivo congelado de GBFS como el que escribe scripts/freeze_gbfs.py: short_name -> capacidad."""
+    lines = [
+        "# Archivo congelado de prueba.",
+        "# captura_desde_utc: 2026-10-10T04:00:00Z",
+        f"# captura_hasta_utc: {until}",
+        "# fotos_de_estado: 12",
+        "# estados_de_informacion: 2",
+        "short_name,capacity,ocupacion_inicial,fotos",
+    ]
+    lines += [f"{name},{capacity},{'0.500000' if capacity else ''},{3 if capacity else 0}"
+              for name, capacity in capacities.items()]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
 
@@ -904,17 +902,14 @@ def _capacity_trips() -> list[dict]:
     ]
 
 
-def test_la_capacidad_sale_de_la_ultima_foto_de_gbfs(tmp_path):
-    gbfs = tmp_path / "gbfs"
-    write_gbfs(gbfs, "20261010T040000Z", {"4327.09": 99, "6720.07": 99, "6131.1": 99})
-    # El short_name de GBFS también se recorta antes de cruzarlo con el id de los viajes.
-    write_gbfs(gbfs, "20261010T050000Z", {"4327.09 ": 30, "6720.07": 0, "9999.99": 12})
+def test_la_capacidad_sale_del_archivo_congelado_de_gbfs(tmp_path):
+    gbfs = write_gbfs(tmp_path / "gbfs_congelado.csv", {"4327.09": 30, "6720.07": 0, "9999.99": 12})
     built = run(tmp_path, {"202607": _capacity_trips()}, "2026-07-01", "2026-07-03", gbfs=gbfs)
 
     capacity = dict(zip(built.stations["station_id"], built.stations["capacity"]))
     assert capacity["4327.09"] == 30
     assert pd.isna(capacity["6720.07"])   # 0 en GBFS es "no instalada hoy": se guarda vacía
-    assert pd.isna(capacity["6131.1"])    # no está en la foto
+    assert pd.isna(capacity["6131.1"])    # no está en el archivo
     assert built.stations["station_type"].isna().all()
     report = built.report["capacidad"]
     assert (report["con_capacidad"], report["capacidad_cero_hoy"], report["no_estan_en_gbfs"]) == (1, 1, 1)
@@ -922,18 +917,38 @@ def test_la_capacidad_sale_de_la_ultima_foto_de_gbfs(tmp_path):
         {"id": "6131.1", "nombre": "E 24 St & Park Ave S", "salidas": 0, "llegadas": 1}
     ]
     photo = built.report["entradas"]["gbfs"]
-    assert photo["foto"] == "info_20261010T050000Z.parquet"
+    assert photo["foto"] == "gbfs_congelado.csv" and photo["estaciones_en_el_archivo"] == 3
+    assert (photo["captura_desde_utc"], photo["captura_hasta_utc"]) == ("2026-10-10T04:00:00Z", "2026-10-10T17:00:00Z")
     assert photo["dias_despues_del_periodo"] == 99  # del 3 de julio al 10 de octubre
+    text = (built.out / "reports" / "limpieza.md").read_text(encoding="utf-8")
+    assert "archivo congelado" in text and "2026-10-10T04:00:00Z" in text
 
 
-def test_sin_fotos_de_gbfs_la_capacidad_queda_vacia_y_el_reporte_lo_dice(tmp_path):
-    built = run(tmp_path, {"202607": _capacity_trips()}, "2026-07-01", "2026-07-03", gbfs=tmp_path / "no_existe")
+def test_la_capacidad_no_cambia_al_reconstruir_con_el_mismo_archivo_congelado(tmp_path):
+    """El archivo está congelado: dos construcciones dan la misma capacidad, y los ids se leen como texto."""
+    gbfs = write_gbfs(tmp_path / "gbfs_congelado.csv", {"4327.09": 30, "6720.07": 21, "6131.1": 19, "6131.10": 55})
+    first = run(tmp_path, {"202607": _capacity_trips()}, "2026-07-01", "2026-07-03", gbfs=gbfs, out="uno")
+    second = run(tmp_path, {"202607": _capacity_trips()}, "2026-07-01", "2026-07-03", gbfs=gbfs, out="dos")
+    assert first.stations.equals(second.stations)
+    capacity = dict(zip(first.stations["station_id"], first.stations["capacity"]))
+    assert capacity == {"4327.09": 30, "6131.1": 19, "6720.07": 21}  # 6131.1 no toma la capacidad de 6131.10
+
+
+def test_un_archivo_congelado_ilegible_detiene_la_limpieza(tmp_path):
+    bad = tmp_path / "gbfs_congelado.csv"
+    bad.write_text("short_name,capacity\n4327.09,30\n", encoding="utf-8")
+    with pytest.raises(bt.BuildError, match="le faltan columnas"):
+        run(tmp_path, {"202607": _capacity_trips()}, "2026-07-01", "2026-07-03", gbfs=bad)
+
+
+def test_sin_archivo_de_gbfs_la_capacidad_queda_vacia_y_el_reporte_lo_dice(tmp_path):
+    built = run(tmp_path, {"202607": _capacity_trips()}, "2026-07-01", "2026-07-03", gbfs=tmp_path / "no_existe.csv")
 
     assert built.stations["capacity"].isna().all()
     assert built.report["entradas"]["gbfs"]["foto"] is None
     assert built.report["capacidad"]["con_capacidad"] == 0
     text = (built.out / "reports" / "limpieza.md").read_text(encoding="utf-8")
-    assert "No se encontró ninguna foto de GBFS" in text
+    assert "No se encontró el archivo congelado de GBFS" in text
 
 
 def test_stations_lleva_nombre_y_coordenada_mas_frecuentes(tmp_path):
@@ -959,9 +974,13 @@ def test_trips_tiene_las_columnas_y_los_tipos_acordados(tmp_path):
     path = built.out / "trips.parquet"
 
     schema = pq.read_schema(path)
-    assert schema.names == ["ride_id", "started_at", "ended_at", "start_station_id", "end_station_id"]
+    assert schema.names == [
+        "ride_id", "started_at", "ended_at", "start_station_id", "end_station_id",
+        "start_lat", "start_lng", "end_lat", "end_lng",
+    ]
     assert [str(kind) for kind in schema.types] == [
         "string", f"timestamp[us, tz={TZ}]", f"timestamp[us, tz={TZ}]", "string", "string",
+        "double", "double", "double", "double",
     ]
     assert schema.equals(bt.TRIPS_SCHEMA)
     frame = pq.read_table(path).to_pandas()
@@ -1292,6 +1311,10 @@ def test_el_reporte_describe_trips_y_dice_que_no_es_un_contrato(tmp_path):
         "ended_at": f"timestamp[us, tz={TZ}]",
         "start_station_id": "string",
         "end_station_id": "string",
+        "start_lat": "double",
+        "start_lng": "double",
+        "end_lat": "double",
+        "end_lng": "double",
     }
     assert (info["primera_salida"], info["ultima_salida"]) == ("2026-07-02T08:00:00-04:00", "2026-07-02T15:00:00-04:00")
     assert "trips" not in built.report["tablas"]
@@ -1360,7 +1383,7 @@ SABOTAGES = [
     (lambda t: _with_column(t, "ride_id", lambda ids: [*ids[:-1], ids[-2]]),
      "trips: filas con un ride_id que ya salió en otra fila: se esperaba 0 y se obtuvo 1"),
     (_in_utc, "trips.parquet no quedó con las columnas acordadas"),
-    (lambda t: t.rename_columns(["ride_id", "started_at", "ended_at", "start_station", "end_station"]),
+    (lambda t: t.rename_columns(["ride_id", "started_at", "ended_at", "start_station", "end_station", *t.column_names[5:]]),
      "trips.parquet no quedó con las columnas acordadas"),
     (lambda t: t.drop_columns(["ride_id"]), "trips.parquet no quedó con las columnas acordadas"),
 ]
@@ -1409,13 +1432,33 @@ def test_las_comprobaciones_de_trips_detectan_un_cast_a_secas(tmp_path, monkeypa
     assert not list((tmp_path / "salida").rglob("*.parquet"))
 
 
+def test_trips_conserva_las_coordenadas_crudas_tambien_en_una_punta_sin_estacion(tmp_path):
+    """El simulador necesita saber cerca de qué estación terminó un viaje sin estación de fin o excluida."""
+    loose = {**trip("4327.09", None, "2026-07-02 08:00:00", ride_id="SUELTO"), "end_lat": 40.7005, "end_lng": -73.9905}
+    excluded = {**trip("4327.09", "6720.07", "2026-07-02 09:00:00", ride_id="A_NJ"),
+                "end_station_id": "JC001", "end_station_name": "Grove St", "end_lat": 40.7195, "end_lng": -74.0431}
+    no_point = trip("4327.09", None, "2026-07-02 10:00:00", ride_id="SIN_PUNTO")
+    normal = trip("4327.09", "6720.07", "2026-07-02 11:00:00", ride_id="NORMAL")
+    built = run(tmp_path, {"202607": [loose, excluded, no_point, normal]}, "2026-07-01", "2026-07-03")
+
+    frame = pq.read_table(built.out / "trips.parquet").to_pandas().set_index("ride_id")
+    assert pd.isna(frame.loc["SUELTO", "end_station_id"])
+    assert (frame.loc["SUELTO", "end_lat"], frame.loc["SUELTO", "end_lng"]) == (40.7005, -73.9905)
+    assert pd.isna(frame.loc["A_NJ", "end_station_id"])   # excluida: sin id, pero con su coordenada
+    assert (frame.loc["A_NJ", "end_lat"], frame.loc["A_NJ", "end_lng"]) == (40.7195, -74.0431)
+    assert pd.isna(frame.loc["SIN_PUNTO", "end_lat"]) and pd.isna(frame.loc["SIN_PUNTO", "end_lng"])
+    start = CATALOG["4327.09"]
+    assert (frame.loc["NORMAL", "start_lat"], frame.loc["NORMAL", "start_lng"]) == (start[1], start[2])
+    end = CATALOG["6720.07"]
+    assert (frame.loc["NORMAL", "end_lat"], frame.loc["NORMAL", "end_lng"]) == (end[1], end[2])
+
+
 # --------------------------------------------------------------------------- #
 # Contratos, reporte y fallos
 # --------------------------------------------------------------------------- #
 
 def test_las_tres_salidas_cumplen_su_contrato_y_el_reporte_existe(tmp_path):
-    gbfs = tmp_path / "gbfs"
-    write_gbfs(gbfs, "20261010T050000Z", {"4327.09": 30})
+    gbfs = write_gbfs(tmp_path / "gbfs_congelado.csv", {"4327.09": 30})
     built = run(tmp_path, {"202607": _variant_trips()}, "2026-07-01", "2026-07-03", gbfs=gbfs)
 
     for name in bt.TABLES:
@@ -1438,7 +1481,7 @@ def test_las_tres_salidas_cumplen_su_contrato_y_el_reporte_existe(tmp_path):
     assert on_disk["zona_horaria"] and all(t["coincide"] for t in on_disk["zona_horaria"])
 
     text = (built.out / "reports" / "limpieza.md").read_text(encoding="utf-8")
-    for expected in ("demanda atendida", "La capacidad es la de hoy", "rachas de 72 horas", "Salidas sin llegada"):
+    for expected in ("demanda atendida", "La capacidad es la de la captura", "rachas de 72 horas", "Salidas sin llegada"):
         assert expected in text, expected
     assert "recuperad" not in text.lower()  # decisión 9: nunca "viajes recuperados"
     # Capacidad 0 es "no instalada hoy", pero no toda estación no instalada trae capacidad 0.
@@ -1533,16 +1576,15 @@ def _run_main(tmp_path, capsys, fin: str, gbfs: Path) -> tuple[int, str, str]:
     return code, captured.out, captured.err
 
 
-def test_el_script_avisa_si_no_hay_ninguna_foto_de_gbfs(tmp_path, capsys):
+def test_el_script_avisa_si_no_existe_el_archivo_congelado_de_gbfs(tmp_path, capsys):
     """La corrida termina bien, pero stations sale sin capacidad: no puede pasar en silencio."""
-    code, out, err = _run_main(tmp_path, capsys, "2026-07-03", tmp_path / "no_existe")
+    code, out, err = _run_main(tmp_path, capsys, "2026-07-03", tmp_path / "no_existe.csv")
     assert code == 0 and "Comprobaciones:" in out and "(0 con capacidad)" in out
     assert "trips (tabla interna, no es contrato): 1 viajes" in out
-    assert "AVISO: no hay ninguna foto de GBFS en " + str(tmp_path / "no_existe" / "station_information") in err
-    assert "TODAS las estaciones" in err and "python scripts/capture_gbfs.py --una-vez" in err
+    assert "AVISO: no existe el archivo congelado de GBFS " + str(tmp_path / "no_existe.csv") in err
+    assert "TODAS las estaciones" in err and "python scripts/freeze_gbfs.py" in err
 
-    gbfs = tmp_path / "gbfs"
-    write_gbfs(gbfs, "20261010T050000Z", {"4327.09": 30})
+    gbfs = write_gbfs(tmp_path / "gbfs_congelado.csv", {"4327.09": 30})
     code, out, err = _run_main(tmp_path, capsys, "2026-07-03", gbfs)
     assert code == 0 and "(1 con capacidad)" in out
     assert "AVISO" not in err
@@ -1550,8 +1592,7 @@ def test_el_script_avisa_si_no_hay_ninguna_foto_de_gbfs(tmp_path, capsys):
 
 def test_el_script_avisa_si_el_periodo_llega_al_ultimo_dia_del_ultimo_mes(tmp_path, capsys):
     """Los archivos traen los viajes que TERMINAN en cada mes: sin el mes siguiente faltan salidas del último día."""
-    gbfs = tmp_path / "gbfs"
-    write_gbfs(gbfs, "20261010T050000Z", {"4327.09": 30})
+    gbfs = write_gbfs(tmp_path / "gbfs_congelado.csv", {"4327.09": 30})
     code, _, err = _run_main(tmp_path, capsys, "2026-07-31", gbfs)
     assert code == 0
     assert "AVISO: el periodo termina el 2026-07-31 y el mes 202608 no está en meses_crudos" in err

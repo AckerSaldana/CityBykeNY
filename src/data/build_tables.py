@@ -17,6 +17,12 @@ periodo, ordenadas por started_at. Sus columnas están en TRIPS_SCHEMA:
     ended_at           instante con zona America/New_York
     start_station_id   texto, el id que quedó después de la limpieza
     end_station_id     texto, el id que quedó después de la limpieza
+    start_lat, start_lng, end_lat, end_lng   decimales, tal como vienen en el
+                       archivo crudo (pueden ir vacíos)
+
+Las coordenadas son las del viaje, sin tocar: una punta sin estación, o con una
+estación que no entra a las tablas, conserva las suyas. El simulador las usa
+para saber cerca de qué estación empezó o terminó un viaje así.
 
 Una punta va vacía (nula) si el viaje no trae estación, si la estación está
 excluida o si es un id sin ningún viaje dentro del periodo (no es estación de
@@ -45,7 +51,9 @@ Reglas, en orden. Cada una deja su conteo en el reporte.
 6. station_hour es densa (decisión 12): una fila por hora, con ceros, entre la
    primera y la última hora con viajes de cada estación.
 7. stations lleva una fila por estación de station_hour. La capacidad sale de
-   la última foto de GBFS y es la de HOY, no la del periodo.
+   config/gbfs_congelado.csv (la capacidad más frecuente de la captura de
+   GBFS, congelada con scripts/freeze_gbfs.py). Es la de la captura, no la
+   del periodo. Como el archivo está congelado, reconstruir no la cambia.
 8. routes cuenta los viajes entre pares de estaciones.
 
 Antes de escribir se hacen comprobaciones (las sumas cuadran con los viajes,
@@ -82,6 +90,7 @@ import pyarrow.parquet as pq
 
 from src.contracts import TS, ContractError, to_contract_table, write_contract
 from src.data.datos_config import Datos, DatosError, load_datos
+from src.data.gbfs_frozen import FROZEN_FILE, GbfsFrozenError, load_frozen
 from src.paths import DATA_PROCESSED, DATA_RAW, DATA_SAMPLE, DATOS_YAML, REPORTS, ROOT, TZ
 
 TABLES = ("stations", "station_hour", "routes")      # las tres tablas de contrato que salen de aquí
@@ -100,6 +109,10 @@ TRIPS_SCHEMA = pa.schema(
         ("ended_at", TS),                   # instante de llegada, hora local de NY
         ("start_station_id", pa.string()),  # nulo: sin estación, excluida o sin viajes en el periodo
         ("end_station_id", pa.string()),    # nulo: sin estación, excluida o sin viajes en el periodo
+        ("start_lat", pa.float64()),        # coordenadas crudas del viaje; pueden ir vacías
+        ("start_lng", pa.float64()),
+        ("end_lat", pa.float64()),
+        ("end_lng", pa.float64()),
     ]
 )
 # Filas por grupo del Parquet. Como va ordenado por started_at, leer unos
@@ -438,42 +451,37 @@ def raw_files(datos: Datos, raw_dir: Path) -> dict[str, Path]:
     return files
 
 
-def load_capacity(gbfs_dir: Path | None, datos: Datos) -> tuple[dict[str, int | None], dict]:
-    """Capacidad por short_name de la última foto de station_information.
+def load_capacity(gbfs_file: Path | None, datos: Datos) -> tuple[dict[str, int | None], dict]:
+    """Capacidad por short_name del archivo congelado de GBFS (config/gbfs_congelado.csv).
 
-    Devuelve (capacidades, datos de la foto). Sin carpeta o sin fotos, las
-    capacidades van vacías y la foto es None.
+    Devuelve (capacidades, datos del archivo). Sin archivo, las capacidades van
+    vacías y `foto` es None. Un archivo que existe y no se puede leer es un error.
     """
-    folder = Path(gbfs_dir) / "station_information" if gbfs_dir else None
-    snapshots = sorted(folder.glob("info_*.parquet")) if folder and folder.is_dir() else []
-    if not snapshots:
-        return {}, {"foto": None, "carpeta": _short(folder) if folder else None}
-    latest = snapshots[-1]  # el nombre lleva la hora de captura en UTC: el último es el más reciente
+    path = Path(gbfs_file) if gbfs_file else None
+    if path is None or not path.exists():
+        return {}, {"foto": None, "archivo": _short(path) if path else None}
     try:
-        table = pq.read_table(latest, columns=["short_name", "capacity", "snapshot_ts"])
-    except Exception as error:
-        raise BuildError(f"No se pudo leer la foto de GBFS {latest}: {error}") from error
-    capacity: dict[str, int | None] = {}
-    repeated = 0
-    for short_name, value in zip(table["short_name"].to_pylist(), table["capacity"].to_pylist()):
-        if short_name is None:
-            continue
-        key = short_name.strip()
-        if key in capacity:
-            repeated += 1  # no pasa hoy; si pasa, se queda la primera
-            continue
-        capacity[key] = value
-    taken = table["snapshot_ts"][0].as_py() if table.num_rows else None
+        frozen = load_frozen(path)
+    except GbfsFrozenError as error:
+        raise BuildError(str(error)) from error
+    capacity = {
+        str(name): int(value) for name, value in zip(frozen.table["short_name"], frozen.table["capacity"])
+    }
+    meta = frozen.meta
+    until = meta.get("captura_hasta_utc")
+    taken = datetime.fromisoformat(until.replace("Z", "+00:00")) if isinstance(until, str) else None
     info = {
-        "foto": latest.name,
-        "carpeta": _short(folder),
-        "tomada_utc": taken.astimezone(timezone.utc).isoformat() if taken else None,
-        # Días (locales de Nueva York) entre el último día del periodo y la foto.
+        "foto": path.name,  # el nombre del archivo congelado
+        "archivo": _short(path),
+        "captura_desde_utc": meta.get("captura_desde_utc"),
+        "captura_hasta_utc": until,
+        "fotos_de_estado": meta.get("fotos_de_estado"),
+        "estados_de_informacion": meta.get("estados_de_informacion"),
+        # Días (locales de Nueva York) entre el último día del periodo y el fin de la captura.
         "dias_despues_del_periodo": (
             (taken.astimezone(ZoneInfo(TZ)).date() - datos.periodo.fin).days if taken else None
         ),
-        "estaciones_en_la_foto": len(capacity),
-        "short_name_repetidos": repeated,
+        "estaciones_en_el_archivo": len(capacity),
     }
     return capacity, info
 
@@ -702,7 +710,8 @@ def _resolve(con: duckdb.DuckDBPyConnection, plan: IdPlan, period: dict) -> None
                CASE WHEN t.start_id IS NULL THEN 'sin_estacion' ELSE coalesce(s.state, 'sin_mapa') END AS start_state,
                s.station_id AS start_station,
                CASE WHEN t.end_id IS NULL THEN 'sin_estacion' ELSE coalesce(e.state, 'sin_mapa') END AS end_state,
-               e.station_id AS end_station
+               e.station_id AS end_station,
+               t.start_lat, t.start_lng, t.end_lat, t.end_lng
         FROM trips t
         LEFT JOIN id_map s ON s.raw_id = t.start_id
         LEFT JOIN id_map e ON e.raw_id = t.end_id
@@ -795,10 +804,11 @@ def _write_trips(con: duckdb.DuckDBPyConnection, path: Path) -> int:
                {instant_sql('r.started_at')} AS started_at,
                {instant_sql('r.ended_at')} AS ended_at,
                r.start_station AS start_station_id,
-               r.end_station AS end_station_id
+               r.end_station AS end_station_id,
+               r.start_lat, r.start_lng, r.end_lat, r.end_lng
         FROM resolved r
         WHERE r.start_in OR r.end_in
-        ORDER BY 2, 3, 1, 4, 5  -- por posición: el instante de salida ya con zona, no la fecha local
+        ORDER BY 2, 3, 1, 4, 5, 6, 7, 8, 9  -- por posición: el instante de salida ya con zona, no la fecha local
         """
     ).to_arrow_reader(TRIPS_ROWS_PER_GROUP)
     with pq.ParquetWriter(
@@ -1076,7 +1086,7 @@ def _stations_table(
     report = {
         "estaciones": len(rows),
         "con_capacidad": with_capacity,
-        "capacidad_cero_hoy": zero_capacity,
+        "capacidad_cero_hoy": zero_capacity,  # capacidad 0 en el archivo congelado
         "en_gbfs_sin_dato_de_capacidad": no_capacity_value,
         "no_estan_en_gbfs": len(unmatched),
         "lista_no_estan_en_gbfs": unmatched,
@@ -1486,7 +1496,7 @@ def _write_text(path: Path, text: str) -> None:
 def build(
     datos: Datos,
     raw_dir: Path,
-    gbfs_dir: Path | None,
+    gbfs_file: Path | None,
     out_dir: Path,
     *,
     config_path: Path | None = None,
@@ -1502,7 +1512,7 @@ def build(
     raw_dir, out_dir = Path(raw_dir), Path(out_dir)
     check_out_dir(out_dir)
     files = raw_files(datos, raw_dir)
-    capacity, gbfs_info = load_capacity(gbfs_dir, datos)
+    capacity, gbfs_info = load_capacity(gbfs_file, datos)
     period = {
         "ini": datetime.combine(datos.periodo.inicio, datetime.min.time()),
         "fin": datetime.combine(datos.periodo.fin + timedelta(days=1), datetime.min.time()),
@@ -1813,6 +1823,9 @@ def render_markdown(report: dict) -> str:
         "- Columnas: `ride_id`, `started_at` y `ended_at` (salida y llegada, en hora de Nueva York),",
         "  `start_station_id` y `end_station_id` (la estación de cada punta, con el id que quedó después de la",
         "  limpieza: las escrituras unidas de la sección 3 ya llevan un solo id).",
+        "  Además `start_lat`, `start_lng`, `end_lat` y `end_lng`: las coordenadas del viaje tal como vienen en el",
+        "  archivo crudo (pueden ir vacías). Una punta vacía conserva las suyas; el simulador las usa para saber",
+        "  cerca de qué estación empezó o terminó ese viaje.",
         f"- Ningún `ride_id` se repite. Filas sin `ride_id`: {_n(trips['sin_ride_id'])}.",
         "- Una punta va vacía si el viaje no trae estación, si la estación está excluida (sección 4) o si es",
         "  una estación sin ningún viaje dentro del periodo. No se adivina ni se rellena.",
@@ -1843,14 +1856,21 @@ def render_markdown(report: dict) -> str:
     ]
     if gbfs["foto"] is None:
         lines += [
-            "No se encontró ninguna foto de GBFS, así que la capacidad quedó vacía en todas las estaciones.",
+            "No se encontró el archivo congelado de GBFS (`config/gbfs_congelado.csv`), así que la capacidad quedó "
+            "vacía en todas las estaciones.",
         ]
     else:
         lines += [
-            f"La capacidad sale de la foto de GBFS `{gbfs['foto']}` (tomada el {gbfs['tomada_utc']}, UTC).",
+            f"La capacidad sale de `{gbfs['archivo']}`, el archivo congelado que escribe `scripts/freeze_gbfs.py`: "
+            "la capacidad más",
+            f"frecuente de cada estación en la captura de GBFS del {gbfs['captura_desde_utc']} al "
+            f"{gbfs['captura_hasta_utc']} (UTC),",
+            f"con {_n(gbfs['fotos_de_estado'] or 0)} fotos de estado y {_n(gbfs['estados_de_informacion'] or 0)} "
+            "estados de información. Como está congelado,",
+            "reconstruir las tablas no cambia la capacidad aunque la captura siga creciendo.",
             "",
             f"- Con capacidad: {_n(capacity['con_capacidad'])} estaciones.",
-            f"- Capacidad 0 en la foto: {_n(capacity['capacidad_cero_hoy'])}. Son estaciones que hoy no están instaladas;",
+            f"- Capacidad 0 en el archivo: {_n(capacity['capacidad_cero_hoy'])}. Son estaciones que hoy no están instaladas;",
             "  se guarda vacía, no como cero. Al revés no vale: otras estaciones que hoy no están instaladas",
             "  conservan su capacidad en GBFS. Para saber cuáles ya no existen se usa `is_installed` de",
             "  `station_status`, no la capacidad vacía.",
@@ -1924,12 +1944,12 @@ def render_markdown(report: dict) -> str:
     else:
         days = gbfs["dias_despues_del_periodo"]
         when = (
-            f"tomada {_n(days)} días después del último día del periodo" if days is not None and days > 0
+            f"que terminó {_n(days)} días después del último día del periodo" if days is not None and days > 0
             else "que no es del periodo completo"
         )
         lines += [
-            f"- **La capacidad es la de hoy, no la del periodo.** Viene de una sola foto de GBFS, {when}.",
-            f"  {_n(capacity['capacidad_cero_hoy'])} estaciones con viajes en el periodo aparecen en la foto con "
+            f"- **La capacidad es la de la captura, no la del periodo.** Viene de una captura de GBFS {when}.",
+            f"  {_n(capacity['capacidad_cero_hoy'])} estaciones con viajes en el periodo aparecen en el archivo con "
             f"capacidad 0 y {_n(capacity['no_estan_en_gbfs'])} no están en GBFS:",
             "  todas quedan con capacidad vacía.",
         ]
@@ -2004,8 +2024,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--crudos", metavar="DIR", help="carpeta con los Parquet mensuales AAAAMM.parquet (por defecto data/raw/trips)"
     )
     options.add_argument(
-        "--gbfs", metavar="DIR",
-        help="carpeta de la captura de GBFS, la que contiene station_information/ (por defecto data/raw/gbfs)",
+        "--gbfs", metavar="ARCHIVO",
+        help=(
+            "archivo congelado de GBFS con la capacidad, el que escribe scripts/freeze_gbfs.py "
+            "(por defecto config/gbfs_congelado.csv)"
+        ),
     )
     options.add_argument(
         "--config", metavar="ARCHIVO", help="archivo de periodo y reglas (por defecto config/datos.yaml)"
@@ -2017,16 +2040,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Punto de entrada. Devuelve 0 si todo salió bien, 1 si algo falló, 130 si se interrumpió.
 
-    Un AVISO al final (sin foto de GBFS, viajes sin ride_id, o falta el mes siguiente al periodo) no cambia el 0.
+    Un AVISO al final (sin archivo congelado de GBFS, viajes sin ride_id, o falta el mes siguiente al periodo) no cambia el 0.
     """
     args = build_parser().parse_args(argv)
     config_path = Path(args.config).expanduser() if args.config else DATOS_YAML
     out_dir = Path(args.salida).expanduser() if args.salida else DATA_PROCESSED
     raw_dir = Path(args.crudos).expanduser() if args.crudos else DATA_RAW / "trips"
-    gbfs_dir = Path(args.gbfs).expanduser() if args.gbfs else DATA_RAW / "gbfs"
+    gbfs_file = Path(args.gbfs).expanduser() if args.gbfs else FROZEN_FILE
     try:
         datos = load_datos(config_path)
-        report = build(datos, raw_dir, gbfs_dir, out_dir, config_path=config_path, log=lambda m: print(m, flush=True))
+        report = build(datos, raw_dir, gbfs_file, out_dir, config_path=config_path, log=lambda m: print(m, flush=True))
     except KeyboardInterrupt:
         print("\nInterrumpido por el usuario. No se escribió nada.", file=sys.stderr)
         return 130
@@ -2042,8 +2065,8 @@ def main(argv: list[str] | None = None) -> int:
     # Avisos: la corrida terminó bien, pero hay algo que quien la corrió debe saber.
     if report["entradas"]["gbfs"]["foto"] is None:
         print(
-            f"\nAVISO: no hay ninguna foto de GBFS en {gbfs_dir / 'station_information'}. La capacidad quedó "
-            "vacía en TODAS las estaciones.\nCorre: python scripts/capture_gbfs.py --una-vez   y vuelve a "
+            f"\nAVISO: no existe el archivo congelado de GBFS {gbfs_file}. La capacidad quedó "
+            "vacía en TODAS las estaciones.\nCorre: python scripts/freeze_gbfs.py   y vuelve a "
             "correr este script.",
             file=sys.stderr,
         )
