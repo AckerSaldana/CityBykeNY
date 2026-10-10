@@ -1,0 +1,12 @@
+# Configuración de Streamlit para este proyecto. Solo lo indispensable.
+# Este archivo vive en app/.streamlit, junto a Inicio.py. Ahí Streamlit lo lee
+# sin importar desde qué carpeta se abra la app. No lo muevas a la raíz del
+# proyecto: ahí solo se leería al abrir la app desde la raíz.
+
+[browser]
+# No enviar estadísticas de uso a Streamlit.
+gatherUsageStats = false
+
+[server]
+# No pedir un correo en la terminal la primera vez que se abre la app.
+showEmailPrompt = false
