@@ -432,6 +432,21 @@ def _day_segments(franjas: tuple[Franja, ...], noche: tuple[str, str] | None) ->
     return segments
 
 
+def hour_labels(franjas: tuple[Franja, ...], noche: tuple[str, str] | None = None) -> tuple[str, ...]:
+    """Franja del reporte de cada hora de reloj, de la 0 a la 23.
+
+    Son las mismas etiquetas con las que se reporta el riesgo: el nombre de
+    la franja de operación, NIGHT o OUTSIDE. Una hora lleva la etiqueta del
+    minuto en que empieza: si un borde de franja no cae en hora exacta, la
+    hora que lo contiene cuenta completa en la franja donde empieza.
+    """
+    names = tuple(f.nombre for f in franjas) + ((NIGHT,) if noche else ()) + (OUTSIDE,)
+    segments = _day_segments(franjas, noche)
+    return tuple(
+        next(names[label] for low, high, label in segments if low <= hour * 60 < high) for hour in range(24)
+    )
+
+
 def build_calendar(
     first_day: date,
     last_day: date,

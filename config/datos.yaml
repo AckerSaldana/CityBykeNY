@@ -111,3 +111,13 @@ simulacion:
   # No alimenta las recomendaciones ni la curva.
   # Lista de números entre 0 y 1, sin repetir. Puede ir vacía: [].
   sensibilidad_ocupacion_inicial: [0.4, 0.5, 0.6]
+
+  # Piso de azar: una política de referencia que gasta el presupuesto de
+  # referencia moviendo bicis al azar, sin pronóstico (respeta bicis en el
+  # origen, lugar en el destino, distancia máxima y presupuesto). Sirve para
+  # ver cuánto riesgo simulado se evita solo por mover bicis. NO es una de las
+  # políticas del contrato: no va a recommendations ni a policy_curve.
+  # Cuántas corridas se hacen, cada una con su propio sorteo a partir de
+  # `semilla`; el reporte da la media y el rango entre corridas.
+  # Entero, mayor o igual a 0. Con 0 no se corre.
+  corridas_piso_de_azar: 5

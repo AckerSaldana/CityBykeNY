@@ -32,11 +32,17 @@ Qué hacen con su pronóstico, las dos igual:
    umbral; una estación SIN tipo no se toca en esa franja.
 4. Los rangos se convierten en traslados con `match_moves`, que reparte el
    presupuesto: primero el tipo con más prioridad y, dentro de la misma
-   prioridad, la estación a la que le falta o le sobra menos. Solo se mueven
-   bicis entre una estación a la que le sobran y una a la que le faltan: la
-   que ya está dentro de su rango no se toca.
+   prioridad, la estación a la que le falta o le sobra menos. Se atiende solo
+   a las estaciones que están fuera de su rango. Su contraparte es primero
+   una estación con la necesidad contraria y después una que ya está dentro
+   de su rango, que presta o recibe sin salir de él.
 
 Una estación sin información no pide ni presta bicis.
+
+Aparte está el **piso de azar** (`RandomPolicy`, "random"): gasta el mismo
+presupuesto por franja moviendo bicis al azar, sin pronóstico. No es una de
+las políticas del contrato: sirve de referencia de lo que logra mover bicis
+sin información.
 
 Supuestos de la banda (declarados en el reporte): las horas son independientes
 entre sí y las salidas son independientes de las llegadas, así que las
@@ -130,12 +136,20 @@ def match_moves(inventory, low_int, high_int, priority, neighbors, budget: int) 
     cercano. Se atienden por prioridad (la más alta primero), después por la
     diferencia MÁS PEQUEÑA y después por id.
 
-    La contraparte de cada una es una estación vecina con la necesidad
-    contraria (a una le faltan y a la otra le sobran), de la más cercana a la
-    más lejana. **Una estación que ya está dentro de su rango no se mueve**:
-    ni recibe ni presta. Y ninguna pasa del borde más cercano de su rango: la
-    que recibe llega como mucho a su mínimo y la que entrega baja como mucho a
-    su máximo.
+    Solo se atiende a las estaciones que están fuera de su rango, y cada una
+    llega como mucho al borde más cercano. Sus contrapartes, en este orden:
+
+    1. Vecinas con la necesidad contraria (a una le faltan y a la otra le
+       sobran), de la más cercana a la más lejana. Cada una va como mucho al
+       borde más cercano de su rango.
+    2. Si todavía falta, vecinas que están dentro de su rango, de la más
+       cercana a la más lejana. **Una estación dentro de su rango presta o
+       recibe solo mientras no salga de él**: presta hasta quedar en su
+       mínimo y recibe hasta quedar en su máximo. Aquí entran también las del
+       paso 1 que ya llegaron a su borde.
+
+    Una estación sin información, o sin solución y sin tipo, tiene por rango
+    su inventario actual: no le queda margen y no presta ni recibe.
 
     `neighbors[s]` ya trae solo las estaciones dentro de la distancia máxima.
     Mover una bici cuesta 1. Se detiene cuando se acaba el presupuesto.
@@ -155,24 +169,34 @@ def match_moves(inventory, low_int, high_int, priority, neighbors, budget: int) 
         if current[s] < low_int[s]:
             receives = True
             need = int(low_int[s] - current[s])
-            spare = current[near] - high_int[near]   # bicis que le sobran a cada vecina
         elif current[s] > high_int[s]:
             receives = False
             need = int(current[s] - high_int[s])
-            spare = low_int[near] - current[near]    # bicis que le faltan a cada vecina
         else:
             continue  # quedó dentro de su rango al atender a otra
-        for position in np.nonzero(spare > 0)[0].tolist():
-            other = int(near[position])
-            bikes = min(need, int(spare[position]), left)
-            origin, destination = (other, s) if receives else (s, other)
-            moves.append(Move(origin, destination, bikes))
-            current[origin] -= bikes
-            current[destination] += bikes
-            need -= bikes
-            left -= bikes
+        # Paso 1: vecinas con la necesidad contraria. Paso 2: vecinas dentro de su rango, sin sacarlas de él.
+        for inside in (False, True):
             if need == 0 or left == 0:
                 break
+            theirs = current[near]
+            if inside:
+                in_range = (theirs >= low_int[near]) & (theirs <= high_int[near])
+                margin = theirs - low_int[near] if receives else high_int[near] - theirs
+                spare = np.where(in_range, margin, 0)
+            else:
+                # Bicis que le sobran a cada vecina (si `s` recibe) o que le faltan (si `s` entrega).
+                spare = theirs - high_int[near] if receives else low_int[near] - theirs
+            for position in np.nonzero(spare > 0)[0].tolist():
+                other = int(near[position])
+                bikes = min(need, int(spare[position]), left)
+                origin, destination = (other, s) if receives else (s, other)
+                moves.append(Move(origin, destination, bikes))
+                current[origin] -= bikes
+                current[destination] += bikes
+                need -= bikes
+                left -= bikes
+                if need == 0 or left == 0:
+                    break
     return moves
 
 
@@ -328,6 +352,67 @@ class NoIntervention:
 
     def decide(self, context: InterventionContext) -> list[Move]:
         return []
+
+
+class RandomPolicy:
+    """Piso de azar: gasta el presupuesto de cada franja moviendo bicis al azar, sin ninguna información.
+
+    No es una de las políticas del contrato (no va a `recommendations` ni a
+    `policy_curve`). Es una referencia: lo que se obtiene con el mismo
+    presupuesto cuando los traslados no usan pronóstico.
+
+    En cada intervención mueve una bici a la vez hasta gastar el presupuesto:
+
+    1. Sortea el origen entre las estaciones que tienen al menos una bici y
+       alguna vecina dentro de la distancia máxima con lugar libre (todas con
+       la misma probabilidad).
+    2. Sortea el destino entre esas vecinas con lugar libre.
+
+    Así cada traslado respeta los cuatro límites: bicis en el origen, lugar en
+    el destino, distancia máxima y presupuesto. Se detiene antes solo si ya no
+    queda ningún traslado posible. No mira umbrales ni rangos: puede vaciar o
+    llenar una estación.
+
+    El sorteo depende solo de `seed`, del día y de la franja: la misma
+    intervención con el mismo inventario da siempre los mismos traslados.
+    """
+
+    name = "random"
+
+    def __init__(self, network: Network, reglas: Reglas, seed, neighbors: list | None = None):
+        self.network = network
+        self.reglas = reglas
+        self.seed = tuple(int(value) for value in np.atleast_1d(seed))
+        self.neighbors = neighbors if neighbors is not None else network.neighbors_within(reglas.distancia_maxima_km)
+        self._has_neighbors = np.array([len(near) > 0 for near in self.neighbors], dtype=bool)
+
+    def decide(self, context: InterventionContext) -> list[Move]:
+        left = int(context.budget)
+        if left <= 0:
+            return []
+        franja = self.reglas.franjas.index(context.franja)
+        rng = np.random.default_rng([*self.seed, context.day.toordinal(), franja])
+        current = np.asarray(context.inventory, dtype=np.int64).copy()
+        capacity = self.network.capacity
+        stuck = np.zeros(self.network.size, dtype=bool)  # orígenes sin ninguna vecina con lugar, por ahora
+        moves: list[Move] = []
+        while left > 0:
+            origins = np.nonzero(self._has_neighbors & ~stuck & (current > 0))[0]
+            if origins.size == 0:
+                break
+            origin = int(origins[rng.integers(origins.size)])
+            near = self.neighbors[origin]
+            free = near[current[near] < capacity[near]]
+            if free.size == 0:
+                stuck[origin] = True
+                continue
+            destination = int(free[rng.integers(free.size)])
+            moves.append(Move(origin, destination, 1))
+            current[origin] -= 1
+            current[destination] += 1
+            left -= 1
+            stuck[:] = False  # el origen ganó un lugar libre: otra estación puede volver a tener destino
+        return moves
 
 
 class ForecastPolicy:

@@ -560,7 +560,10 @@ def test_el_script_escribe_predicciones_y_metricas_de_validacion(workspace, tmp_
     metrics = pq.read_table(out / "reports" / "metricas_validacion.parquet").to_pandas()
     assert list(metrics.columns) == METRIC_COLUMNS
     assert set(metrics["split"]) == {"val"} and set(metrics["model"]) == {"baseline"}
-    assert set(metrics["group_by"]) == {"general", "hora", "tipo_de_dia", "estacion"}
+    assert set(metrics["group_by"]) == {"general", "hora", "franja", "tipo_de_dia", "estacion"}
+    # Por franja se califican las mismas filas: las franjas suman el tramo, en salidas y en llegadas.
+    by_band = metrics[metrics["group_by"] == "franja"]
+    assert (by_band.groupby("target")["n"].sum() == (predictions["split"] == "val").sum()).all()
     assert set(metrics["target"]) == {"dep", "arr"}
     n_val = int((predictions["split"] == "val").sum())
     assert (metrics.loc[metrics["group_by"] == "general", "n"] == n_val).all()
@@ -572,7 +575,8 @@ def test_el_script_escribe_predicciones_y_metricas_de_validacion(workspace, tmp_
 
     report = (out / "reports" / "metricas_validacion.md").read_text(encoding="utf-8")
     for text in (
-        "## General", "## Por tipo de día", "## Por hora del día", "## Respaldo", "## Recortes", "## Cómo leer esto",
+        "## General", "## Por tipo de día", "## Por hora del día", "## Por franja del día",
+        "Las franjas son las del reporte de la simulación", "## Respaldo", "## Recortes", "## Cómo leer esto",
         "demanda atendida", "no la mediana", "NO se calificó", "La prueba final no se ha calificado",
         # Avisos para no leer de más: nivel 3, media contra mediana, cobertura y WAPE mayor que 100 %.
         "Las filas de nivel 3 no son un pronóstico de esa estación",
@@ -587,7 +591,7 @@ def test_el_script_escribe_predicciones_y_metricas_de_validacion(workspace, tmp_
     for forbidden in ("viajes recuperados", "MAPE"):
         assert forbidden not in report and forbidden not in printed
     assert "VALIDACIÓN" in printed and "no se calificó" in printed
-    assert "General" in printed and "Por tipo de día" in printed and "Por hora local" in printed
+    assert "General" in printed and "Por tipo de día" in printed and "Por hora local" in printed and "Por franja del día" in printed
 
 
 def test_dos_corridas_del_script_dan_archivos_identicos(workspace, tmp_path, capsys):

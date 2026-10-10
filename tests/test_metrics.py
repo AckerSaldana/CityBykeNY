@@ -6,8 +6,10 @@ a) MAE, RMSE, WAPE, cobertura y ancho medio contra un cálculo a mano.
 b) WAPE queda vacío (NaN) cuando la suma de los valores reales es 0.
 c) El tipo de día: un festivo entre semana es "festivo", un sábado es "fin de
    semana", y la fecha es la del reloj de Nueva York.
-d) `evaluate` arma la tabla larga con sus cuatro desgloses. No califica si
+d) `evaluate` arma la tabla larga con sus cinco desgloses. No califica si
    hay valores vacíos, cuantiles cruzados o filas reales sin predicción.
+   El desglose por franja usa las franjas del reporte de la simulación
+   (las de operación, la noche y "resto").
 e) El candado de la prueba final (decisión 4): calificar "test" falla salvo
    que se pida de forma explícita, y también una fila con fecha de la prueba
    final aunque su etiqueta diga "val".
@@ -28,6 +30,7 @@ import pytest
 from src.data.datos_config import Tramo, load_datos
 from src.models.metrics import (
     DAY_TYPES,
+    GROUP_BYS,
     METRIC_COLUMNS,
     METRICS_SCHEMA,
     FinalTestError,
@@ -36,9 +39,12 @@ from src.models.metrics import (
     federal_holidays,
     format_table,
     metrics_by_group,
+    report_bands,
     write_metrics,
 )
-from src.paths import DATOS_YAML, TZ
+from src.paths import DATOS_YAML, OPERACION_YAML, TZ
+from src.sim.engine import NIGHT, OUTSIDE, Franja, Reglas, hour_labels
+from src.sim.operacion import load_operacion
 
 # La prueba final de estas pruebas empieza después de las horas del ejemplo (4 a 7 de septiembre de 2026).
 # Se le pasa a `evaluate` para no depender de las fechas de config/datos.yaml.
@@ -178,9 +184,16 @@ def pick(metrics: pd.DataFrame, target: str, group_by: str, group: str) -> pd.Se
     return rows.iloc[0]
 
 
-def test_evaluate_devuelve_la_tabla_larga_con_los_cuatro_desgloses(scored):
+# Franjas de estas pruebas, escritas aquí: mañana de 06:00 a 12:00, tarde de 15:00 a 21:00 y noche de 22:00
+# a 06:00. Lo demás (12:00 a 15:00 y 21:00 a 22:00) es "resto".
+FRANJAS = (Franja("manana", "05:00", "06:00", "12:00", 0.5), Franja("tarde", "14:00", "15:00", "21:00", 0.5))
+BANDS = hour_labels(FRANJAS, ("22:00", "06:00"))
+
+
+def test_evaluate_devuelve_la_tabla_larga_con_los_cinco_desgloses(scored):
     predictions, station_hour = scored
-    metrics = evaluate(predictions, station_hour, model="baseline", split="val", prueba_final=FINAL)
+    metrics = evaluate(predictions, station_hour, model="baseline", split="val", prueba_final=FINAL, franjas=BANDS)
+    assert set(metrics["group_by"]) == set(GROUP_BYS)
 
     assert list(metrics.columns) == METRIC_COLUMNS
     assert set(metrics["model"]) == {"baseline"} and set(metrics["split"]) == {"val"}
@@ -190,6 +203,7 @@ def test_evaluate_devuelve_la_tabla_larga_con_los_cuatro_desgloses(scored):
         assert groups == {
             "general": ["todas"],
             "hora": ["08", "09"],
+            "franja": ["manana"],   # las cuatro horas del ejemplo son de la mañana
             "tipo_de_dia": ["laborable", "fin de semana", "festivo"],
             "estacion": ["5470.1", "5470.10"],
         }
@@ -217,6 +231,76 @@ def test_evaluate_devuelve_la_tabla_larga_con_los_cuatro_desgloses(scored):
     assert pick(metrics, "dep", "tipo_de_dia", "fin de semana")["mae"] == pytest.approx((0 + 1) / 2)
     assert pick(metrics, "dep", "hora", "09")["n"] == 2
     assert pick(metrics, "dep", "hora", "09")["mae"] == pytest.approx((4 + 1) / 2)
+
+
+def test_la_franja_de_cada_hora_es_la_del_reporte_de_la_simulacion():
+    assert list(BANDS) == [NIGHT] * 6 + ["manana"] * 6 + [OUTSIDE] * 3 + ["tarde"] * 6 + [OUTSIDE] + [NIGHT] * 2
+    # Sin franja de noche, lo que no es franja de operación es "resto".
+    assert list(hour_labels(FRANJAS)) == [OUTSIDE] * 6 + ["manana"] * 6 + [OUTSIDE] * 3 + ["tarde"] * 6 + [OUTSIDE] * 3
+    # Donde la noche se encima con una franja de operación, la hora cuenta en la franja de operación.
+    assert list(hour_labels(FRANJAS, ("20:00", "07:00")))[18:] == ["tarde"] * 3 + [NIGHT] * 3
+    assert list(hour_labels(FRANJAS, ("20:00", "07:00")))[:8] == [NIGHT] * 6 + ["manana"] * 2
+    # Una noche que no cruza la medianoche.
+    assert list(hour_labels(FRANJAS, ("00:00", "05:00")))[:7] == [NIGHT] * 5 + [OUTSIDE] + ["manana"]
+    # Un borde que no cae en hora exacta: la hora cuenta donde empieza (las 12:00 empiezan en la mañana).
+    late = (Franja("manana", "05:00", "06:00", "12:30", 1.0),)
+    assert hour_labels(late)[12] == "manana" and hour_labels(late)[13] == OUTSIDE
+
+
+def test_las_franjas_por_defecto_salen_de_los_dos_archivos_de_config():
+    franjas = Reglas.from_operacion(load_operacion(OPERACION_YAML)).franjas
+    noche = load_datos(DATOS_YAML).simulacion.franja_noche
+    bands = report_bands()
+    assert bands == hour_labels(franjas, tuple(noche)) and len(bands) == 24
+    assert {franja.nombre for franja in franjas} <= set(bands) <= {*(f.nombre for f in franjas), NIGHT, OUTSIDE}
+
+
+def test_las_metricas_por_franja_son_las_del_calculo_a_mano():
+    # Una estación y seis horas: dos de la mañana, una de "resto", una de la tarde y dos de la noche (una
+    # antes y otra después de la medianoche).
+    hours = ts("2026-09-04 08:00", "2026-09-04 11:00", "2026-09-04 13:00", "2026-09-04 16:00",
+               "2026-09-04 23:00", "2026-09-05 02:00")
+    station_hour = pd.DataFrame(
+        {"station_id": ["A"] * 6, "ts_hour": hours, "departures": [4, 6, 2, 9, 1, 0], "arrivals": [0] * 6}
+    )
+    predictions = station_hour[["station_id", "ts_hour"]].copy()
+    predictions["model"], predictions["split"] = "baseline", "val"
+    predictions["dep_q10"] = [2.0, 2.0, 0.0, 5.0, 0.0, 0.0]
+    predictions["dep_q50"] = [3.0, 8.0, 2.0, 6.0, 3.0, 1.0]
+    predictions["dep_q90"] = [5.0, 9.0, 4.0, 8.0, 4.0, 2.0]
+    for q in ("q10", "q50", "q90"):
+        predictions[f"arr_{q}"] = 0.0
+    metrics = evaluate(predictions, station_hour, model="baseline", split="val", prueba_final=FINAL, franjas=BANDS)
+
+    rows = metrics[(metrics["group_by"] == "franja") & (metrics["target"] == "dep")]
+    assert rows["group"].tolist() == ["manana", "tarde", NIGHT, OUTSIDE]   # el orden del reporte de la simulación
+    assert rows["n"].tolist() == [2, 1, 2, 1]
+    assert rows["n"].sum() == pick(metrics, "dep", "general", "todas")["n"]   # las franjas suman el tramo
+    # Mañana: errores 1 y 2; reales 4 y 6; las dos dentro del intervalo; anchos 3 y 7.
+    manana = pick(metrics, "dep", "franja", "manana")
+    assert manana["mae"] == pytest.approx(1.5) and manana["rmse"] == pytest.approx(math.sqrt(2.5))
+    assert manana["wape"] == pytest.approx(3 / 10) and manana["coverage"] == 1.0 and manana["mean_width"] == 5.0
+    # Tarde: real 9 contra 6, fuera del intervalo (5 a 8).
+    tarde = pick(metrics, "dep", "franja", "tarde")
+    assert (tarde["mae"], tarde["coverage"], tarde["wape"]) == (3.0, 0.0, pytest.approx(3 / 9))
+    # Noche: las 23:00 y las 02:00 del día siguiente van juntas. Errores 2 y 1; reales 1 y 0.
+    noche = pick(metrics, "dep", "franja", NIGHT)
+    assert noche["mae"] == pytest.approx(1.5) and noche["wape"] == pytest.approx(3 / 1) and noche["coverage"] == 1.0
+    # Resto: las 13:00, sin error.
+    assert pick(metrics, "dep", "franja", OUTSIDE)["mae"] == 0.0
+    # Sin llegadas reales, el WAPE de llegadas queda vacío en todas las franjas.
+    assert metrics.loc[(metrics["group_by"] == "franja") & (metrics["target"] == "arr"), "wape"].isna().all()
+
+    # Otras franjas, otro reparto de las mismas filas; y hacen falta las 24 horas.
+    todo_resto = evaluate(predictions, station_hour, model="baseline", split="val", prueba_final=FINAL,
+                          franjas=[OUTSIDE] * 24)
+    assert todo_resto.loc[todo_resto["group_by"] == "franja", "group"].tolist() == [OUTSIDE, OUTSIDE]
+    assert pick(todo_resto, "dep", "franja", OUTSIDE)["mae"] == pick(metrics, "dep", "general", "todas")["mae"]
+    with pytest.raises(ValueError, match="24 etiquetas"):
+        evaluate(predictions, station_hour, model="baseline", split="val", prueba_final=FINAL, franjas=BANDS[:23])
+    # Sin `franjas`, las de config/operacion.yaml y config/datos.yaml.
+    default = evaluate(predictions, station_hour, model="baseline", split="val", prueba_final=FINAL)
+    assert set(default.loc[default["group_by"] == "franja", "group"]) <= set(report_bands())
 
 
 def test_evaluate_solo_califica_el_modelo_y_el_tramo_pedidos(scored):

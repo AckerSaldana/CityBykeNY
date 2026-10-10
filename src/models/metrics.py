@@ -12,8 +12,13 @@ Qué se mide, para salidas (dep) y para llegadas (arr) por separado:
   del 10 % al 90 %, así que la cobertura nominal es 80 %.
 - Ancho medio del intervalo = promedio de q90 - q10.
 
-Desgloses: general, por hora local del día, por tipo de día (laborable, fin
-de semana, festivo) y por estación.
+Desgloses: general, por hora local del día, por franja del reporte, por tipo
+de día (laborable, fin de semana, festivo) y por estación.
+
+Las franjas del reporte son las mismas con las que la simulación reporta el
+riesgo: las franjas de config/operacion.yaml, la franja de noche de
+config/datos.yaml (`simulacion.franja_noche`) y "resto". Cada fila de estación
+y hora cuenta en la franja donde empieza su hora.
 
 La prueba final se usa una sola vez (decisión 4). Por eso `evaluate` se niega
 a calificar el tramo "test", y cualquier fila que caiga en las fechas de la
@@ -36,14 +41,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.data.datos_config import Tramo, load_datos
-from src.paths import TZ
+from src.paths import DATOS_YAML, OPERACION_YAML, TZ
+from src.sim.engine import NIGHT, OUTSIDE, Reglas, hour_labels
+from src.sim.operacion import load_operacion
 
 # Prefijo de las columnas en predictions -> columna con el valor real en station_hour.
 TARGETS = {"dep": "departures", "arr": "arrivals"}
 TARGET_LABELS = {"dep": "salidas", "arr": "llegadas"}
 KEYS = ["station_id", "ts_hour"]
 
-GROUP_BYS = ("general", "hora", "tipo_de_dia", "estacion")
+GROUP_BYS = ("general", "hora", "franja", "tipo_de_dia", "estacion")
 DAY_TYPES = ("laborable", "fin de semana", "festivo")
 ALL = "todas"              # valor de `group` en el desglose general
 FINAL_SPLIT = "test"       # el tramo que se califica una sola vez
@@ -58,7 +65,7 @@ METRICS_SCHEMA = pa.schema(
         ("split", pa.string()),
         ("target", pa.string()),       # "dep" o "arr"
         ("group_by", pa.string()),     # uno de GROUP_BYS
-        ("group", pa.string()),        # "todas", hora "00" a "23", tipo de día o station_id
+        ("group", pa.string()),        # "todas", hora "00" a "23", franja, tipo de día o station_id
         ("n", pa.int64()),             # filas de estación y hora calificadas
         ("mae", pa.float64()),
         ("rmse", pa.float64()),
@@ -113,6 +120,28 @@ def day_type(ts_hour: pd.Series) -> pd.Series:
     return pd.Series(kind, index=ts_hour.index)
 
 
+# Nota que acompaña a la tabla por franja en los reportes de métricas.
+FRANJA_NOTE = (
+    "Las franjas son las del reporte de la simulación: las de `config/operacion.yaml`, la franja de noche de\n"
+    "`config/datos.yaml` (`simulacion.franja_noche`) y \"resto\", que es lo que no cae en ninguna. Cada fila de\n"
+    "estación y hora cuenta en la franja donde empieza su hora. Las filas de las franjas suman las del tramo."
+)
+
+
+def report_bands(operacion: str | Path = OPERACION_YAML, config: str | Path = DATOS_YAML) -> tuple[str, ...]:
+    """Franja del reporte de cada hora de reloj (de la 0 a la 23), leída de los dos archivos de config.
+
+    Las franjas de operación salen de `operacion` (config/operacion.yaml) y la
+    franja de noche del bloque `simulacion` de `config` (config/datos.yaml).
+    Lo que no cae en ninguna es "resto". Si `config` no trae el bloque
+    `simulacion`, no hay franja de noche. Es la misma regla con la que la
+    simulación reparte el riesgo (`src.sim.engine.hour_labels`).
+    """
+    franjas = Reglas.from_operacion(load_operacion(operacion)).franjas
+    simulacion = load_datos(config).simulacion
+    return hour_labels(franjas, None if simulacion is None else tuple(simulacion.franja_noche))
+
+
 # --------------------------------------------------------------------------- #
 # Cálculo
 # --------------------------------------------------------------------------- #
@@ -160,6 +189,7 @@ def evaluate(
     usar_prueba_final: bool = False,
     prueba_final: Tramo | None = None,
     exigir_todas: bool = True,
+    franjas=None,
 ) -> pd.DataFrame:
     """Califica un modelo en un tramo. Devuelve la tabla larga (METRIC_COLUMNS).
 
@@ -186,6 +216,9 @@ def evaluate(
       Por eso a `station_hour` se le pasan solo las filas del tramo. Con
       `False` se califican solo las filas que el modelo sí predijo: esas
       métricas no se pueden comparar con las de otro modelo.
+    - `franjas`: la franja del reporte de cada hora de reloj, 24 etiquetas de
+      la hora 0 a la 23 (lo que devuelve `report_bands`). Si no se pasa, se
+      lee de config/operacion.yaml y config/datos.yaml.
 
     Falla con ValueError si en las filas a calificar hay un valor vacío (un
     vacío contaría como error cero) o si q10 es mayor que q90.
@@ -240,9 +273,16 @@ def evaluate(
             "esas métricas no se pueden comparar con las de otro modelo."
         )
 
+    bands = np.array(report_bands() if franjas is None else list(franjas), dtype=object)
+    if len(bands) != 24:
+        raise ValueError(f"`franjas` debe traer 24 etiquetas, una por hora de reloj (trae {len(bands)}).")
+    # Como en el reporte de la simulación: primero las franjas de operación, después la noche y el resto.
+    band_order = [band for band in dict.fromkeys(bands.tolist()) if band not in (NIGHT, OUTSIDE)] + [NIGHT, OUTSIDE]
+    hour = local_time(scored["ts_hour"]).dt.hour.to_numpy()
     groups = {
         "general": None,
-        "hora": _HOUR_LABELS[local_time(scored["ts_hour"]).dt.hour.to_numpy()],
+        "hora": _HOUR_LABELS[hour],
+        "franja": bands[hour],
         "tipo_de_dia": day_type(scored["ts_hour"]).to_numpy(),
         "estacion": scored["station_id"].to_numpy(),
     }
@@ -254,6 +294,8 @@ def evaluate(
             )
             if group_by == "tipo_de_dia":  # en el orden de DAY_TYPES, no alfabético
                 part = part.reindex([kind for kind in DAY_TYPES if kind in part.index])
+            elif group_by == "franja":
+                part = part.reindex([band for band in band_order if band in part.index])
             part = part.rename_axis("group").reset_index()
             part["group"] = part["group"].astype("str")
             part["model"], part["split"], part["target"], part["group_by"] = model, split, prefix, group_by

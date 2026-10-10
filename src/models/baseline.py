@@ -62,6 +62,7 @@ import pandas as pd
 from src.contracts import PREDICTIONS, SPLITS, read_contract, validate_file, write_contract
 from src.data.datos_config import SPLIT_NAMES, TRAMOS, Datos, Tramo, load_datos
 from src.models.metrics import (
+    FRANJA_NOTE,
     NOMINAL_COVERAGE,
     TARGET_LABELS,
     evaluate,
@@ -69,6 +70,7 @@ from src.models.metrics import (
     format_table,
     local_time,
     markdown_table,
+    report_bands,
     write_metrics,
 )
 from src.paths import DATA_PROCESSED, DATOS_YAML, ROOT
@@ -408,6 +410,12 @@ Unidades: MAE, RMSE y ancho están en viajes por estación y hora. WAPE y cobert
 
 {format_table(metrics, "hora", "hora")}
 
+## Por franja del día
+
+{format_table(metrics, "franja", "franja")}
+
+{FRANJA_NOTE}
+
 El desglose por estación está en `{REPORT_NAME}.parquet`, en las filas con `group_by = "estacion"`.
 
 ## Respaldo cuando una celda no tiene historia
@@ -521,6 +529,7 @@ def main(argv: list[str] | None = None) -> int:
             model=MODEL,
             split="val",
             prueba_final=datos.tramos[TRAMO_OF_SPLIT["test"]],
+            franjas=report_bands(config=args.config),
         )
         report = build_report(summaries, metrics)
         fingerprint = json.dumps(input_fingerprint(station_hour, datos), indent=2) + "\n"
@@ -553,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         ("General", "general", "grupo"),
         ("Por tipo de día", "tipo_de_dia", "tipo de día"),
         ("Por hora local", "hora", "hora"),
+        ("Por franja del día (las del reporte de la simulación)", "franja", "franja"),
     ):
         print(f"\n{title}")
         print(format_table(metrics, group_by, label))

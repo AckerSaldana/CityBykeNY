@@ -29,6 +29,11 @@ calentamiento y no cuenta. El total de bicis no cambia durante la corrida.
 La banda de incertidumbre se elige en la misma corrida entre las candidatas
 de config/datos.yaml: la de menor riesgo simulado en validación.
 
+Además corre el piso de azar (`simulacion.corridas_piso_de_azar` corridas que
+mueven bicis al azar con el presupuesto de referencia). Es una referencia del
+reporte: no va a recommendations.parquet ni a policy_curve.parquet. El reporte
+termina con docs/experimento_mediodia.md, tal cual, si ese archivo existe.
+
 La prueba final no se simula (decisión 4): `--tramo prueba` se rechaza salvo
 que se agregue `--usar-prueba-final`.
 

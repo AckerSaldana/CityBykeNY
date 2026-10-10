@@ -30,6 +30,14 @@ Orden de la corrida:
    promediado entre esas políticas. Se usa para todo lo demás.
 3. Curva: los demás presupuestos, con la banda elegida.
 4. Sensibilidad: la corrida de referencia con otros inventarios iniciales.
+5. Piso de azar: con el presupuesto de referencia, `corridas_piso_de_azar`
+   corridas de una política que mueve bicis al azar (`RandomPolicy`). Es una
+   referencia para el reporte: no es una política del contrato y no va a
+   `recommendations` ni a `policy_curve`.
+
+El reporte termina con el contenido de docs/experimento_mediodia.md, tal
+cual, cuando ese archivo existe: es el registro fechado de un experimento
+descartado y no se recalcula.
 
 simulacion.json guarda una huella de lo que se leyó (`corrida.huella`: reglas,
 bloque `simulacion`, fechas, un número de control de cada tabla y del archivo
@@ -107,6 +115,7 @@ from src.sim.policies import (
     ForecastPolicy,
     ForecastWindow,
     NoIntervention,
+    RandomPolicy,
     safe_range,
     stations_with_history,
 )
@@ -124,6 +133,9 @@ FORECAST_OF = {"historical": "baseline", "model": "lgbm"}
 OBSERVED = "observado en GBFS"
 NOT_SIMULATED = "ninguno"  # lo que dice el reporte del pronóstico de "model" cuando no se simuló
 FULL_BAND = 1.0  # la banda completa, de q10 a q90: la que separa el riesgo "medio" del "bajo"
+RANDOM_LABEL = "piso de azar"  # mover bicis al azar: referencia del reporte, no es una política del contrato
+# Registro fechado de un experimento descartado. El reporte lo lleva al final, tal cual, si el archivo existe.
+EXPERIMENT_FILE = ROOT / "docs" / "experimento_mediodia.md"
 
 
 @dataclass(frozen=True)
@@ -136,6 +148,7 @@ class Resultado:
     runs: dict          # (política, presupuesto del día en bicis) -> RunResult, con la banda elegida
     network: Network
     calendar: Calendar
+    random_runs: tuple = ()   # corridas del piso de azar con el presupuesto de referencia; no van a las tablas
 
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +484,58 @@ def summarize(result: RunResult, none: RunResult, calendar: Calendar, reglas: Re
     }
 
 
+def avoided_percent(avoided: float, without: float) -> float | None:
+    """Riesgo simulado evitado como porcentaje del riesgo sin intervención. None si ese riesgo es 0."""
+    return float(avoided / without * 100) if without else None
+
+
+def _spread(values) -> dict:
+    """Media y rango (mínimo y máximo) de un valor entre las corridas del piso de azar."""
+    values = np.asarray(values, dtype="float64")
+    return {"media": float(values.mean()), "minimo": float(values.min()), "maximo": float(values.max())}
+
+
+def summarize_random(results, none: RunResult, calendar: Calendar, budget: int, semilla: int) -> dict:
+    """Resumen de las corridas del piso de azar: media y rango entre corridas, sobre los días evaluados.
+
+    Cada corrida aporta su media por día evaluado. El rango es el mínimo y el
+    máximo de esas medias: dice cuánto cambia el resultado con el sorteo, no
+    es un intervalo de confianza. Sin corridas devuelve solo `corridas: 0`.
+    """
+    out = {"corridas": int(len(results)), "semilla": int(semilla), "presupuesto_del_dia_en_bicis": int(budget)}
+    if not results:
+        return out
+    days = calendar.evaluated
+    base = daily_risk(none, calendar)
+    rows = []
+    for index, result in enumerate(results):
+        hours = result.risk_hours[days]
+        total = hours[:, :, 0].sum(axis=1)
+        rows.append(
+            {
+                "corrida": index,
+                "riesgo_por_dia": float(total.mean()),
+                "riesgo_simulado_evitado_por_dia": float((base - total).mean()),
+                "riesgo_por_franja": {label: float(hours[:, i, 0].mean()) for i, label in enumerate(calendar.labels)},
+                "viajes_bloqueados_por_dia": float(result.blocked[days].mean()),
+                "llegadas_desviadas_por_dia": float(result.diverted[days].mean()),
+                "bicis_movidas_por_dia": float(result.budget_used[days].sum(axis=1).mean()),
+                "riesgo_de_cada_dia": [float(v) for v in total],
+            }
+        )
+    for key in ("riesgo_por_dia", "riesgo_simulado_evitado_por_dia", "viajes_bloqueados_por_dia",
+                "llegadas_desviadas_por_dia", "bicis_movidas_por_dia"):
+        out[key] = _spread([row[key] for row in rows])
+    out["riesgo_simulado_evitado_pct"] = avoided_percent(
+        out["riesgo_simulado_evitado_por_dia"]["media"], float(base.mean())
+    )
+    out["riesgo_por_franja"] = {
+        label: _spread([row["riesgo_por_franja"][label] for row in rows]) for label in calendar.labels
+    }
+    out["cada_corrida"] = rows
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Simulación completa
 # --------------------------------------------------------------------------- #
@@ -723,6 +788,10 @@ def run_simulation(
                 name: {
                     "riesgo_por_dia": float(daily_risk(result, calendar).mean()),
                     "riesgo_simulado_evitado_por_dia": float((without - daily_risk(result, calendar)).mean()),
+                    # Contra el riesgo sin intervención de ESTE inventario inicial, no el de la corrida principal.
+                    "riesgo_simulado_evitado_pct": avoided_percent(
+                        float((without - daily_risk(result, calendar)).mean()), float(without.mean())
+                    ),
                     "viajes_bloqueados_por_dia": float(result.blocked[calendar.evaluated].mean()),
                 }
                 for name, result in results.items()
@@ -748,6 +817,23 @@ def run_simulation(
             sensitivity_row(f"todas al {float(flat) * 100:g} %", float(other.sum() / network.capacity.sum()),
                             other_none, other_runs)
         )
+
+    # Piso de azar: el presupuesto de referencia gastado en traslados al azar. Referencia del reporte; no va
+    # a `runs`, así que no llega a las recomendaciones ni a la curva.
+    random_runs = []
+    for index in range(int(ajustes.corridas_piso_de_azar)):
+        say(f"{RANDOM_LABEL}, corrida {index + 1} de {int(ajustes.corridas_piso_de_azar)}, {reference:,} bicis al día")
+        chance = RandomPolicy(network, reglas, (int(ajustes.semilla), index), neighbors)
+        random_runs.append(simulate(network, events, calendar, reglas, chance, reference, start))
+        simulated += 1
+    if random_runs:
+        if any(result.initial_total != none.initial_total or result.final_total != result.initial_total
+               for result in random_runs):
+            raise CheckError("El total de bicis cambió en una corrida del piso de azar.")
+        say(f"repetición del {RANDOM_LABEL} para comprobar que el sorteo se repite con la semilla")
+        chance = RandomPolicy(network, reglas, (int(ajustes.semilla), 0), neighbors)
+        if simulate(network, events, calendar, reglas, chance, reference, start).digest() != random_runs[0].digest():
+            raise CheckError("Dos corridas del piso de azar con la misma semilla dieron resultados distintos.")
 
     evaluated = calendar.evaluated
     draws = resample_days(len(evaluated), int(ajustes.remuestreos), int(ajustes.semilla))
@@ -879,6 +965,7 @@ def run_simulation(
             "banda": band,
             "filas": sensitivity,
         },
+        "piso_de_azar": summarize_random(random_runs, none, calendar, reference, int(ajustes.semilla)),
         "recomendaciones": recommended,
         "diferencias_entre_politicas": {
             "presupuesto_del_dia_en_bicis": int(reference),
@@ -895,11 +982,20 @@ def run_simulation(
             'La política "none" no movió bicis.',
             f"Se repitió la corrida de {POLICY_LABELS[names[0]]} con {reference:,} bicis al día y dio el mismo "
             "resultado.",
+            *(
+                [
+                    f"Las {len(random_runs)} corridas del {RANDOM_LABEL} pasaron las mismas comprobaciones (total de "
+                    "bicis, los cuatro límites de cada traslado y presupuesto por franja); la primera se repitió "
+                    "con la misma semilla y dio el mismo resultado."
+                ]
+                if random_runs
+                else []
+            ),
         ],
         "corridas_simuladas": simulated,
     }
     report["limitaciones"] = limitations(report)
-    return Resultado(recommendations, policy_curve, report, runs, network, calendar)
+    return Resultado(recommendations, policy_curve, report, runs, network, calendar, tuple(random_runs))
 
 
 # --------------------------------------------------------------------------- #
@@ -975,6 +1071,9 @@ def limitations(report: dict) -> list[str]:
         "Reparto del presupuesto: dentro de la misma prioridad se atiende primero la diferencia más pequeña. "
         "La regla que pidió el usuario, \"riesgo evitado por bici\", **no se implementó**: necesita un modelo "
         "del riesgo esperado por estación y franja que no existe. La diferencia más pequeña es su sustituto.",
+        "Una estación dentro de su rango aceptado puede prestar o recibir bicis para atender a una vecina que "
+        "está fuera del suyo, sin salir de su propio rango. Después de hacerlo puede quedar en el borde de su "
+        "rango: su mínimo si prestó, su máximo si recibió.",
         "Bicis clásicas y eléctricas se cuentan juntas.",
         "Una estación cerrada varios días se ve como demanda cero: la simulación no sabe que estaba cerrada.",
         "La banda trata las horas como independientes entre sí y las salidas como independientes de las "
@@ -1173,10 +1272,155 @@ def _differences(report: dict) -> list[str]:
     ]
 
 
-def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
+def _signed(value: float) -> str:
+    """Una diferencia con su signo: +12.3 o -4.0."""
+    return f"{value:+,.1f}"
+
+
+def _pct(value: float | None) -> str:
+    return "n/d" if value is None else f"{value:.1f} %"
+
+
+def _spread_range(stat: dict) -> str:
+    return f"{_n(stat['minimo'])} a {_n(stat['maximo'])}"
+
+
+def _random_section(report: dict) -> list[str]:
+    """Sección del piso de azar: mover bicis al azar junto a las políticas, con el presupuesto de referencia."""
+    floor = report["piso_de_azar"]
+    if not floor["corridas"]:
+        return []
+    rows, labels = _at_reference(report), list(report["reglas"]["etiquetas_del_reporte"])
+    none = rows["none"]
+    base = none["riesgo_por_dia"]["media"]
+    title = f"{RANDOM_LABEL} (media de {floor['corridas']} corridas)"
+    table = [
+        [
+            POLICY_LABELS["none"], _n(base), "", _n(0.0), _pct(avoided_percent(0.0, base)),
+            *[_n(none["riesgo_por_franja"][label]["media"]) for label in labels],
+            _n(none["viajes_bloqueados"]["por_dia"]), _n(none["llegadas_desviadas"]["por_dia"]),
+            _n(none["bicis_movidas"]["por_dia"]),
+        ],
+        [
+            title, _n(floor["riesgo_por_dia"]["media"]), _spread_range(floor["riesgo_por_dia"]),
+            _n(floor["riesgo_simulado_evitado_por_dia"]["media"]), _pct(floor["riesgo_simulado_evitado_pct"]),
+            *[_n(floor["riesgo_por_franja"][label]["media"]) for label in labels],
+            _n(floor["viajes_bloqueados_por_dia"]["media"]), _n(floor["llegadas_desviadas_por_dia"]["media"]),
+            _n(floor["bicis_movidas_por_dia"]["media"]),
+        ],
+    ]
+    over = []
+    for policy in _policies(report):
+        if policy == "none":
+            continue
+        row = rows[policy]
+        avoided = row["riesgo_simulado_evitado_por_dia"]["media"]
+        table.append(
+            [
+                POLICY_LABELS[policy], _n(row["riesgo_por_dia"]["media"]), "", _n(avoided),
+                _pct(avoided_percent(avoided, base)),
+                *[_n(row["riesgo_por_franja"][label]["media"]) for label in labels],
+                _n(row["viajes_bloqueados"]["por_dia"]), _n(row["llegadas_desviadas"]["por_dia"]),
+                _n(row["bicis_movidas"]["por_dia"]),
+            ]
+        )
+        over.append(
+            f"{POLICY_LABELS[policy]}, {_n(floor['riesgo_por_dia']['media'] - row['riesgo_por_dia']['media'])}"
+        )
+    return [
+        "## Piso de azar: mover bicis sin información",
+        "",
+        "Es una referencia, **no una política del contrato**: no está en `recommendations.parquet` ni en "
+        f"`policy_curve.parquet`. Gasta el presupuesto de referencia ({floor['presupuesto_del_dia_en_bicis']:,} "
+        "bicis al día), con el mismo reparto por franja y en los mismos momentos de intervención, moviendo una "
+        "bici a la vez: el origen se sortea entre las estaciones con al menos una bici y alguna vecina con lugar "
+        "libre dentro de la distancia máxima, y el destino entre esas vecinas. Respeta los cuatro límites (bicis "
+        "en el origen, lugar en el destino, distancia máxima y presupuesto). No usa pronóstico ni mira los "
+        "umbrales de riesgo.",
+        "",
+        f"Se corrió {floor['corridas']} veces, cada una con su propio sorteo (`simulacion.semilla` "
+        f"{floor['semilla']} y `simulacion.corridas_piso_de_azar` de config/datos.yaml). La tabla da la media "
+        "entre corridas y el rango (mínimo a máximo), que dice cuánto cambia el resultado con el sorteo: no es "
+        "un intervalo de confianza. Horas de estación en riesgo por día evaluado, mismo inventario inicial y "
+        "mismos viajes que las demás. Los viajes bloqueados y las llegadas desviadas son simulados.",
+        "",
+        _table(
+            ["política", "horas en riesgo por día", "rango entre corridas", "riesgo simulado evitado por día",
+             "% del riesgo sin intervención", *labels, "viajes bloqueados por día", "llegadas desviadas por día",
+             "bicis movidas por día"],
+            table,
+        ),
+        "",
+        "Horas de estación en riesgo por día del piso de azar menos las de cada política (positivo: la política "
+        f"tiene menos riesgo simulado que mover al azar): {'; '.join(over)}. El detalle de cada corrida está en "
+        "`simulacion.json` (`piso_de_azar`).",
+        "",
+    ]
+
+
+def _blocked_section(report: dict) -> list[str]:
+    """Viajes bloqueados y llegadas desviadas por política y presupuesto, y su diferencia contra no intervenir."""
+    none = next(row for row in report["resultados"] if row["politica"] == "none")
+    blocked, diverted = none["viajes_bloqueados"]["por_dia"], none["llegadas_desviadas"]["por_dia"]
+    table = [
+        [
+            *_first_cells(row),
+            _n(row["viajes_bloqueados"]["por_dia"]),
+            _signed(row["viajes_bloqueados"]["por_dia"] - blocked),
+            _n(row["llegadas_desviadas"]["por_dia"]),
+            _signed(row["llegadas_desviadas"]["por_dia"] - diverted),
+        ]
+        for row in _shown(report)
+    ]
+    floor = report["piso_de_azar"]
+    note = ""
+    if floor["corridas"]:
+        reference = report["reglas"]
+        table.append(
+            [
+                f"{RANDOM_LABEL} (media de {floor['corridas']} corridas)",
+                f"{reference['presupuesto_de_referencia']:g}",
+                f"{floor['presupuesto_del_dia_en_bicis']:,}",
+                _n(floor["viajes_bloqueados_por_dia"]["media"]),
+                _signed(floor["viajes_bloqueados_por_dia"]["media"] - blocked),
+                _n(floor["llegadas_desviadas_por_dia"]["media"]),
+                _signed(floor["llegadas_desviadas_por_dia"]["media"] - diverted),
+            ]
+        )
+        note = (
+            f" El {RANDOM_LABEL} es una referencia, no una política del contrato; entre sus corridas los viajes "
+            f"bloqueados por día van de {_spread_range(floor['viajes_bloqueados_por_dia'])} y las llegadas "
+            f"desviadas de {_spread_range(floor['llegadas_desviadas_por_dia'])}."
+        )
+    return [
+        "## Viajes bloqueados y llegadas desviadas por política (simulados)",
+        "",
+        "**Son resultados de la simulación, no mediciones**: los datos solo registran demanda atendida. Un viaje "
+        "bloqueado es una salida que en la simulación encontró la estación sin bicis (posible demanda "
+        "insatisfecha). Una llegada desviada encontró la estación llena y la bici fue a la estación con lugar "
+        "más cercana. Media por día evaluado. \"Diferencia\" es contra sin intervención: negativo es menos que "
+        f"sin intervenir.{note}",
+        "",
+        _table(
+            ["política", "bicis por estación", "bicis al día", "viajes bloqueados por día",
+             "diferencia contra sin intervención", "llegadas desviadas por día",
+             "diferencia contra sin intervención"],
+            table,
+        ),
+        "",
+    ]
+
+
+def build_report(
+    report: dict, operacion: str = "config/operacion.yaml", anexo: str | Path | None = EXPERIMENT_FILE
+) -> str:
     """El reporte en Markdown. Todos los números salen de `report`.
 
     `operacion` es el archivo de reglas con el que se corrió, tal como se muestra en el reporte.
+
+    `anexo` es un archivo que se agrega al final tal cual, si existe: por defecto
+    docs/experimento_mediodia.md, el registro fechado de un experimento descartado. No se recalcula ni se
+    cambia una palabra. Con `None` no se agrega nada.
     """
     tramo, rules, stations = report["tramo"], report["reglas"], report["estaciones"]
     level = f"{report['intervalo']['nivel'] * 100:g} %"
@@ -1214,7 +1458,7 @@ def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
         f"{tramo['dias_evaluados'][-1]}.",
         f"- Políticas simuladas: {', '.join(POLICY_LABELS[name] for name in policies)}.",
         f"- Corridas simuladas: {report['corridas_simuladas']} (sin intervención, las de la banda, las de la "
-        "curva y las de la sensibilidad). Con presupuesto 0 todas las políticas son la corrida sin intervención "
+        "curva, las de la sensibilidad y las del piso de azar). Con presupuesto 0 todas las políticas son la corrida sin intervención "
         "y no se vuelven a simular.",
         "- Todas las políticas parten del mismo inventario y enfrentan los mismos viajes. En cada intervención "
         "una política ve el inventario simulado de ese momento y ningún viaje.",
@@ -1423,9 +1667,11 @@ def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
         f"estación, {reference:,} bicis al día.",
         "- Reparto del presupuesto: primero el tipo con más prioridad (una estación sin tipo va después de "
         "todas las que tienen); dentro de la misma prioridad, primero la estación a la que le falta o le sobra "
-        "MENOS para llegar a su rango, y después por id. La contraparte es la estación más cercana, dentro de la "
-        "distancia máxima, con la necesidad contraria (a una le faltan bicis y a la otra le sobran); una "
-        "estación que ya está dentro de su rango no recibe ni presta. **No se implementó \"riesgo evitado por bici\"**, que era la primera opción del "
+        "MENOS para llegar a su rango, y después por id. Solo se atiende a estaciones que están fuera de su "
+        "rango, y cada una llega como mucho al borde más cercano. La contraparte es primero la estación más "
+        "cercana, dentro de la distancia máxima, con la necesidad contraria (a una le faltan bicis y a la otra "
+        "le sobran); si no alcanza, la estación más cercana que ya está dentro de su rango, que presta o recibe "
+        "solo mientras no salga de él. **No se implementó \"riesgo evitado por bici\"**, que era la primera opción del "
         "usuario: necesita un modelo del riesgo esperado por estación y franja.",
         "- Franja sin solución (ningún inventario evita los dos umbrales con la banda): una estación con tipo "
         "va a `ocupacion_respaldo` de su tipo por su capacidad, sin quedar bajo ningún umbral; una estación sin "
@@ -1464,6 +1710,7 @@ def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
         "",
         *_reading(report),
         "",
+        *_random_section(report),
         "## Riesgo día por día",
         "",
         f"Horas de estación en riesgo de cada día evaluado, con el presupuesto de referencia ({reference:,} "
@@ -1497,13 +1744,14 @@ def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
         f"La corrida con el presupuesto de referencia ({reference:,} bicis al día) y la banda elegida, repetida "
         "con otros inventarios iniciales: todas las estaciones a la misma fracción de su capacidad "
         "(`simulacion.sensibilidad_ocupacion_inicial` de config/datos.yaml). La primera fila es la corrida "
-        "principal. Horas de estación en riesgo por día evaluado. Estas corridas no alimentan las "
-        "recomendaciones ni la curva.",
+        "principal. Horas de estación en riesgo por día evaluado. \"% evitado\" es el riesgo simulado evitado "
+        "como porcentaje del riesgo sin intervención de ESE MISMO inventario inicial (la columna \"sin "
+        "intervención\" de su fila). Estas corridas no alimentan las recomendaciones ni la curva.",
         "",
         _table(
             ["inventario inicial", "bicis", "ocupación", "sin intervención",
              *[f"{POLICY_LABELS[name]}: {what}" for name in names
-               for what in ("en riesgo", "riesgo simulado evitado", "bloqueados por día")]],
+               for what in ("en riesgo", "riesgo simulado evitado", "% evitado", "bloqueados por día")]],
             [
                 [
                     row["inventario_inicial"],
@@ -1511,9 +1759,14 @@ def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
                     f"{row['ocupacion_media'] * 100:.1f} %",
                     _n(row["riesgo_sin_intervencion_por_dia"]),
                     *[
-                        _n(row["por_politica"][name][key])
+                        cell
                         for name in names
-                        for key in ("riesgo_por_dia", "riesgo_simulado_evitado_por_dia", "viajes_bloqueados_por_dia")
+                        for cell in (
+                            _n(row["por_politica"][name]["riesgo_por_dia"]),
+                            _n(row["por_politica"][name]["riesgo_simulado_evitado_por_dia"]),
+                            _pct(row["por_politica"][name]["riesgo_simulado_evitado_pct"]),
+                            _n(row["por_politica"][name]["viajes_bloqueados_por_dia"]),
+                        )
                     ],
                 ]
                 for row in report["sensibilidad_al_inventario_inicial"]["filas"]
@@ -1540,6 +1793,7 @@ def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
             ],
         ),
         "",
+        *_blocked_section(report),
         "## Presupuesto disponible y usado por franja",
         "",
         "Bicis por día evaluado. Lo que una franja no usa pasa a la siguiente del mismo día; lo que sobra al "
@@ -1615,7 +1869,11 @@ def build_report(report: dict, operacion: str = "config/operacion.yaml") -> str:
         *[f"- {item}" for item in report["limitaciones"]],
         "",
     ]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    extra = Path(anexo) if anexo is not None else None
+    if extra is not None and extra.exists():
+        text += "\n" + extra.read_text(encoding="utf-8")  # tal cual: ni se recalcula ni se reescribe
+    return text
 
 
 def summary_lines(report: dict, operacion: str = "config/operacion.yaml") -> list[str]:
@@ -1681,6 +1939,15 @@ def summary_lines(report: dict, operacion: str = "config/operacion.yaml") -> lis
         "",
         "Los viajes bloqueados son simulados (posible demanda insatisfecha), no demanda medida.",
     ]
+    floor = report["piso_de_azar"]
+    if floor["corridas"]:
+        lines.append(
+            f"Piso de azar (mover bicis al azar, {floor['presupuesto_del_dia_en_bicis']:,} bicis al día, "
+            f"{floor['corridas']} corridas; referencia, no está en las tablas): "
+            f"{_n(floor['riesgo_por_dia']['media'])} horas en riesgo por día (rango entre corridas "
+            f"{_spread_range(floor['riesgo_por_dia'])}); riesgo simulado evitado "
+            f"{_n(floor['riesgo_simulado_evitado_por_dia']['media'])}."
+        )
     if not report["prueba_final"]["simulada"]:
         lines.append("La prueba final no se simuló (decisión 4).")
     return lines
@@ -1806,7 +2073,7 @@ FINGERPRINT_PARTS = {
 BAND_KEY = "banda_elegida"
 SETTINGS = (
     "dias_de_calentamiento", "remuestreos", "nivel_del_intervalo", "semilla", "bandas", "franja_noche",
-    "sensibilidad_ocupacion_inicial",
+    "sensibilidad_ocupacion_inicial", "corridas_piso_de_azar",
 )
 
 

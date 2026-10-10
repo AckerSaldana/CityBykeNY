@@ -70,6 +70,7 @@ from src.models import baseline
 from src.models.baseline import TRAMO_OF_SPLIT, _check_built_period, _short, _span, input_fingerprint
 from src.models.metrics import (
     FINAL_SPLIT,
+    FRANJA_NOTE,
     KEYS,
     NOMINAL_COVERAGE,
     TARGET_LABELS,
@@ -81,6 +82,7 @@ from src.models.metrics import (
     format_table,
     local_time,
     markdown_table,
+    report_bands,
     write_metrics,
 )
 from src.paths import DATA_PROCESSED, DATOS_YAML
@@ -437,7 +439,7 @@ def pinball_table(scores: pd.DataFrame) -> str:
 def worse_lines(base: pd.DataFrame, model: pd.DataFrame, scores: pd.DataFrame) -> list[str]:
     """Frases que dicen dónde LightGBM sale peor que la línea base. Lista vacía si en ningún lado."""
     lines: list[str] = []
-    names = {"general": "General", "tipo_de_dia": "Tipo de día", "hora": "Hora"}
+    names = {"general": "General", "tipo_de_dia": "Tipo de día", "hora": "Hora", "franja": "Franja"}
     for group_by, title in names.items():
         pair = _paired(base, model, group_by)
         for prefix, label in TARGET_LABELS.items():
@@ -509,7 +511,7 @@ def build_report(
     val, test = summaries["val"], summaries["test"]
     worse = worse_lines(base_metrics, metrics, scores)
     worse_text = "\n".join(f"- {line}" for line in worse) if worse else (
-        "- En ningún grupo de las tablas de arriba (general, tipo de día, hora) ni en la pérdida de cuantil."
+        "- En ningún grupo de las tablas de arriba (general, tipo de día, hora, franja) ni en la pérdida de cuantil."
     )
     shown = ", ".join(f"{key} = {value}" for key, value in params.items() if key not in ("verbose", "objective"))
     return f"""# LightGBM con cuantiles: métricas en validación y comparación con la línea base
@@ -540,6 +542,12 @@ La cobertura nominal del intervalo de q10 a q90 es {100 * NOMINAL_COVERAGE:.0f} 
 ## Por hora del día (hora local de Nueva York)
 
 {comparison_table(base_metrics, metrics, "hora", "hora")}
+
+## Por franja del día
+
+{comparison_table(base_metrics, metrics, "franja", "franja")}
+
+{FRANJA_NOTE}
 
 El desglose por estación de los dos modelos está en `{METRICS_NAME}.parquet`, en las filas con `group_by = "estacion"`.
 
@@ -696,9 +704,12 @@ def main(argv: list[str] | None = None, *, params: dict | None = None) -> int:
         # Solo validación. A las métricas no llega ni una fila real de la prueba final.
         final = datos.tramos[TRAMO_OF_SPLIT["test"]]
         actual = station_hour[datos.tramos[TRAMO_OF_SPLIT["val"]].contains(station_hour["ts_hour"])]
-        metrics = evaluate(predictions, actual, model=MODEL, split="val", prueba_final=final)
+        franjas = report_bands(config=args.config)
+        metrics = evaluate(predictions, actual, model=MODEL, split="val", prueba_final=final, franjas=franjas)
         try:
-            base_metrics = evaluate(base_rows, actual, model=BASELINE, split="val", prueba_final=final)
+            base_metrics = evaluate(
+                base_rows, actual, model=BASELINE, split="val", prueba_final=final, franjas=franjas
+            )
         except ValueError as error:
             raise LgbmError(
                 f"La línea base de {_short(predictions_path)} no corresponde a este station_hour ({error}) "
@@ -742,6 +753,8 @@ def main(argv: list[str] | None = None, *, params: dict | None = None) -> int:
     print(comparison_table(base_metrics, metrics, "tipo_de_dia", "tipo de día"))
     print("\nPor hora local")
     print(comparison_table(base_metrics, metrics, "hora", "hora"))
+    print("\nPor franja del día (las del reporte de la simulación)")
+    print(comparison_table(base_metrics, metrics, "franja", "franja"))
     print("\nPérdida de cuantil (pinball) y lados del intervalo")
     print(pinball_table(scores))
     print("\nDónde LightGBM sale peor que la línea base:")

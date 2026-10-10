@@ -12,12 +12,15 @@ c) Franja sin solución: una estación con tipo va a `ocupacion_respaldo` de su
    tipo, recortada a [bicis_minimas, capacidad - lugares_libres_minimos]; una
    estación sin tipo no se toca.
 d) Reparto: prioridad, después la diferencia MÁS PEQUEÑA y después el id;
-   distancia máxima; solo entre estaciones con necesidades contrarias (la que
-   está dentro de su rango no presta ni recibe); alto al acabarse el
-   presupuesto.
+   distancia máxima; se atiende solo a las estaciones fuera de su rango, y su
+   contraparte es primero una con la necesidad contraria y después una que
+   está dentro de su rango, que presta o recibe sin salir de él; alto al
+   acabarse el presupuesto.
 e) Sin información del futuro: cambiar o borrar viajes posteriores a una
    intervención no cambia lo que se decidió en ella, y lo que recibe una
    política no trae viajes.
+f) Piso de azar: mueve bicis al azar gastando el presupuesto, dentro de los
+   cuatro límites, y con la misma semilla decide siempre lo mismo.
 
 Todo corre sin red y sin tocar data/processed. Las reglas de operación de
 estas pruebas están escritas aquí: no dependen de config/operacion.yaml.
@@ -49,6 +52,7 @@ from src.sim.policies import (
     ForecastInfo,
     ForecastPolicy,
     NoIntervention,
+    RandomPolicy,
     accepted_range,
     match_moves,
     respaldo_inventory,
@@ -254,11 +258,13 @@ def test_dentro_del_rango_no_se_mueve_nada_y_fuera_se_va_solo_al_borde_mas_cerca
         assert wide.decide(context(WEDNESDAY, manana, [inside, 3, 5, 5])) == []
     # Fuera del rango recibe justo lo que le falta para llegar al borde, no más: a A le faltan 2 y a B le sobran 2.
     assert wide.decide(context(WEDNESDAY, manana, [13, 5, 5, 5])) == [Move(1, 0, 2)]
-    # Aunque a B le sobren 6, A solo toma las 2 que la llevan al borde (15). Las otras 4 se quedan en B:
-    # ya nadie las necesita, y una estación dentro de su rango no recibe.
-    assert wide.decide(context(WEDNESDAY, manana, [13, 9, 5, 5])) == [Move(1, 0, 2)]
-    # Y si a A le sobran (19, máximo 17), entrega solo 2 aunque a B le falten más.
-    assert wide.decide(context(WEDNESDAY, manana, [19, 0, 5, 5])) == [Move(0, 1, 2)]
+    # A B le sobran 6. A toma las 2 que la llevan a su borde (15). Después se atiende a B, que sigue fuera de
+    # su rango: A, ya dentro del suyo (15 a 17), recibe 2 más sin pasar de 17. Las otras 2 se quedan en B:
+    # C y D no tienen información y no reciben.
+    assert wide.decide(context(WEDNESDAY, manana, [13, 9, 5, 5])) == [Move(1, 0, 2), Move(1, 0, 2)]
+    # Si a A le sobran (19, máximo 17), entrega 2 y queda en su borde. A B todavía le falta 1: A, ya dentro
+    # de su rango, le presta esa bici sin bajar de su mínimo (15).
+    assert wide.decide(context(WEDNESDAY, manana, [19, 0, 5, 5])) == [Move(0, 1, 2), Move(0, 1, 1)]
 
 
 def test_un_rango_sin_ningun_entero_dentro_usa_el_punto_medio():
@@ -386,17 +392,22 @@ def test_el_rango_aceptado_a_mano_en_los_cuatro_casos():
 
 def test_solo_se_buscan_contrapartes_dentro_de_la_distancia_maxima():
     # A, B, C, D en línea, a 0.556 km cada paso. A necesita 3 (tiene 2, quiere 5). D, a 1.67 km, tiene 5 de
-    # sobra. B (8, rango 4 a 8) y C (10) están dentro de su rango: no prestan ni reciben.
+    # sobra. B (8) y C (10) están justo en su único valor aceptado: no tienen margen para prestar ni recibir.
     network = make_network({"A": 20, "B": 20, "C": 20, "D": 20})
     inventory = fixed([2, 8, 10, 15])
-    low, high = fixed([5, 4, 10, 10]), fixed([5, 8, 10, 10])
+    low, high = fixed([5, 8, 10, 10]), fixed([5, 8, 10, 10])
     priority = fixed([2, 2, 2, 2])
-    # Con 1.2 km D no alcanza a A, y B, que está dentro de su rango, no presta: no se mueve nada.
+    # Con 1.2 km D no alcanza a A: no se mueve nada.
     near = network.neighbors_within(1.2)
     assert match_moves(inventory, low, high, priority, near, budget=100) == []
     # Con 2 km D sí alcanza a A.
     far = network.neighbors_within(2.0)
     assert match_moves(inventory, low, high, priority, far, budget=100) == [Move(3, 0, 3)]
+    # Lo mismo con una contraparte dentro de su rango: B (8, rango 4 a 8) puede prestar 4, pero solo a quien
+    # tenga cerca. Con 1.2 km le presta 3 a A; y D, a quien le sobran 5, deja en B las 3 que B puede recibir.
+    wide = fixed([5, 4, 10, 10])
+    assert match_moves(inventory, wide, high, priority, near, budget=100) == [Move(1, 0, 3), Move(3, 1, 3)]
+    assert match_moves(inventory, wide, high, priority, network.neighbors_within(0.5), budget=100) == []
     # Con 0.5 km nadie alcanza a nadie.
     assert match_moves(inventory, low, high, priority, network.neighbors_within(0.5), budget=100) == []
 
@@ -442,20 +453,57 @@ def test_primero_la_mas_cercana_entre_las_que_tienen_la_necesidad_contraria():
     assert match_moves(inventory, low, high, fixed([2, 2, 2]), near, budget=100) == [Move(1, 0, 1), Move(2, 0, 5)]
 
 
-def test_una_estacion_dentro_de_su_rango_no_presta_ni_recibe_y_nadie_pasa_de_su_borde():
+def test_una_estacion_dentro_de_su_rango_presta_o_recibe_sin_salir_de_el():
     network = make_network({"A": 20, "B": 20, "C": 20})
     near = network.neighbors_within(1.2)
     priority = fixed([2, 2, 2])
-    # A necesita 6. B (8 bicis, rango 5 a 9) y C (7, rango 7 a 10) están dentro de su rango: no prestan.
-    assert match_moves(fixed([0, 8, 7]), fixed([6, 5, 7]), fixed([9, 9, 10]), priority, near, budget=100) == []
-    # A le sobran 4 (10 bicis, rango 2 a 6). B (5, rango 3 a 7) y C (9, rango 4 a 10) no reciben.
-    assert match_moves(fixed([10, 5, 9]), fixed([2, 3, 4]), fixed([6, 7, 10]), priority, near, budget=100) == []
-    # A necesita 6 y a B le sobran 3 (12 bicis, rango 5 a 9): B baja solo hasta su borde (9), no hasta 5.
+    # A necesita 6. B (8 bicis, rango 5 a 9) está dentro de su rango y presta hasta quedar en su mínimo: 3.
+    # C (7, rango 7 a 10) ya está en su mínimo: no presta. A queda con 3; nadie más puede darle.
+    assert match_moves(fixed([0, 8, 7]), fixed([6, 5, 7]), fixed([9, 9, 10]), priority, near, budget=100) == [
+        Move(1, 0, 3)
+    ]
+    # A le sobran 4 (10 bicis, rango 2 a 6). B (5, rango 3 a 7) recibe hasta su máximo: 2. C (9, rango 4 a 10)
+    # recibe 1. A la cuarta bici no le queda destino.
+    assert match_moves(fixed([10, 5, 9]), fixed([2, 3, 4]), fixed([6, 7, 10]), priority, near, budget=100) == [
+        Move(0, 1, 2), Move(0, 2, 1)
+    ]
+    # Si todas están dentro de su rango no se mueve nada: solo se atiende a las que están fuera.
+    assert match_moves(fixed([7, 8, 9]), fixed([6, 5, 7]), fixed([9, 9, 10]), priority, near, budget=100) == []
+    # Una estación cuyo rango es un solo valor (sin información, o sin solución y sin tipo) no tiene margen.
+    assert match_moves(fixed([0, 8, 7]), fixed([6, 8, 7]), fixed([9, 8, 7]), priority, near, budget=100) == []
+
+
+def test_la_contraparte_es_primero_la_de_necesidad_contraria_y_despues_la_que_esta_dentro_de_su_rango():
+    network = make_network({"A": 20, "B": 20, "C": 20})
+    near = network.neighbors_within(1.2)
+    priority = fixed([2, 2, 2])
+    # A necesita 4 (rango 4 a 9). B, la más cercana, está dentro de su rango (8, rango 5 a 9). A C, más lejos,
+    # le sobran 3 (13, rango 7 a 10). Se atiende primero C (diferencia 3) y da sus 3 a A. A todavía le falta
+    # 1: ya no hay nadie con bicis de sobra, así que la presta B.
+    moves = match_moves(fixed([0, 8, 13]), fixed([4, 5, 7]), fixed([9, 9, 10]), priority, near, budget=100)
+    assert moves == [Move(2, 0, 3), Move(1, 0, 1)]
+    # Con las mismas estaciones y C sin bicis de sobra, toda la ayuda sale de las que están dentro de su
+    # rango, de la más cercana a la más lejana: B presta 3 (baja a su mínimo, 5) y C presta 1.
+    moves = match_moves(fixed([0, 8, 9]), fixed([4, 5, 7]), fixed([9, 9, 10]), priority, near, budget=100)
+    assert moves == [Move(1, 0, 3), Move(2, 0, 1)]
+    # La que tenía bicis de sobra baja primero a su máximo; ya dentro de su rango puede prestar más, hasta su
+    # mínimo. A necesita 6 y a B le sobran 3 (12, rango 5 a 9): 3 por necesidad contraria y 3 más como préstamo.
     moves = match_moves(fixed([0, 12, 7]), fixed([6, 5, 7]), fixed([9, 9, 10]), priority, near, budget=100)
-    assert moves == [Move(1, 0, 3)]
-    # A le sobran 4 y a C le falta 1 (3 bicis, rango 4 a 10): C sube solo hasta su borde (4).
+    assert moves == [Move(1, 0, 3), Move(1, 0, 3)]
+    # A le sobran 4 y a C le falta 1 (3 bicis, rango 4 a 10). Primero se atiende C: A le da 1. Las 3 que le
+    # quedan de sobra a A van a las que están dentro de su rango: 2 a B (hasta su máximo, 7) y 1 a C.
     moves = match_moves(fixed([10, 5, 3]), fixed([2, 3, 4]), fixed([6, 7, 10]), priority, near, budget=100)
-    assert moves == [Move(0, 2, 1)]
+    assert moves == [Move(0, 2, 1), Move(0, 1, 2), Move(0, 2, 1)]
+    # Nadie sale de su rango y el presupuesto manda: con 4 bicis, las 3 de C y solo 1 de las de B.
+    low, high, start = fixed([6, 5, 7]), fixed([9, 9, 10]), fixed([0, 9, 10])
+    moves = match_moves(start, low, high, priority, near, budget=100)
+    after = start.copy()
+    for move in moves:
+        after[move.origin] -= move.bikes
+        after[move.destination] += move.bikes
+    assert moves == [Move(1, 0, 4), Move(2, 0, 2)] and after.tolist() == [6, 5, 8]
+    assert ((after[1:] >= low[1:]) & (after[1:] <= high[1:])).all()
+    assert match_moves(start, low, high, priority, near, budget=5) == [Move(1, 0, 4), Move(2, 0, 1)]
 
 
 def test_se_detiene_cuando_se_acaba_el_presupuesto():
@@ -494,9 +542,9 @@ def test_la_prioridad_sale_del_tipo_y_una_estacion_sin_tipo_va_al_final():
     assert UNTYPED_PRIORITY == 0
     assert policy.priority.tolist() == [1, UNTYPED_PRIORITY, 3]   # B no tiene tipo
     # A y C necesitan 5 (lo = 2 + 3) y tienen 4. B (rango 2 a 15) tiene 16: le sobra 1. Va primero C (prioridad 3)
-    # y se lleva esa bici. A (prioridad 1) se queda sin ella: B ya está dentro de su rango y no presta.
-    assert policy.decide(context(WEDNESDAY, reglas.franjas[0], [4, 16, 4])) == [Move(1, 2, 1)]
-    # Si a B le sobran 2, la segunda sí llega a A, después de C.
+    # y se lleva esa bici. Después A (prioridad 1): B ya está dentro de su rango y le presta una sin salir de él.
+    assert policy.decide(context(WEDNESDAY, reglas.franjas[0], [4, 16, 4])) == [Move(1, 2, 1), Move(1, 0, 1)]
+    # Si a B le sobran 2, pasa lo mismo: la segunda bici que le sobra llega a A, después de C.
     assert policy.decide(context(WEDNESDAY, reglas.franjas[0], [4, 17, 4])) == [Move(1, 2, 1), Move(1, 0, 1)]
     # Con una sola bici de presupuesto se la lleva C, la de más prioridad.
     assert policy.decide(context(WEDNESDAY, reglas.franjas[0], [4, 17, 4], budget=1)) == [Move(1, 2, 1)]
@@ -595,7 +643,8 @@ def test_las_politicas_no_reciben_viajes_ni_al_crearse_ni_al_decidir():
     assert list(inspect.signature(ForecastPolicy.__init__).parameters) == [
         "self", "name", "network", "reglas", "forecast", "band", "neighbors",
     ]
-    for policy in (ForecastPolicy, NoIntervention):
+    assert list(inspect.signature(RandomPolicy.__init__).parameters) == ["self", "network", "reglas", "seed", "neighbors"]
+    for policy in (ForecastPolicy, NoIntervention, RandomPolicy):
         assert list(inspect.signature(policy.decide).parameters) == ["self", "context"]
     # El pronóstico se arma sin viajes: con predictions y con qué estaciones tienen historia.
     assert "trips" not in inspect.signature(ForecastInfo.from_predictions).parameters
@@ -615,3 +664,73 @@ def test_la_misma_intervencion_da_siempre_la_misma_decision():
         assert (first.budget_used <= first.budget_available).all()
         assert first.final_total == first.initial_total   # el total de bicis no cambia
     assert len(digests) == 2   # con pronósticos distintos, las dos políticas no deciden lo mismo
+
+
+# --------------------------------------------------------------------------- #
+# f) Piso de azar
+# --------------------------------------------------------------------------- #
+
+def test_el_piso_de_azar_mueve_lo_unico_posible_y_no_mueve_nada_si_no_se_puede():
+    reglas = make_reglas(distancia_maxima_km=0.6)   # solo son vecinas A-B y B-C
+    manana = reglas.franjas[0]
+    # A tiene 1 bici y B un lugar. C, llena, tiene a B como única vecina. Con 1 bici de presupuesto el único
+    # traslado que cabe en los límites es A -> B o C -> B; con B ya llena no queda ninguno.
+    network = make_network({"A": 1, "B": 1, "C": 9})
+    policy = RandomPolicy(network, reglas, seed=(7, 0))
+    assert policy.name == "random"
+    moves = policy.decide(context(WEDNESDAY, manana, [1, 0, 9], budget=1))
+    assert moves in ([Move(0, 1, 1)], [Move(2, 1, 1)])
+    # Solo A tiene bicis: el único traslado posible es A -> B, y después B -> A o B -> C (C tiene lugar).
+    network = make_network({"A": 3, "B": 3, "C": 3})
+    policy = RandomPolicy(network, reglas, seed=(7, 0))
+    assert policy.decide(context(WEDNESDAY, manana, [1, 0, 0], budget=1)) == [Move(0, 1, 1)]
+    first, second = policy.decide(context(WEDNESDAY, manana, [1, 0, 0], budget=2))
+    assert first == Move(0, 1, 1) and second in (Move(1, 0, 1), Move(1, 2, 1))
+    # Sin presupuesto, sin bicis, con todo lleno o sin vecinas dentro de la distancia máxima: nada.
+    assert policy.decide(context(WEDNESDAY, manana, [1, 1, 1], budget=0)) == []
+    assert policy.decide(context(WEDNESDAY, manana, [0, 0, 0], budget=5)) == []
+    assert policy.decide(context(WEDNESDAY, manana, [3, 3, 3], budget=5)) == []
+    alone = RandomPolicy(network, make_reglas(distancia_maxima_km=0.1), seed=(7, 0))
+    assert alone.decide(context(WEDNESDAY, manana, [2, 1, 0], budget=5)) == []
+
+
+def test_el_piso_de_azar_gasta_el_presupuesto_dentro_de_los_cuatro_limites():
+    reglas = make_reglas(distancia_maxima_km=0.6)   # A-B, B-C y C-D; A y D no se alcanzan
+    network = make_network({"A": 6, "B": 4, "C": 5, "D": 6})
+    start = fixed([6, 1, 0, 3])
+    policy = RandomPolicy(network, reglas, seed=(7, 0))
+    moves = policy.decide(context(WEDNESDAY, reglas.franjas[0], start, budget=9))
+    assert sum(move.bikes for move in moves) == 9 and all(move.bikes == 1 for move in moves)   # presupuesto
+    inventory = start.copy()
+    for move in moves:
+        assert inventory[move.origin] >= 1                                   # bicis en el origen
+        assert inventory[move.destination] < network.capacity[move.destination]   # lugar en el destino
+        assert network.dist_km[move.origin, move.destination] <= reglas.distancia_maxima_km   # distancia
+        inventory[move.origin] -= 1
+        inventory[move.destination] += 1
+    assert inventory.sum() == start.sum()
+    # Sin información: no depende del pronóstico ni de los umbrales, solo de la semilla, el día y la franja.
+    assert policy.decide(context(WEDNESDAY, reglas.franjas[0], start, budget=9)) == moves
+    assert RandomPolicy(network, reglas, seed=(7, 0)).decide(context(WEDNESDAY, reglas.franjas[0], start, budget=9)) == moves
+    others = [
+        RandomPolicy(network, reglas, seed=(7, 1)).decide(context(WEDNESDAY, reglas.franjas[0], start, budget=9)),
+        RandomPolicy(network, reglas, seed=(8, 0)).decide(context(WEDNESDAY, reglas.franjas[0], start, budget=9)),
+        policy.decide(context(WEDNESDAY, reglas.franjas[1], start, budget=9)),
+        policy.decide(context(THURSDAY, reglas.franjas[0], start, budget=9)),
+    ]
+    assert sum(other != moves for other in others) >= 3   # otro sorteo, otra franja u otro día: otros traslados
+
+
+def test_el_piso_de_azar_pasa_por_el_motor_conserva_las_bicis_y_se_repite_con_la_semilla():
+    network, reglas, trips, days, _ = future_case()
+    runs = {}
+    for seed in ((7, 0), (7, 1)):
+        first, _ = decisions(network, reglas, trips, days, RandomPolicy(network, reglas, seed))
+        second, _ = decisions(network, reglas, trips, days, RandomPolicy(network, reglas, seed))
+        assert first.digest() == second.digest()
+        # Los traslados pasaron los cuatro límites del motor (si no, habría fallado) y se gastó todo.
+        assert (first.budget_used == first.budget_available).all() and int(first.budget_used.sum()) == 12 * len(days)
+        assert first.final_total == first.initial_total   # el total de bicis no cambia
+        assert first.policy == "random"
+        runs[seed] = first
+    assert runs[(7, 0)].digest() != runs[(7, 1)].digest()

@@ -74,6 +74,9 @@ class Simulacion:
     # Ocupaciones planas (fracción de la capacidad) con las que se repite la corrida de referencia para ver
     # cuánto depende el resultado del inventario inicial. Puede ir vacía.
     sensibilidad_ocupacion_inicial: tuple[float, ...]
+    # Corridas del piso de azar (mover bicis al azar con el presupuesto de referencia), cada una con su
+    # propio sorteo a partir de `semilla`. 0 = no se corre.
+    corridas_piso_de_azar: int
 
 
 @dataclass(frozen=True)
@@ -110,7 +113,7 @@ def _simulacion(raw, validacion: Tramo | None, problems: list[str]) -> Simulacio
     if not isinstance(raw, dict):
         problems.append(
             "simulacion: debe ser un bloque con dias_de_calentamiento, remuestreos, nivel_del_intervalo, semilla, "
-            "bandas, franja_noche y sensibilidad_ocupacion_inicial"
+            "bandas, franja_noche, sensibilidad_ocupacion_inicial y corridas_piso_de_azar"
         )
         return None
     antes = len(problems)
@@ -173,6 +176,13 @@ def _simulacion(raw, validacion: Tramo | None, problems: list[str]) -> Simulacio
             "0 y 1, sin repetir (por ejemplo [0.4, 0.5, 0.6]; puede ir vacía: [])"
         )
 
+    azar = raw.get("corridas_piso_de_azar")
+    if not _es_entero(azar) or azar < 0:
+        problems.append(
+            "simulacion.corridas_piso_de_azar: debe ser un número entero mayor o igual a 0 "
+            "(0 es no correr el piso de azar)"
+        )
+
     if len(problems) > antes:
         return None
     return Simulacion(
@@ -183,6 +193,7 @@ def _simulacion(raw, validacion: Tramo | None, problems: list[str]) -> Simulacio
         bandas=tuple(float(v) for v in bandas),
         franja_noche=(noche["inicio"], noche["fin"]),
         sensibilidad_ocupacion_inicial=tuple(float(v) for v in sensibilidad),
+        corridas_piso_de_azar=azar,
     )
 
 

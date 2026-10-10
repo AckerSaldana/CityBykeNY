@@ -496,12 +496,16 @@ def test_el_script_escribe_predicciones_metricas_y_reporte(workspace, capsys):
     assert set(metrics["model"]) == {"baseline", MODEL} and set(metrics["split"]) == {"val"}
     for model in ("baseline", MODEL):
         part = metrics[metrics["model"] == model]
-        assert set(part["group_by"]) == {"general", "hora", "tipo_de_dia", "estacion"}
+        assert set(part["group_by"]) == {"general", "hora", "franja", "tipo_de_dia", "estacion"}
+        # Por franja, las mismas filas en los dos modelos: las franjas suman el tramo.
+        by_band = part[part["group_by"] == "franja"]
+        assert (by_band.groupby("target")["n"].sum() == (ours["split"] == "val").sum()).all()
         assert (part.loc[part["group_by"] == "general", "n"] == (ours["split"] == "val").sum()).all()
 
     report = (data / "reports" / "metricas_lgbm.md").read_text(encoding="utf-8")
     for text in (
-        "## General", "## Por tipo de día", "## Por hora del día", "## Pérdida de cuantil", "## Dónde LightGBM sale peor",
+        "## General", "## Por tipo de día", "## Por hora del día", "## Por franja del día",
+        "Las franjas son las del reporte de la simulación", "## Pérdida de cuantil", "## Dónde LightGBM sale peor",
         "## Variables", "## Hiperparámetros y rondas", "## Corrección antes de escribir", "## Cómo leer esto",
         "MAE base", "MAE lgbm", "RMSE base", "RMSE lgbm", "pinball q10", "pinball q90",
         "q50 es la media de la celda, no la mediana", "Comparar también RMSE", "demanda atendida", "NO se calificó",

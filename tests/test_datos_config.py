@@ -40,6 +40,7 @@ simulacion:
   bandas: [0, 0.5, 1]
   franja_noche: {inicio: "22:00", fin: "06:00"}
   sensibilidad_ocupacion_inicial: [0.4, 0.6]
+  corridas_piso_de_azar: 3
 """
 
 # El bloque de simulación de TEXTO_BASE, para las pruebas que lo quitan o lo cambian entero.
@@ -125,6 +126,7 @@ def test_un_archivo_valido_se_carga_con_sus_valores(tmp_path):
     assert datos.simulacion == Simulacion(
         dias_de_calentamiento=2, remuestreos=500, nivel_del_intervalo=0.8, semilla=7,
         bandas=(0.0, 0.5, 1.0), franja_noche=("22:00", "06:00"), sensibilidad_ocupacion_inicial=(0.4, 0.6),
+        corridas_piso_de_azar=3,
     )
     assert isinstance(datos.simulacion.nivel_del_intervalo, float)
 
@@ -281,7 +283,7 @@ def test_el_mensaje_junta_todos_los_problemas_de_la_simulacion(tmp_path):
     with pytest.raises(DatosError) as error:
         load_datos(_archivo(tmp_path, texto))
     for clave in ("dias_de_calentamiento", "remuestreos", "nivel_del_intervalo", "semilla", "bandas",
-                  "franja_noche", "sensibilidad_ocupacion_inicial"):
+                  "franja_noche", "sensibilidad_ocupacion_inicial", "corridas_piso_de_azar"):
         assert f"simulacion.{clave}: debe" in str(error.value), clave
 
 
@@ -300,6 +302,10 @@ def test_el_mensaje_junta_todos_los_problemas_de_la_simulacion(tmp_path):
          "simulacion.sensibilidad_ocupacion_inicial: debe ser una lista"),
         ("  sensibilidad_ocupacion_inicial: [0.4, 0.6]\n", "",
          "simulacion.sensibilidad_ocupacion_inicial: debe ser una lista"),
+        ("corridas_piso_de_azar: 3", "corridas_piso_de_azar: -1", "simulacion.corridas_piso_de_azar: debe ser un número"),
+        ("corridas_piso_de_azar: 3", "corridas_piso_de_azar: 2.5", "simulacion.corridas_piso_de_azar: debe ser un número"),
+        ("corridas_piso_de_azar: 3", "corridas_piso_de_azar: true", "simulacion.corridas_piso_de_azar: debe ser un número"),
+        ("  corridas_piso_de_azar: 3\n", "", "simulacion.corridas_piso_de_azar: debe ser un número"),
     ],
 )
 def test_las_bandas_la_noche_y_la_sensibilidad_mal_escritas_se_rechazan(tmp_path, viejo, nuevo, mensaje):
@@ -313,6 +319,9 @@ def test_la_sensibilidad_puede_ir_vacia_y_la_noche_puede_no_cruzar_la_medianoche
     texto = texto.replace('inicio: "22:00", fin: "06:00"', 'inicio: "00:00", fin: "05:00"')
     simulacion = load_datos(_archivo(tmp_path, texto)).simulacion
     assert simulacion.sensibilidad_ocupacion_inicial == () and simulacion.franja_noche == ("00:00", "05:00")
+    # El piso de azar puede no correrse: 0 corridas.
+    sin_azar = load_datos(_archivo(tmp_path, _editado("corridas_piso_de_azar: 3", "corridas_piso_de_azar: 0")))
+    assert sin_azar.simulacion.corridas_piso_de_azar == 0
 
 
 # --------------------------------------------------------------------------- #

@@ -20,7 +20,11 @@ i) Inventario inicial: sale de la ocupación observada del archivo congelado
 j) Banda de incertidumbre: se simulan todas las candidatas, gana la de menor
    riesgo medio entre políticas y se usa para todo lo demás.
 k) Reporte por franja (mañana, tarde, noche, resto) y sensibilidad al
-   inventario inicial.
+   inventario inicial, con el riesgo simulado evitado como porcentaje del
+   riesgo sin intervención de cada inventario. Piso de azar: se corre con el
+   presupuesto de referencia, va al reporte y no a las tablas. Tabla de
+   viajes bloqueados y llegadas desviadas por política. El reporte termina
+   con el registro del experimento descartado, tal cual.
 l) El script de punta a punta, y lo que lee de cada archivo.
 m) El reporte usa el lenguaje honesto y declara las limitaciones.
 n) La huella de las entradas: con ella una prueba dice, con el comando que hay
@@ -63,14 +67,18 @@ from src.sim.engine import NIGHT, OUTSIDE, Reglas, SimulacionError, build_networ
 from src.sim.policies import ForecastWindow
 from src.sim.simulate import (
     BAND_KEY,
+    EXPERIMENT_FILE,
     FINAL_FOLDER,
     NO_MODEL,
     OBSERVED,
+    RANDOM_LABEL,
     RERUN,
+    avoided_percent,
     build_report,
     check_final_test,
     choose_band,
     current_fingerprint,
+    daily_risk,
     interval,
     load_forecasts,
     load_history,
@@ -93,6 +101,7 @@ FINAL = Tramo("prueba", date(2026, 9, 5), date(2026, 9, 6))
 SETTINGS = SimpleNamespace(
     dias_de_calentamiento=1, remuestreos=300, nivel_del_intervalo=0.9, semilla=7,
     bandas=(0.0, 0.5, 1.0), franja_noche=("22:00", "06:00"), sensibilidad_ocupacion_inicial=(0.4, 0.6),
+    corridas_piso_de_azar=3,
 )
 SIMULATED = ["A", "B", "C", "D", "E", "F"]   # G no tiene capacidad y H no tiene viajes en validación
 LABELS = ["manana", "tarde", NIGHT, OUTSIDE]
@@ -114,6 +123,7 @@ simulacion:
   bandas: [0, 0.5, 1]
   franja_noche: {inicio: "22:00", fin: "06:00"}
   sensibilidad_ocupacion_inicial: [0.4, 0.6]
+  corridas_piso_de_azar: 3
 """
 
 
@@ -873,6 +883,17 @@ def test_la_sensibilidad_repite_la_corrida_de_referencia_con_otros_inventarios_i
         assert main_row["por_politica"][name]["riesgo_simulado_evitado_por_dia"] == pytest.approx(
             row["riesgo_simulado_evitado_por_dia"]["media"]
         )
+    # El porcentaje evitado de cada fila es contra el riesgo sin intervención de ESE inventario inicial.
+    assert len({row["riesgo_sin_intervencion_por_dia"] for row in rows}) == len(rows)   # las tres filas difieren
+    for row in rows:
+        for name in ("historical", "model"):
+            cell = row["por_politica"][name]
+            assert cell["riesgo_simulado_evitado_pct"] == pytest.approx(
+                cell["riesgo_simulado_evitado_por_dia"] / row["riesgo_sin_intervencion_por_dia"] * 100
+            )
+            assert cell["riesgo_simulado_evitado_pct"] == pytest.approx(
+                (1 - cell["riesgo_por_dia"] / row["riesgo_sin_intervencion_por_dia"]) * 100
+            )
     # Las otras: todas las estaciones a esa fracción. Lo mismo que una corrida aparte con ese inventario.
     capacity = np.array([8, 10, 12, 9, 14, 10])
     for flat, row in zip((0.4, 0.6), rows[1:]):
@@ -891,6 +912,170 @@ def test_la_sensibilidad_repite_la_corrida_de_referencia_con_otros_inventarios_i
     section = build_report(report).split("## Sensibilidad al inventario inicial")[1].split("## Métricas secundarias")[0]
     assert "todas al 40 %" in section and "regla histórica: riesgo simulado evitado" in section
     assert "modelo: riesgo simulado evitado" in section
+    assert "regla histórica: % evitado" in section and "modelo: % evitado" in section
+    assert "de ESE MISMO inventario inicial" in section
+    lines = {line.split("|")[1].strip(): line for line in section.splitlines() if line.startswith("| ")}
+    for row in rows:
+        for name in ("historical", "model"):
+            assert f"| {row['por_politica'][name]['riesgo_simulado_evitado_pct']:.1f} % |" in lines[row["inventario_inicial"]]
+
+
+def test_el_porcentaje_evitado_a_mano():
+    # 25 horas evitadas de 100 sin intervención: 25 %. Más riesgo que sin intervenir: negativo.
+    assert avoided_percent(25.0, 100.0) == 25.0 and avoided_percent(-10.0, 40.0) == -25.0
+    # Sin riesgo sin intervención no hay contra qué dividir.
+    assert avoided_percent(0.0, 0.0) is None
+
+
+# --------------------------------------------------------------------------- #
+# k2) Piso de azar, tabla de viajes bloqueados y anexo del reporte
+# --------------------------------------------------------------------------- #
+
+def test_el_piso_de_azar_se_corre_con_el_presupuesto_de_referencia_y_no_entra_a_las_tablas(case, result_lgbm):
+    report = result_lgbm.report
+    floor = report["piso_de_azar"]
+    assert (floor["corridas"], floor["semilla"], floor["presupuesto_del_dia_en_bicis"]) == (3, 7, 6)
+    runs, calendar = result_lgbm.random_runs, result_lgbm.calendar
+    assert len(runs) == 3 and {run.policy for run in runs} == {"random"} and {run.daily_budget for run in runs} == {6}
+    start = report["inventario_inicial"]["bicis"]
+    none = result_lgbm.runs[("none", 0)]
+    for run, row in zip(runs, floor["cada_corrida"]):
+        # Mismo inventario inicial que las demás, total de bicis constante y presupuesto dentro de lo disponible.
+        assert run.initial_total == run.final_total == start
+        assert (run.budget_used <= run.budget_available).all() and int(run.budget_used.sum()) > 0
+        assert row["riesgo_por_dia"] == pytest.approx(daily_risk(run, calendar).mean())
+        assert row["riesgo_simulado_evitado_por_dia"] == pytest.approx(
+            (daily_risk(none, calendar) - daily_risk(run, calendar)).mean()
+        )
+        assert sum(row["riesgo_por_franja"].values()) == pytest.approx(row["riesgo_por_dia"])
+        assert row["viajes_bloqueados_por_dia"] == pytest.approx(run.blocked[calendar.evaluated].mean())
+        assert row["llegadas_desviadas_por_dia"] == pytest.approx(run.diverted[calendar.evaluated].mean())
+    # Media y rango entre corridas.
+    for key in ("riesgo_por_dia", "riesgo_simulado_evitado_por_dia", "viajes_bloqueados_por_dia",
+                "llegadas_desviadas_por_dia", "bicis_movidas_por_dia"):
+        values = [row[key] for row in floor["cada_corrida"]]
+        assert floor[key] == {"media": pytest.approx(np.mean(values)), "minimo": min(values), "maximo": max(values)}
+    assert len({row["riesgo_por_dia"] for row in floor["cada_corrida"]}) > 1   # cada corrida tiene su sorteo
+    base = row_of(report, "none", 0)["riesgo_por_dia"]["media"]
+    assert floor["riesgo_simulado_evitado_pct"] == pytest.approx(
+        floor["riesgo_simulado_evitado_por_dia"]["media"] / base * 100
+    )
+    assert set(floor["riesgo_por_franja"]) == set(LABELS)
+
+    # No es una política del contrato: no está en las tablas ni entre los resultados de la curva.
+    assert "random" not in POLICIES
+    assert set(result_lgbm.policy_curve["policy"]) == set(POLICIES)
+    assert set(result_lgbm.recommendations["policy"]) == set(POLICIES)
+    assert {row["politica"] for row in report["resultados"]} == set(POLICIES)
+    assert {policy for policy, _ in result_lgbm.runs} == set(POLICIES)
+    assert report["pronostico"]["politicas_simuladas"] == list(POLICIES)
+    assert any(RANDOM_LABEL in check for check in report["comprobaciones"])
+
+    # Con la misma semilla sale lo mismo; con otra, otro sorteo.
+    again = simulate_case(case, lgbm=True)
+    assert again.report["piso_de_azar"] == floor
+    assert [run.digest() for run in again.random_runs] == [run.digest() for run in runs]
+    other = simulate_case(case, lgbm=True, ajustes=settings(semilla=8))
+    assert [run.digest() for run in other.random_runs] != [run.digest() for run in runs]
+
+
+def test_el_reporte_muestra_el_piso_de_azar_junto_a_las_politicas(result_lgbm):
+    report = result_lgbm.report
+    floor = report["piso_de_azar"]
+    text = build_report(report)
+    section = text.split("## Piso de azar: mover bicis sin información")[1].split("## Riesgo día por día")[0]
+    assert "**no una política del contrato**" in section and "`recommendations.parquet`" in section
+    assert "no es un intervalo de confianza" in section and "son simulados" in section
+    rows = [line for line in section.splitlines() if line.startswith("| ") and "---" not in line][1:]
+    assert [line.split("|")[1].strip() for line in rows] == [
+        "sin intervención", f"{RANDOM_LABEL} (media de 3 corridas)", "regla histórica", "modelo",
+    ]
+    cells = [cell.strip() for cell in rows[1].strip("|").split("|")]
+    assert cells[1] == f"{floor['riesgo_por_dia']['media']:,.1f}"
+    assert cells[2] == f"{floor['riesgo_por_dia']['minimo']:,.1f} a {floor['riesgo_por_dia']['maximo']:,.1f}"
+    assert cells[3] == f"{floor['riesgo_simulado_evitado_por_dia']['media']:,.1f}"
+    assert cells[4] == f"{floor['riesgo_simulado_evitado_pct']:.1f} %"
+    model = row_of(report, "model", 6)
+    assert f"modelo, {floor['riesgo_por_dia']['media'] - model['riesgo_por_dia']['media']:,.1f}" in section
+    assert any(line.startswith("Piso de azar") for line in summary_lines(report))
+    # En ninguna otra tabla de políticas aparece como una política más.
+    curve = text.split("## Horas de estación en riesgo por día")[1].split("Lectura de la tabla")[0]
+    assert RANDOM_LABEL not in curve
+    assert RANDOM_LABEL not in text.split("## Recomendaciones")[1].split("## Comprobaciones de la corrida")[0]
+
+
+def test_con_cero_corridas_no_hay_piso_de_azar(case, result):
+    without = simulate_case(case, ajustes=settings(corridas_piso_de_azar=0))
+    assert without.report["piso_de_azar"] == {"corridas": 0, "semilla": 7, "presupuesto_del_dia_en_bicis": 6}
+    assert without.random_runs == ()
+    text = build_report(without.report) + "\n".join(summary_lines(without.report))
+    assert "## Piso de azar" not in text and f"{RANDOM_LABEL} (media" not in text
+    assert "Piso de azar (mover bicis al azar" not in text
+    assert without.report["corridas_simuladas"] == result.report["corridas_simuladas"] - 3
+    # Lo demás no cambia: el piso de azar no toca ni la banda, ni la curva, ni las recomendaciones.
+    pd.testing.assert_frame_equal(without.policy_curve, result.policy_curve)
+    pd.testing.assert_frame_equal(without.recommendations, result.recommendations)
+    assert without.report["banda"] == result.report["banda"]
+
+
+def test_el_reporte_trae_la_tabla_de_viajes_bloqueados_y_llegadas_desviadas_por_politica(result_lgbm):
+    report = result_lgbm.report
+    text = build_report(report)
+    section = text.split("## Viajes bloqueados y llegadas desviadas por política (simulados)")[1].split(
+        "## Presupuesto disponible y usado por franja"
+    )[0]
+    assert "**Son resultados de la simulación, no mediciones**" in section
+    assert "demanda atendida" in section and "posible demanda insatisfecha" in section
+    rows = [[cell.strip() for cell in line.strip("|").split("|")]
+            for line in section.splitlines() if line.startswith("| ") and "---" not in line]
+    assert rows[0] == ["política", "bicis por estación", "bicis al día", "viajes bloqueados por día",
+                       "diferencia contra sin intervención", "llegadas desviadas por día",
+                       "diferencia contra sin intervención"]
+    body = rows[1:]
+    # Sin intervención una vez, cada política con cada presupuesto y, al final, el piso de azar.
+    assert len(body) == 1 + 4 * 2 + 1
+    none = row_of(report, "none", 0)
+    blocked, diverted = none["viajes_bloqueados"]["por_dia"], none["llegadas_desviadas"]["por_dia"]
+    assert body[0] == ["sin intervención", "cualquiera", "cualquiera", f"{blocked:,.1f}", "+0.0",
+                       f"{diverted:,.1f}", "+0.0"]
+    labels = {"historical": "regla histórica", "model": "modelo"}
+    expected = []
+    for name in ("historical", "model"):
+        for per_station, budget in ((0, 0), (0.5, 3), (1.0, 6), (2.0, 12)):
+            row = row_of(report, name, budget)
+            mine, theirs = row["viajes_bloqueados"]["por_dia"], row["llegadas_desviadas"]["por_dia"]
+            # Lo que dice la tabla es lo que pasó en la corrida: salidas bloqueadas y llegadas desviadas por día.
+            run = result_lgbm.runs[(name, budget)]
+            evaluated = result_lgbm.calendar.evaluated
+            assert mine == run.blocked[evaluated].mean() and theirs == run.diverted[evaluated].mean()
+            expected.append([labels[name], f"{per_station:g}", f"{budget:,}", f"{mine:,.1f}", f"{mine - blocked:+,.1f}",
+                             f"{theirs:,.1f}", f"{theirs - diverted:+,.1f}"])
+    assert body[1:-1] == expected
+    floor = report["piso_de_azar"]
+    mine, theirs = floor["viajes_bloqueados_por_dia"]["media"], floor["llegadas_desviadas_por_dia"]["media"]
+    assert body[-1] == [f"{RANDOM_LABEL} (media de 3 corridas)", "1", "6", f"{mine:,.1f}", f"{mine - blocked:+,.1f}",
+                        f"{theirs:,.1f}", f"{theirs - diverted:+,.1f}"]
+    # Con presupuesto 0 la diferencia es cero: es la corrida sin intervención.
+    assert body[1][3:] == body[0][3:]
+
+
+def test_el_reporte_termina_con_el_registro_del_experimento_tal_cual(result, tmp_path):
+    report = result.report
+    plain = build_report(report, anexo=None)
+    assert plain.endswith("\n") and "Experimento descartado" not in plain
+    # Un archivo cualquiera: va al final, sin cambiarle ni un espacio.
+    record = tmp_path / "registro.md"
+    content = "## Registro de prueba\n\n| a | b |\n|---|---:|\n| x | 1,234.5 |\n\n  Línea con  espacios raros.  \n"
+    record.write_text(content, encoding="utf-8")
+    assert build_report(report, anexo=record) == plain + "\n" + content
+    # Si el archivo no existe, el reporte sale sin anexo.
+    assert build_report(report, anexo=tmp_path / "no_existe.md") == plain
+    # Por defecto, el registro del experimento de mediodía (docs/experimento_mediodia.md), si está.
+    assert EXPERIMENT_FILE.parts[-2:] == ("docs", "experimento_mediodia.md")
+    if EXPERIMENT_FILE.exists():
+        assert build_report(report) == plain + "\n" + EXPERIMENT_FILE.read_text(encoding="utf-8")
+    else:
+        assert build_report(report) == plain
 
 
 # --------------------------------------------------------------------------- #
@@ -963,6 +1148,9 @@ def test_el_script_escribe_las_tablas_y_el_reporte(project, case, result, capsys
     text = (out / "reports" / "simulacion.md").read_text(encoding="utf-8")
     assert f"(`{corrida['operacion']}`, `estado: provisional`)" in text and "config/operacion.yaml" not in text
     assert "Captura usada: del 2026-10-10T04:05:04Z al 2026-10-10T17:11:35Z (UTC), 155 fotos" in text
+    if EXPERIMENT_FILE.exists():   # el reporte escrito termina con el registro del experimento, tal cual
+        assert text.endswith("\n\n" + EXPERIMENT_FILE.read_text(encoding="utf-8"))
+    assert "Piso de azar (mover bicis al azar, 6 bicis al día, 3 corridas" in printed.out
     assert f"Reglas de operación PROVISIONALES ({corrida['operacion']})." in printed.out
     assert "config/operacion.yaml" not in printed.out
     # El resumen en pantalla.
@@ -1243,7 +1431,8 @@ def test_la_revision_dice_que_entrada_cambio_y_que_comando_correr(project, case)
     # El bloque `simulacion`: otra semilla, otra franja de noche, y unas bandas que ya no traen la elegida.
     chosen = json.loads((out / "reports" / "simulacion.json").read_text(encoding="utf-8"))["banda"]["elegida"]
     for old, new in (("semilla: 7", "semilla: 8"), ('inicio: "22:00"', 'inicio: "23:00"'),
-                     ("sensibilidad_ocupacion_inicial: [0.4, 0.6]", "sensibilidad_ocupacion_inicial: [0.5]")):
+                     ("sensibilidad_ocupacion_inicial: [0.4, 0.6]", "sensibilidad_ocupacion_inicial: [0.5]"),
+                     ("corridas_piso_de_azar: 3", "corridas_piso_de_azar: 4")):
         files["config"].write_text(DATOS_TEXT.replace(old, new), encoding="utf-8")
         with stale("el bloque `simulacion` de config/datos.yaml"):
             check_outputs_are_current(out, data, **files)
