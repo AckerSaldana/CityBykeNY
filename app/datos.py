@@ -1,533 +1,417 @@
-"""Lectura de datos para el dashboard.
+"""Acceso a los datos del tablero. Es el ÚNICO archivo que sabe dónde están.
 
-Este es el ÚNICO archivo que sabe dónde viven los datos. Las vistas nunca abren
-archivos por su cuenta: piden las tablas a las funciones de aquí.
+Las páginas no leen archivos: llaman a las funciones de aquí. Todas leen
+tablas pequeñas, ya resumidas, de `data/processed/app/`. Esas tablas se
+construyen (y se reconstruyen después de cada simulación) con:
 
-Regla para cada tabla:
+    python scripts/build_app_tables.py
 
-1. Si su archivo existe en data/processed (datos reales del flujo), se usa ese.
-2. Si no, se usa el de data/sample (datos SINTÉTICOS, inventados por un programa).
-3. Si no está en ninguna de las dos carpetas, la página muestra un mensaje que
-   dice cómo generar la muestra y se detiene. No aparece un error de Python.
+Reglas para las páginas:
 
-Mientras ALGUNA tabla venga de data/sample, cada página lo dice:
-
-- La página que lee al menos una tabla sintética muestra el aviso completo.
-- La página cuyas tablas son todas reales muestra una nota corta: dice que
-  usa solo tablas reales y cuáles siguen sintéticas en otras vistas.
-
-Ni el aviso ni la nota se quitan a mano: desaparecen solos cuando los
-archivos reales llegan a data/processed.
-
-OJO con la mezcla: si unas tablas ya son reales y otras siguen en la muestra,
-sus estaciones no coinciden (las de la muestra se llaman SIM-...). Al cruzar
-una tabla real con una sintética el resultado sale vacío. El aviso lo explica.
-
-Dos tablas no salen de viajes observados: `recommendations` y `policy_curve`
-salen de la SIMULACIÓN de inventario (python scripts/run_simulation.py).
-Cuando sus archivos reales están en data/processed ya no hay aviso de datos
-sintéticos, pero siguen sin ser mediciones. Por eso la página que las lee
-muestra una nota: "RESULTADOS DE UNA SIMULACIÓN: no son mediciones". Tampoco
-se quita a mano. Mira show_simulation_note(), más abajo.
-
-Este archivo no importa nada de src/. Solo usa streamlit y pandas, para que la
-app siga abriendo aunque cambie el resto del repositorio.
+- Los números se escriben con `num()` y `pct()`; lo que falta, con `texto()`
+  (muestra "Sin dato").
+- Las claves internas (políticas, franjas, tipos...) se traducen con los
+  diccionarios de ETIQUETAS de abajo. En pantalla no van nombres de columnas
+  ni de archivos.
+- Ninguna cifra se escribe a mano: todo sale de `indicadores()` y de las
+  tablas. Cuando cambie la simulación solo se vuelve a correr el constructor.
+- Cada página empieza con `datos.encabezado("Título")`.
 """
 
+from __future__ import annotations
+
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 import streamlit as st
 
-# Las carpetas se ubican a partir de este archivo, no desde la carpeta en la
-# que se abrió la terminal. Así la app funciona igual desde cualquier lugar.
-ROOT = Path(__file__).resolve().parents[1]    # carpeta raíz del repositorio
-DATA_PROCESSED = ROOT / "data" / "processed"  # datos reales
-DATA_SAMPLE = ROOT / "data" / "sample"        # datos SINTÉTICOS de muestra
+# Carpeta con las tablas pequeñas. Las pruebas la cambian por una temporal.
+CARPETA = Path(__file__).resolve().parents[1] / "data" / "processed" / "app"
 
-# Las seis tablas del proyecto: nombre -> qué contiene.
-# El archivo de cada una se llama <nombre>.parquet.
-TABLES = {
-    "stations": "Estaciones: nombre, ubicación, capacidad y tipo",
-    "station_hour": "Salidas y llegadas observadas, por estación y hora",
-    "predictions": "Pronóstico de salidas y llegadas, por estación y hora",
-    "recommendations": "Bicis que movió cada política en la simulación, por estación, día y franja horaria",
-    "policy_curve": "Horas de estación en riesgo simulado por día, por política y presupuesto diario",
-    "routes": "Viajes de usuarios entre pares de estaciones, sumados sobre el periodo",
-}
+LINEA = "Resultados de simulación con datos de validación"
+SIN_DATO = "Sin dato"
+CONSTRUIR = "python scripts/build_app_tables.py"
 
-SYNTHETIC_WARNING = "DATOS SINTÉTICOS DE MUESTRA: no son resultados reales"
-REAL_ONLY_NOTE = "Esta vista usa solo tablas reales"
-MAKE_SAMPLE_COMMAND = "python scripts/make_sample_data.py"
+# --------------------------------------------------------------------------- #
+# Etiquetas (clave interna -> texto en pantalla)
+# --------------------------------------------------------------------------- #
 
-# Las dos tablas que salen de la simulación de inventario. Las otras cuatro
-# salen de viajes que sí ocurrieron o del pronóstico.
-SIMULATED_TABLES = ["recommendations", "policy_curve"]
-SIMULATION_NOTE = "RESULTADOS DE UNA SIMULACIÓN: no son mediciones"
-# Reporte que la simulación escribe junto a sus tablas, dentro de data/processed.
-SIMULATION_REPORT = "reports/simulacion.json"
+POLITICAS = {"none": "Sin intervención", "historical": "Regla histórica", "model": "Modelo"}
+MODELOS = {"baseline": "Promedio histórico", "lgbm": "Modelo"}
+FRANJAS = {"manana": "Mañana", "tarde": "Tarde", "noche": "Noche", "resto": "Resto del día"}
+RIESGOS = {"alto": "Alto", "medio": "Medio", "bajo": "Bajo"}
+TIPOS_DIA = {"laborable": "Laborable", "fin_de_semana": "Fin de semana"}
+USUARIOS = {"todos": "Todos", "miembros": "Miembros", "ocasionales": "Ocasionales"}
+TIPOS_ESTACION = {"oficinas": "Oficinas", "residencial": "Residencial", "recreativa": "Recreativa",
+                  "mixta": "Mixta", "sin_dato": SIN_DATO}
+BLOQUES = {"madrugada": "Madrugada (00 a 05)", "manana": "Mañana (06 a 11)",
+           "tarde": "Tarde (12 a 17)", "noche": "Noche (18 a 23)"}
+VOLUMENES = {"bajo": "Demanda baja", "medio": "Demanda media", "alto": "Demanda alta"}
+CAUSAS = {"pocas_bicis": "Casi vacía", "pocos_lugares": "Casi llena"}
+OBJETIVOS = {"salidas": "Salidas", "llegadas": "Llegadas"}
 
-# Frases de la nota de simulación. Cada diccionario va de lo que dice el
-# reporte de la corrida a la frase que sale en pantalla.
-RULES_TEXT = {
-    "provisional": (
-        "Las reglas de operación de esa corrida son **provisionales**: estos "
-        "números cambian cuando logística las confirme."
-    ),
-    "confirmado": "Las reglas de operación de esa corrida ya estaban confirmadas por logística.",
-}
-FORECAST_TEXT = {
-    "baseline": (
-        "La política `model` se alimentó del pronóstico de la línea base "
-        "(promedio histórico): no es un modelo entrenado."
-    ),
-    "lgbm": "La política `model` se alimentó del pronóstico de LightGBM.",
-    # Sin pronóstico de LightGBM la simulación no corre la política `model`:
-    # las tablas simuladas salen sin sus filas.
-    "ninguno": (
-        "La política `model` **no se simuló** en esa corrida, porque todavía no "
-        "había pronóstico de LightGBM: estas tablas no traen filas de `model`."
-    ),
-}
+# Colores fijos para que las cinco páginas se vean iguales.
+COLORES_POLITICA = {"none": "#8A8F98", "historical": "#E69F00", "model": "#0072B2"}
+COLORES_RIESGO = {"alto": "#D55E00", "medio": "#E69F00", "bajo": "#009E73"}
+COLORES_MODELO = {"baseline": "#E69F00", "lgbm": "#0072B2"}
+COLOR_OBSERVADO = "#222222"
+COLOR_SE_VACIA = "#D55E00"  # flujo neto negativo: salen más bicis de las que llegan
+COLOR_SE_LLENA = "#0072B2"  # flujo neto positivo: llegan más de las que salen
 
-MONTHS = [
-    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
-    "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-]
+_MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+          "septiembre", "octubre", "noviembre", "diciembre"]
+_DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 
 
 # --------------------------------------------------------------------------- #
-# De dónde sale cada tabla
+# Formato
 # --------------------------------------------------------------------------- #
 
-def find_file(table: str) -> Path | None:
-    """Archivo de una tabla: primero data/processed, después data/sample.
-
-    Devuelve None si no está en ninguna de las dos carpetas.
-    """
-    for folder in (DATA_PROCESSED, DATA_SAMPLE):
-        path = folder / f"{table}.parquet"
-        if path.is_file():
-            return path
-    return None
-
-
-def synthetic_tables() -> list[str]:
-    """Nombres de las tablas que hoy se leen de data/sample (sintéticas)."""
-    return [table for table in TABLES if find_file(table) == DATA_SAMPLE / f"{table}.parquet"]
-
-
-def missing_tables() -> list[str]:
-    """Nombres de las tablas cuyo archivo no está en ninguna de las dos carpetas."""
-    return [table for table in TABLES if find_file(table) is None]
-
-
-def show_synthetic_warning(used: list[str] | None = None) -> None:
-    """Aviso visible mientras alguna tabla venga de data/sample.
-
-    Hay que llamarla al inicio de TODAS las páginas.
-
-    `used` es la lista de las tablas que lee la vista, por ejemplo
-    ["stations", "station_hour"]. Según esa lista, la página muestra:
-
-    - El aviso completo, si la vista lee al menos una tabla sintética.
-    - Una nota corta, si las tablas de la vista son todas reales pero quedan
-      tablas sintéticas en otras vistas.
-    - Nada, si las seis tablas ya son reales.
-
-    Sin lista se supone que la vista lee las seis tablas: sale el aviso
-    completo mientras quede alguna sintética. Es lo que usa Inicio.
-
-    OJO: si la vista empieza a leer otra tabla, hay que agregarla a su lista.
-    La prueba (pytest tests/test_app_smoke.py) falla si falta.
-    """
-    tables = synthetic_tables()
-    if not tables:
-        return
-    names = ", ".join(f"`{table}`" for table in tables)
-    # ¿La vista lee alguna tabla sintética? Sin lista se supone que sí. Un
-    # nombre mal escrito también cuenta como sí: ante la duda, aviso completo.
-    uses_synthetic = not used or any(
-        table in tables or table not in TABLES for table in used
-    )
-    if not uses_synthetic:
-        # Todas las tablas de esta vista son reales: se dice eso, sin alarmar,
-        # y se nombran las que siguen sintéticas en las demás vistas.
-        note = f"{REAL_ONLY_NOTE}. Siguen sintéticas en otras vistas: {names}."
-        st.info(note)
-        st.sidebar.info(note)
-        return
-    text = (
-        f"**{SYNTHETIC_WARNING}.**\n\n"
-        f"Tablas que vienen de `data/sample`: {names}.\n\n"
-        "Ningún número de estas tablas se puede citar en el pitch. Este aviso "
-        "desaparece solo cuando los archivos reales estén en `data/processed`."
-    )
-    # Si además ya llegó alguna tabla real, hay mezcla. Se explica por qué los
-    # cruces entre tablas salen vacíos, para que nadie crea que la vista falla.
-    if len(tables) + len(missing_tables()) < len(TABLES):
-        text += (
-            "\n\n**OJO: hay tablas reales y tablas sintéticas mezcladas.** Las "
-            "estaciones de la muestra (`SIM-...`) no existen en los datos reales. "
-            "Al cruzar una tabla real con una sintética no coincide ninguna "
-            "estación y el resultado sale vacío. No es un error de la vista: se "
-            "arregla solo cuando llegue el resto de los archivos reales."
-        )
-    st.warning(text)
-    # También en el menú de la izquierda, que sigue a la vista al bajar la
-    # página. Ahí también se nombran las tablas sintéticas.
-    st.sidebar.warning(f"{SYNTHETIC_WARNING}. Tablas: {names}.")
-
-
-# --------------------------------------------------------------------------- #
-# Nota de las tablas que salen de la simulación
-# --------------------------------------------------------------------------- #
-
-def fecha_en_texto(day) -> str:
-    """Una fecha escrita en español, por ejemplo "2 de septiembre de 2026"."""
-    return f"{day.day} de {MONTHS[day.month - 1]} de {day.year}"
-
-
-def periodo_en_texto(first, last) -> str:
-    """Un periodo escrito en español, por ejemplo "del 2 al 14 de septiembre de 2026"."""
-    if (first.year, first.month, first.day) == (last.year, last.month, last.day):
-        return f"el {fecha_en_texto(first)}"  # un solo día
-    if (first.year, first.month) == (last.year, last.month):
-        return f"del {first.day} al {fecha_en_texto(last)}"
-    return f"del {fecha_en_texto(first)} al {fecha_en_texto(last)}"
-
-
-def simulation_run() -> dict:
-    """Dos datos de la corrida de la simulación que NO vienen en las tablas.
-
-    Salen del reporte que la simulación escribe junto a sus tablas
-    (data/processed/reports/simulacion.json):
-
-    - "rules": "provisional" o "confirmado". Es el estado que tenían las
-      reglas de operación (config/operacion.yaml) cuando se simuló.
-    - "forecast": "lgbm" o "ninguno". Es el pronóstico que alimentó a la
-      política "model"; "ninguno" quiere decir que esa política no se simuló
-      (la simulación ya no la alimenta con la línea base).
-
-    Si el reporte no está o no se puede leer, los dos valen None y la nota
-    dice que no se sabe. Nunca se supone.
-    """
+def _falta(x) -> bool:
+    if x is None:
+        return True
     try:
-        report = json.loads((DATA_PROCESSED / SIMULATION_REPORT).read_text(encoding="utf-8"))
-        return {
-            "rules": report["reglas"]["estado"],
-            "forecast": report["pronostico"]["modelo_que_alimenta_model"],
-        }
-    except (OSError, ValueError, KeyError, TypeError):
-        return {"rules": None, "forecast": None}
+        return bool(pd.isna(x))
+    except (TypeError, ValueError):
+        return False
 
 
-def show_simulation_note(used: list[str] | None = None) -> None:
-    """Nota visible cuando la vista lee una tabla real que sale de la simulación.
+def num(x, decimales: int = 0) -> str:
+    """Número con separador de miles y, como mucho, un decimal: 15,017,726 o 4.8."""
+    if _falta(x):
+        return SIN_DATO
+    decimales = max(0, min(int(decimales), 1))
+    return f"{float(x):,.{decimales}f}"
 
-    Hay que llamarla en TODAS las páginas, justo después del aviso de datos
-    sintéticos y con la misma lista de tablas.
 
-    Las tablas simuladas son `recommendations` y `policy_curve`. La página
-    muestra:
+def pct(x, decimales: int = 1) -> str:
+    """Recibe una fracción (0.539) y devuelve "53.9 %"."""
+    if _falta(x):
+        return SIN_DATO
+    decimales = max(0, min(int(decimales), 1))
+    return f"{float(x) * 100:,.{decimales}f} %"
 
-    - La nota, si la vista lee alguna de esas dos tablas y su archivo está en
-      data/processed. La nota nombra solo esas.
-    - Nada, si la vista no lee ninguna de las dos.
-    - Nada, si las que lee vienen de data/sample: ahí manda el aviso de datos
-      sintéticos, que ya dice que no son resultados reales.
 
-    Sin lista se supone que la vista lee las seis tablas. Es lo que usa Inicio.
+def rango_pct(a, b, decimales: int = 0) -> str:
+    """ "31 % a 54 %", o "Sin dato" si falta alguno."""
+    if _falta(a) or _falta(b):
+        return SIN_DATO
+    return f"{pct(a, decimales)} a {pct(b, decimales)}"
 
-    Los días, los cuenta de la tabla. El estado de las reglas y el pronóstico
-    que alimentó a la política "model" los lee del reporte de la corrida. Así
-    la nota sigue diciendo la verdad cuando alguien vuelve a simular.
+
+def texto(x) -> str:
+    """El valor como texto, o "Sin dato" si viene vacío."""
+    if _falta(x) or str(x).strip() == "":
+        return SIN_DATO
+    return str(x)
+
+
+def etiqueta(mapa: dict, clave) -> str:
+    """Traduce una clave interna con uno de los diccionarios; lo desconocido es "Sin dato"."""
+    if _falta(clave):
+        return SIN_DATO
+    return mapa.get(clave, SIN_DATO)
+
+
+def hora(h) -> str:
+    """6 -> "06:00"."""
+    return SIN_DATO if _falta(h) else f"{int(h):02d}:00"
+
+
+def fecha(d, con_dia: bool = True) -> str:
+    """Fecha en español: "miércoles 2 de septiembre de 2026"."""
+    if _falta(d):
+        return SIN_DATO
+    d = pd.Timestamp(d)
+    base = f"{d.day} de {_MESES[d.month - 1]} de {d.year}"
+    return f"{_DIAS[d.weekday()]} {base}" if con_dia else base
+
+
+def accion(bicis, hora_inicio=None) -> str:
+    """Texto de la tarjeta de acción: "Llevar 5 bicis antes de las 06:00"."""
+    if _falta(bicis):
+        return SIN_DATO
+    bicis = int(bicis)
+    if bicis == 0:
+        return "Sin traslado"
+    verbo = "Llevar" if bicis > 0 else "Retirar"
+    unidad = "bici" if abs(bicis) == 1 else "bicis"
+    cuando = "" if _falta(hora_inicio) else f" antes de las {hora(hora_inicio)}"
+    return f"{verbo} {num(abs(bicis))} {unidad}{cuando}"
+
+
+# --------------------------------------------------------------------------- #
+# Lectura con caché
+# --------------------------------------------------------------------------- #
+
+def _faltan_tablas():
+    """Mensaje amable (no un error de Python) cuando falta construir las tablas."""
+    mensaje = ("Todavía no están listas las tablas del tablero. Desde la carpeta del proyecto corre "
+               f"`{CONSTRUIR}` y vuelve a cargar esta página.")
+    st.info(mensaje)
+    st.stop()
+    raise FileNotFoundError(mensaje)  # solo se llega aquí fuera de Streamlit
+
+
+def _ruta(nombre: str) -> tuple[str, float]:
+    """Ruta del archivo y su fecha de cambio. La fecha entra a la llave de la
+    caché: al reconstruir las tablas, la app toma las nuevas sin reiniciar."""
+    ruta = CARPETA / nombre
+    if not ruta.exists():
+        _faltan_tablas()
+    return str(ruta), ruta.stat().st_mtime
+
+
+@st.cache_data(show_spinner=False)
+def _tabla(ruta: str, cambio: float) -> pd.DataFrame:
+    return pd.read_parquet(ruta)
+
+
+@st.cache_data(show_spinner=False, max_entries=200)
+def _tabla_de_estacion(ruta: str, cambio: float, estacion_id: str) -> pd.DataFrame:
+    # El archivo está ordenado por estación: el filtro lee solo su pedazo.
+    return pq.read_table(ruta, filters=[("estacion_id", "=", estacion_id)]).to_pandas()
+
+
+@st.cache_data(show_spinner=False)
+def _json(ruta: str, cambio: float) -> dict:
+    return json.loads(Path(ruta).read_text(encoding="utf-8"))
+
+
+def _leer(nombre: str) -> pd.DataFrame:
+    return _tabla(*_ruta(f"{nombre}.parquet")).copy()
+
+
+def indicadores() -> dict:
+    """Todas las cifras sueltas del tablero (ver app/LEEME.md para las llaves)."""
+    return _json(*_ruta("indicadores.json"))
+
+
+def estaciones() -> pd.DataFrame:
+    """Una fila por estación: estacion_id, nombre, lat, lon, capacidad, tipo,
+    salidas, llegadas, dias_con_datos, salidas_dia, llegadas_dia, flujo_neto_dia,
+    volumen, tiene_pronostico, sin_historia, simulada."""
+    return _leer("estaciones")
+
+
+def estacion(estacion_id: str) -> dict:
+    """Los datos de una estación como diccionario ({} si no existe)."""
+    e = _tabla(*_ruta("estaciones.parquet"))
+    fila = e[e["estacion_id"] == estacion_id]
+    return {} if fila.empty else fila.iloc[0].to_dict()
+
+
+def opciones_de_estacion(solo_con_pronostico: bool = True) -> dict:
+    """{estacion_id: nombre} para un selector, de mayor a menor número de salidas.
+    Dos estaciones con el mismo nombre se distinguen con su clave."""
+    e = estaciones()
+    if solo_con_pronostico:
+        e = e[e["tiene_pronostico"]]
+    e = e.sort_values(["salidas", "estacion_id"], ascending=[False, True])
+    repetido = e["nombre"].duplicated(keep=False)
+    nombres = e["nombre"].where(~repetido, e["nombre"] + " (" + e["estacion_id"] + ")")
+    return dict(zip(e["estacion_id"], nombres))
+
+
+def demanda_mapa(hora_del_dia: int | None = None, tipo_dia: str = "laborable",
+                 usuario: str = "todos") -> pd.DataFrame:
+    """Una fila por estación para el mapa: estacion_id, nombre, lat, lon,
+    capacidad, tipo, salidas, llegadas, flujo_neto.
+
+    Con una hora, son promedios de esa hora; con `None`, del día completo.
+    `usuario` ("todos", "miembros", "ocasionales") solo cambia las salidas: los
+    datos no separan las llegadas por tipo de usuario, así que llegadas y flujo
+    neto son siempre de todos los usuarios.
     """
-    # Tablas simuladas cuyo archivo real ya está en data/processed.
-    real = [table for table in SIMULATED_TABLES if find_file(table) == DATA_PROCESSED / f"{table}.parquet"]
-    # ¿Cuáles lee la vista? Sin lista se supone que las seis tablas. Un nombre
-    # mal escrito también cuenta como las seis: ante la duda, se muestra la nota.
-    reads_all = not used or any(table not in TABLES for table in used)
-    tables = [table for table in real if reads_all or table in used]
-    if not tables:
-        return
-    names = ", ".join(f"`{table}`" for table in tables)
-    text = (
-        f"**{SIMULATION_NOTE}.**\n\n"
-        f"Tablas simuladas que lee esta vista: {names}. Salen de simular el "
-        "inventario de las estaciones en días de validación; la prueba final no "
-        "se simula (decisión 4)."
-    )
-    if "recommendations" in tables:
-        # El día de cada recomendación es el día en que empieza su franja.
-        days = load_recommendations()["window_start"].dt.normalize()
-        if len(days) > 0:
-            text += (
-                f" `recommendations` cubre {days.nunique()} días: "
-                f"{periodo_en_texto(days.min(), days.max())}."
-            )
-    # Lo que las tablas no traen se lee del reporte de la corrida.
-    run = simulation_run()
-    if run["rules"] is None:
-        text += (
-            f"\n\nNo se pudo leer el reporte de la corrida (`data/processed/{SIMULATION_REPORT}`): "
-            "no se sabe si sus reglas de operación eran provisionales ni qué pronóstico "
-            "alimentó a la política `model`."
-        )
+    return _demanda_mapa(*_ruta("estacion_hora.parquet"), *_ruta("estaciones.parquet"),
+                         hora_del_dia, tipo_dia, usuario).copy()
+
+
+@st.cache_data(show_spinner=False, max_entries=200)
+def _demanda_mapa(ruta, cambio, ruta_est, cambio_est, hora_del_dia, tipo_dia, usuario) -> pd.DataFrame:
+    d = _tabla(ruta, cambio)
+    d = d[d["tipo_dia"] == tipo_dia]
+    columna = {"miembros": "salidas_miembros", "ocasionales": "salidas_ocasionales"}.get(usuario, "salidas")
+    if hora_del_dia is not None:
+        d = d[d["hora"] == int(hora_del_dia)]
+    d = (d.assign(salidas=d[columna]).groupby("estacion_id", as_index=False)[["salidas", "llegadas", "flujo_neto"]]
+         .sum().round(2))
+    e = _tabla(ruta_est, cambio_est)[["estacion_id", "nombre", "lat", "lon", "capacidad", "tipo"]]
+    return e.merge(d, on="estacion_id", how="inner")
+
+
+def demanda_sistema() -> pd.DataFrame:
+    """Viajes de todo el sistema por hora: tipo_dia, hora, salidas,
+    salidas_miembros, salidas_ocasionales, llegadas, dias (promedio por día)."""
+    return _leer("demanda_hora")
+
+
+def top_estaciones(n: int = 15) -> pd.DataFrame:
+    """Las estaciones con más salidas: puesto y las columnas de `estaciones()`."""
+    return _leer("top_estaciones").head(n)
+
+
+def top_rutas(n: int = 15, con_ida_y_vuelta: bool = True) -> pd.DataFrame:
+    """Las rutas con más viajes: puesto, origen_id, origen, destino_id, destino,
+    viajes, origen_lat, origen_lon, destino_lat, destino_lon, misma_estacion,
+    ruta ("A → B"). Con `con_ida_y_vuelta=False` se quitan los viajes que salen
+    y vuelven a la misma estación."""
+    r = _leer("top_rutas")
+    if not con_ida_y_vuelta:
+        r = r[~r["misma_estacion"]]
+    return r.head(n)
+
+
+def pronostico_estacion(estacion_id: str, objetivo: str = "salidas") -> pd.DataFrame:
+    """Pronóstico y observado de una estación, por hora, SOLO en validación.
+
+    Columnas: ts (hora local de Nueva York), fecha, hora, modelo ("baseline" o
+    "lgbm"), q10, q50, q90, observado. `objetivo` es "salidas" o "llegadas".
+    Vacío si la estación no tiene pronóstico.
+    """
+    t = _tabla_de_estacion(*_ruta("pronostico.parquet"), estacion_id)
+    nom = "lle" if objetivo == "llegadas" else "sal"
+    partes = []
+    for modelo, pref in (("baseline", "base"), ("lgbm", "modelo")):
+        p = t[["ts", "fecha", "hora"]].copy()
+        p["modelo"] = modelo
+        for q in ("q10", "q50", "q90"):
+            p[q] = t[f"{pref}_{nom}_{q}"].astype(float)
+        p["observado"] = t[f"{nom}_obs"]
+        partes.append(p[p["q50"].notna()])
+    return pd.concat(partes, ignore_index=True)
+
+
+def recomendaciones_estacion(estacion_id: str) -> pd.DataFrame:
+    """Lo que hizo cada política en una estación, con el presupuesto de referencia.
+
+    Columnas: estacion_id, fecha, franja, hora_inicio, hora_fin, politica, bicis
+    (positivo es llevar, negativo es retirar), nivel_riesgo, factible, inventario
+    (bicis en la estación justo después del traslado). Vacío si no se simuló.
+    """
+    return _tabla_de_estacion(*_ruta("recomendaciones.parquet"), estacion_id).copy()
+
+
+def curva() -> pd.DataFrame:
+    """Riesgo contra presupuesto: politica, presupuesto (bicis al día), riesgo
+    (horas de estación en riesgo por día), ic_bajo, ic_alto,
+    riesgo_sin_intervencion, evitado, pct_evitado (fracción)."""
+    return _leer("curva")
+
+
+def _por_corte(nombre: str, corte: str | None) -> pd.DataFrame:
+    t = _leer(nombre)
+    return t if corte is None else t[t["corte"] == corte].reset_index(drop=True)
+
+
+def metricas(corte: str | None = None) -> pd.DataFrame:
+    """Error del pronóstico en validación: corte, grupo, orden, modelo, objetivo,
+    n, mae, rmse, wape (fracción), cobertura (fracción), ancho.
+    Cortes: "general", "bloque" (grupo = llave de BLOQUES), "hora" ("00".."23")
+    y "volumen" (llave de VOLUMENES)."""
+    return _por_corte("metricas", corte)
+
+
+def riesgo_horas(corte: str | None = None) -> pd.DataFrame:
+    """Horas de estación en riesgo por día, con el presupuesto de referencia:
+    corte, grupo, politica, riesgo, ic_bajo, ic_alto. Cortes: "franja" (FRANJAS),
+    "causa" (CAUSAS) y "tipo_estacion" (TIPOS_ESTACION). Puede venir vacía."""
+    return _por_corte("riesgo_horas", corte)
+
+
+def riesgo_niveles(corte: str | None = None) -> pd.DataFrame:
+    """Cuántas franjas de estación quedaron en cada nivel de riesgo: corte,
+    grupo, politica, alto, medio, bajo, total, pct_alto (fracción).
+    Cortes: "franja" (FRANJAS) y "tipo_estacion" (TIPOS_ESTACION)."""
+    return _por_corte("riesgo_niveles", corte)
+
+
+def sensibilidad() -> pd.DataFrame:
+    """Cómo cambia el resultado con el inventario inicial supuesto:
+    inventario_inicial, politica, riesgo_sin_intervencion, riesgo, evitado,
+    pct_evitado. Vacía si la simulación no lo reportó."""
+    filas = []
+    for f in indicadores()["sensibilidad"]["filas"]:
+        for politica in ("historical", "model"):
+            if f.get(politica):
+                filas.append({"inventario_inicial": f["inventario_inicial"], "politica": politica,
+                              "riesgo_sin_intervencion": f["riesgo_sin_intervencion"], **f[politica]})
+    return pd.DataFrame(filas, columns=["inventario_inicial", "politica", "riesgo_sin_intervencion",
+                                        "riesgo", "evitado", "pct_evitado"])
+
+
+def limitaciones(n: int = 5) -> list[str]:
+    """Las primeras `n` limitaciones que escribió la simulación (puede venir vacía)."""
+    return list(indicadores().get("limitaciones") or [])[:n]
+
+
+# --------------------------------------------------------------------------- #
+# Textos que se arman con las cifras
+# --------------------------------------------------------------------------- #
+
+def linea_discreta() -> str:
+    """La única nota de contexto que lleva cada página."""
+    try:
+        sinteticos = indicadores().get("sinteticos")
+    except FileNotFoundError:
+        sinteticos = False
+    return LINEA + (" · datos sintéticos de ejemplo" if sinteticos else "")
+
+
+def encabezado(titulo: str) -> None:
+    """Título de la página y, debajo, la línea discreta. Toda página empieza así."""
+    st.title(titulo)
+    st.caption(linea_discreta())
+
+
+def hallazgos() -> list[str]:
+    """Los tres hallazgos de la página de inicio, armados con las cifras."""
+    ind = indicadores()
+    ref = ind["referencia"]
+    hist = ref["politicas"].get("historical") or {}
+    modelo = ref["politicas"].get("model") or {}
+    presupuesto = ref.get("presupuesto")
+
+    # 1. Cuánto riesgo evita planear con presupuesto.
+    rangos = [r for r in ind["sensibilidad"]["rango"].values()]
+    if presupuesto is None or not (hist or modelo):
+        uno = f"Riesgo simulado evitado al planear con presupuesto: {SIN_DATO}."
+    elif rangos:
+        bajo, alto = min(r["pct_min"] for r in rangos), max(r["pct_max"] for r in rangos)
+        uno = (f"Planear los traslados con {num(presupuesto)} bicis al día evita entre "
+               f"{rango_pct(bajo, alto).replace(' a ', ' y ')} del riesgo simulado, según el inventario "
+               "inicial que se suponga.")
     else:
-        # Si el reporte trae un valor que no está en los diccionarios, se
-        # muestra tal cual.
-        rules = RULES_TEXT.get(run["rules"], f"Estado de las reglas de operación de esa corrida: `{run['rules']}`.")
-        forecast = FORECAST_TEXT.get(
-            run["forecast"], f"La política `model` se alimentó del pronóstico `{run['forecast']}`."
-        )
-        text += f"\n\n{rules} {forecast}"
-    # Lenguaje honesto (decisión 9 del equipo).
-    text += (
-        "\n\nEstas tablas hablan de *riesgo simulado* y, contra no intervenir, de "
-        "*riesgo simulado evitado*. Los viajes bloqueados de la simulación son "
-        "simulados: no son demanda insatisfecha medida."
-    )
-    st.info(text)
-    # También en el menú de la izquierda, que sigue a la vista al bajar la página.
-    st.sidebar.info(f"{SIMULATION_NOTE}. Tablas: {names}.")
+        mejor = max((p for p in (hist, modelo) if p), key=lambda p: p["pct_evitado"] or 0)
+        uno = (f"Planear los traslados con {num(presupuesto)} bicis al día evita "
+               f"{pct(mejor['pct_evitado'], 0)} del riesgo simulado.")
 
-
-# --------------------------------------------------------------------------- #
-# Enlaces a las vistas
-# --------------------------------------------------------------------------- #
-
-def page_link(file: str, label: str) -> None:
-    """Enlace a una vista. Si el archivo ya no existe, avisa en lugar de fallar.
-
-    `file` es la ruta de la vista desde la carpeta app/, por ejemplo
-    "pages/1_Mapa_de_demanda.py".
-    """
-    if (ROOT / "app" / file).is_file():
-        st.page_link(file, label=label)
+    # 2. El modelo contra la regla histórica.
+    comp = ind["comparacion"]
+    base = (ind["pronostico"].get("baseline") or {}).get("salidas") or {}
+    lgbm = (ind["pronostico"].get("lgbm") or {}).get("salidas") or {}
+    if comp["modelo_pronostica_mejor"] is None or comp["modelo_evita"] is None:
+        dos = f"Comparación entre el modelo y la regla histórica: {SIN_DATO}."
     else:
-        st.error(
-            f"No encuentro la vista `app/{file}`. Si le cambiaste el nombre al "
-            "archivo, actualiza este enlace en `app/Inicio.py`."
-        )
+        error = (f"El modelo pronostica {'mejor' if comp['modelo_pronostica_mejor'] else 'peor'} que el promedio "
+                 f"histórico (error de {pct(lgbm['wape'])} contra {pct(base['wape'])})")
+        riesgo = {"igual": "no evita más riesgo", "mas": "evita más riesgo", "menos": "evita menos riesgo"}[comp["modelo_evita"]]
+        nexo = ("pero" if comp["modelo_pronostica_mejor"] != (comp["modelo_evita"] == "mas") else "y")
+        dos = (f"{error}, {nexo} {riesgo}: {pct(modelo['pct_evitado'])} contra "
+               f"{pct(hist['pct_evitado'])} de la regla histórica.")
 
-
-# --------------------------------------------------------------------------- #
-# Lectura
-# --------------------------------------------------------------------------- #
-
-@st.cache_data(show_spinner="Leyendo datos...")
-def _read_parquet(path: str, modified: float) -> pd.DataFrame:
-    """Lee un archivo Parquet. Streamlit guarda el resultado y no lo relee en cada clic.
-
-    `modified` es la fecha de modificación del archivo. No se usa aquí adentro:
-    sirve para que el archivo se vuelva a leer si alguien lo reemplaza. Como la
-    ruta también cuenta, al llegar el archivo real se deja de usar la muestra.
-    """
-    return pd.read_parquet(path)
-
-
-def _load(table: str) -> pd.DataFrame:
-    """Devuelve una tabla. Si su archivo no existe, avisa y detiene la página."""
-    path = find_file(table)
-    if path is None:
-        missing = ", ".join(f"`{name}.parquet`" for name in missing_tables())
-        message = (
-            f"No se encontró el archivo de la tabla `{table}`.\n\n"
-            f"Archivos que faltan en `data/processed` y en `data/sample`: {missing}.\n\n"
-            "Para generar los datos sintéticos de muestra, corre este comando en "
-            f"la terminal, desde la carpeta del proyecto: `{MAKE_SAMPLE_COMMAND}`\n\n"
-            "Después recarga esta página."
-        )
-        st.error(message)
-        st.stop()
-        # Dentro de Streamlit nunca se llega aquí: st.stop() detiene la página.
-        # Fuera de Streamlit (un notebook, una prueba) st.stop() no hace nada.
-        raise FileNotFoundError(message)
-    # Cada llamada entrega una copia: una vista puede modificar su tabla sin
-    # afectar a las demás vistas.
-    return _read_parquet(str(path), path.stat().st_mtime)
-
-
-# Una función por tabla. Las columnas de cada una están en app/LEEME.md.
-
-def load_stations() -> pd.DataFrame:
-    """Estaciones: una fila por estación.
-
-    OJO: `capacity` y `station_type` pueden venir vacíos.
-    """
-    stations = _load("stations")
-    # capacity es un número entero con vacíos. pandas lo leería como decimal
-    # (59.0). Con "Int64" queda como entero y los vacíos se ven como <NA>.
-    stations["capacity"] = stations["capacity"].astype("Int64")
-    return stations
-
-
-def load_station_hour() -> pd.DataFrame:
-    """Salidas y llegadas observadas: una fila por estación y hora.
-
-    `ts_hour` es el inicio de la hora, en hora local de Nueva York, con zona
-    horaria. Son viajes que sí ocurrieron: solo demanda atendida.
-    Para el eje de una gráfica, mira hora_para_grafica() más abajo.
-
-    OJO: cada estación tiene filas solo entre su primer y su último viaje.
-    Dentro de ese tramo están todas las horas; las que no tuvieron viajes
-    valen cero. Fuera de ese tramo no hay filas. Por eso no todas las
-    estaciones empiezan ni terminan el mismo día.
-    """
-    return _load("station_hour")
-
-
-def load_predictions() -> pd.DataFrame:
-    """Pronóstico: una fila por estación, hora, modelo y periodo (val o test).
-
-    `ts_hour` es hora local de Nueva York, con zona horaria.
-    OJO: son periodos de evaluación que ya pasaron, no horas futuras. Es lo
-    que el modelo esperaba para esos días.
-
-    OJO, decisión 4 del equipo (la prueba final se usa una sola vez):
-    lo observado se compara SOLO con las filas de `split == "val"`
-    (validación). Las filas de `split == "test"` (prueba final) se muestran
-    como pronóstico, sin lo observado al lado y sin calcular su error, hasta
-    la evaluación final del proyecto.
-
-    Con `model == "baseline"`, `q50` es el promedio histórico de esa estación,
-    día de la semana y hora. No es la mediana.
-    """
-    return _load("predictions")
-
-
-def load_recommendations() -> pd.DataFrame:
-    """Recomendaciones: una fila por estación, día, franja horaria y política.
-
-    Salen de la simulación de inventario, corrida con el presupuesto de
-    referencia. No son mediciones. El día de cada fila es el día de
-    `window_start`. OJO: para mostrar o sumar hay que elegir antes un día y
-    una política; si no, la misma estación sale repetida.
-
-    `bikes_to_move` es lo que esa política movió en la simulación: positivo
-    es llevar bicis a la estación; negativo es retirarlas. Cero con riesgo
-    alto casi siempre quiere decir que el presupuesto no alcanzó, no que la
-    estación esté bien.
-
-    `start_inventory_target` son las bicis con las que la estación queda en
-    la simulación justo después de ese traslado (las que tenía más
-    `bikes_to_move`). No es el inventario ideal.
-
-    `risk_level` se calcula con el pronóstico y con el inventario de ANTES
-    del traslado. `feasible` en falso significa que, según el pronóstico,
-    ningún inventario inicial evita a la vez que la estación se vacíe y que
-    se llene.
-
-    OJO: no todas las estaciones tienen filas. La simulación deja fuera a las
-    que no tienen capacidad registrada y a las que no tuvieron viajes en los
-    días simulados.
-    """
-    return _load("recommendations")
-
-
-def load_policy_curve() -> pd.DataFrame:
-    """Curva de riesgo contra presupuesto: una fila por política y presupuesto diario.
-
-    Sale de la simulación de inventario. No son mediciones.
-
-    `budget` es el total de bicis que se pueden trasladar en un día en toda
-    la red. `risk_station_hours` son las horas de estación en riesgo simulado
-    POR DÍA: el promedio de los días evaluados, contando las 24 horas.
-    `ci_low` y `ci_high` son un intervalo que sale de sortear esos mismos
-    días. Los días no son independientes: es indicativo, no una garantía.
-
-    La diferencia entre una política y `none` con el mismo presupuesto es
-    riesgo simulado evitado.
-    """
-    return _load("policy_curve")
-
-
-def load_routes() -> pd.DataFrame:
-    """Viajes entre pares de estaciones: una fila por estación de inicio y estación de fin.
-
-    `trips` es cuántos viajes hubo de la primera a la segunda en todo el
-    periodo. De A a B y de B a A son dos filas distintas.
-    OJO: son viajes de usuarios, NO rutas de camiones de rebalanceo. Ningún
-    archivo dice de qué estación a cuál conviene mover bicis.
-    El inicio y el fin pueden ser la misma estación (el usuario devolvió la
-    bici donde la tomó). Los pares sin ningún viaje no tienen fila.
-    Son viajes que sí ocurrieron: solo demanda atendida.
-    """
-    return _load("routes")
-
-
-# --------------------------------------------------------------------------- #
-# Horas en el eje de una gráfica
-# --------------------------------------------------------------------------- #
-
-def hora_para_grafica(columna: pd.Series) -> pd.Series:
-    """La misma hora de Nueva York, sin zona horaria. SOLO para el eje de una gráfica.
-
-    Úsala con st.line_chart, st.bar_chart, st.area_chart y altair. Esas
-    gráficas se dibujan en el navegador: si la hora trae zona, el navegador la
-    convierte a la hora de la computadora y la gráfica sale corrida.
-    Las tablas (st.dataframe) y plotly no la necesitan.
-
-        station_hour["hora"] = datos.hora_para_grafica(station_hour["ts_hour"])
-        st.line_chart(station_hour, x="hora", y="departures")
-
-    OJO: el día de 25 horas, las dos filas de la 01:00 caen en el mismo punto.
-    """
-    return columna.dt.tz_localize(None)
-
-
-# --------------------------------------------------------------------------- #
-# Prueba de lectura (ayuda temporal del esqueleto)
-# --------------------------------------------------------------------------- #
-
-def describe_simulated(name: str, table: pd.DataFrame) -> str:
-    """Una frase que dice qué trae una tabla simulada. Todo se cuenta de la tabla.
-
-    Para las otras tablas devuelve un texto vacío. No lleva ninguna cifra
-    escrita a mano: si alguien vuelve a simular con otras reglas, la frase
-    cambia sola.
-    """
-    if len(table) == 0:
-        return ""  # sin filas no hay nada que contar
-    if name == "recommendations":
-        start = table["window_start"]
-        days = start.dt.normalize()  # el día en que empieza la franja
-        # Franjas por día: cuántas horas de inicio distintas hay.
-        windows = (start.dt.hour * 60 + start.dt.minute).nunique()
-        return (
-            " Una fila por estación, día, franja horaria y política: "
-            f"{table['station_id'].nunique()} estaciones, {days.nunique()} días "
-            f"({periodo_en_texto(days.min(), days.max())}), "
-            f"{windows} franjas por día y {table['policy'].nunique()} políticas."
-        )
-    if name == "policy_curve":
-        budgets = ", ".join(str(budget) for budget in sorted(table["budget"].unique()))
-        return (
-            " Una fila por política y presupuesto diario: "
-            f"{table['policy'].nunique()} políticas y {table['budget'].nunique()} "
-            f"presupuestos ({budgets} bicis al día en toda la red)."
-        )
-    return ""
-
-
-def show_data_check(tables: dict[str, pd.DataFrame]) -> None:
-    """Muestra cuántas filas se leyeron de cada tabla y una vista previa plegada.
-
-    `tables` es un diccionario nombre -> tabla ya leída. Solo sirve para
-    comprobar que los datos llegan a la vista. Se puede quitar de una vista
-    cuando ya tenga sus gráficas.
-
-    En las dos tablas simuladas dice además qué trae cada una (cuántas
-    estaciones, días, franjas, políticas y presupuestos).
-    """
-    synthetic = synthetic_tables()
-    lines = []
-    for name, table in tables.items():
-        origin = "SINTÉTICA, de `data/sample`" if name in synthetic else "real, de `data/processed`"
-        lines.append(f"- `{name}`: {len(table)} filas leídas ({origin}).{describe_simulated(name, table)}")
-    st.markdown("\n".join(lines))
-    for name, table in tables.items():
-        with st.expander(f"Ver las primeras filas de {name}"):
-            st.dataframe(table.head(5), hide_index=True)
+    # 3. Desde qué presupuesto deja de ayudar.
+    umbral = ind["presupuesto_umbral"]["politicas"]
+    u = umbral.get("historical") or umbral.get("model") or {}
+    if u.get("presupuesto") is not None:
+        tres = (f"Más allá de {num(u['presupuesto'])} bicis al día, mover más casi no ayuda: cada bici extra "
+                f"evita {num(u['ganancia_despues'], 1)} horas de riesgo, contra {num(u['ganancia_inicial'], 1)} "
+                "al principio.")
+    elif u.get("ganancia_inicial") is not None:
+        tres = "En los presupuestos simulados, cada bici extra todavía reduce el riesgo."
+    else:
+        tres = f"Presupuesto a partir del cual mover más deja de ayudar: {SIN_DATO}."
+    return [uno, dos, tres]

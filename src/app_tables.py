@@ -1,0 +1,533 @@
+"""Tablas pequeñas para el dashboard.
+
+El dashboard nunca lee las tablas grandes (station_hour tiene 5 millones de
+filas y predictions 3 millones). Este módulo las resume una sola vez y deja el
+resultado en `data/processed/app/`. `app/datos.py` solo lee esa carpeta.
+
+    python scripts/build_app_tables.py                      # datos reales
+    python scripts/build_app_tables.py --datos data/sample --salida /tmp/app
+
+Qué lee de la carpeta de datos: los seis contratos y, si existe,
+`reports/simulacion.json`. Todo lo que falte se escribe vacío o como `null`
+(el dashboard muestra "Sin dato"); nada de esto hace fallar la construcción.
+
+Decisión 4: lo observado solo se cruza con el pronóstico en el tramo de
+validación (`split = "val"`). Las filas de la prueba final nunca se leen para
+comparar ni para calcular métricas. Las tablas descriptivas de demanda
+(estaciones, mapa, rutas) usan todo el periodo, sin pronóstico.
+
+Definiciones que fija este módulo (y que el dashboard solo muestra):
+
+- Tipo de día: sábado y domingo son "fin_de_semana"; lo demás, "laborable"
+  (un festivo entre semana cuenta como laborable).
+- Usuarios: las salidas vienen separadas en miembros y ocasionales. Las
+  llegadas y el flujo neto NO traen esa separación en los datos: en el mapa,
+  el color (flujo neto) es siempre el de todos los usuarios.
+- Bloques de hora para el error de pronóstico: madrugada 00-05, mañana 06-11,
+  tarde 12-17, noche 18-23.
+- Volumen de la estación: tercios (bajo, medio, alto) según las salidas
+  anteriores al tramo de validación.
+- Presupuesto de referencia: el del reporte de simulación. Sin reporte, el
+  presupuesto de la curva más cercano a las bicis recibidas por día en
+  `recommendations` (por contrato esa tabla sale del presupuesto de referencia).
+- Presupuesto a partir del cual casi no ayuda: el primer presupuesto de la
+  curva desde el cual el siguiente escalón evita, por cada bici extra, menos
+  del 10 % de lo que evitaba cada bici en el primer escalón
+  (`UMBRAL_GANANCIA`).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+ROOT = Path(__file__).resolve().parents[1]
+DATOS = ROOT / "data" / "processed"
+SALIDA = DATOS / "app"
+
+ZONA = "America/New_York"
+UMBRAL_GANANCIA = 0.10  # fracción de la ganancia por bici del primer escalón
+TOP = 100  # filas que se guardan en los rankings (la página muestra 15)
+BLOQUES = [("madrugada", 0, 5), ("manana", 6, 11), ("tarde", 12, 17), ("noche", 18, 23)]
+POLITICAS = ["none", "historical", "model"]
+
+# Archivos que se escriben. La app los busca con estos mismos nombres.
+TABLAS = [
+    "estaciones", "estacion_hora", "demanda_hora", "top_estaciones", "top_rutas",
+    "pronostico", "recomendaciones", "curva", "metricas", "riesgo_horas",
+    "riesgo_niveles",
+]
+INDICADORES = "indicadores.json"
+
+
+def _f(x):
+    """Número de Python o None (para el JSON)."""
+    if x is None or pd.isna(x):
+        return None
+    return float(x)
+
+
+def _escribir(df: pd.DataFrame, ruta: Path, grupo: int | None = None) -> None:
+    tabla = pa.Table.from_pandas(df.reset_index(drop=True), preserve_index=False)
+    tabla = tabla.replace_schema_metadata(None)
+    pq.write_table(tabla, ruta, compression="zstd", row_group_size=grupo)
+
+
+def _leer_json(ruta: Path) -> dict:
+    try:
+        return json.loads(ruta.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _hora(texto) -> int | None:
+    try:
+        return int(str(texto).split(":")[0])
+    except (ValueError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Demanda (descriptivo, todo el periodo)
+# --------------------------------------------------------------------------- #
+
+def _demanda(con, datos: Path, salida: Path) -> dict:
+    sh = f"read_parquet('{datos / 'station_hour.parquet'}')"
+    st = f"read_parquet('{datos / 'stations.parquet'}')"
+    con.execute(f"""
+        CREATE TEMP TABLE sh AS
+        SELECT station_id, CAST(ts_hour AS TIMESTAMP) AS ts, departures, arrivals,
+               net_flow, departures_member, departures_casual
+        FROM {sh}""")
+    con.execute("""
+        CREATE TEMP TABLE shd AS
+        SELECT *, CAST(ts AS DATE) AS fecha, hour(ts) AS hora,
+               CASE WHEN isodow(ts) >= 6 THEN 'fin_de_semana' ELSE 'laborable' END AS tipo_dia
+        FROM sh""")
+
+    estaciones = con.execute(f"""
+        WITH t AS (
+            SELECT station_id, sum(departures) AS salidas, sum(arrivals) AS llegadas,
+                   count(DISTINCT fecha) AS dias
+            FROM shd GROUP BY 1)
+        SELECT s.station_id AS estacion_id, s.name AS nombre, s.lat, s.lon,
+               CAST(s.capacity AS DOUBLE) AS capacidad, s.station_type AS tipo,
+               CAST(coalesce(t.salidas, 0) AS BIGINT) AS salidas,
+               CAST(coalesce(t.llegadas, 0) AS BIGINT) AS llegadas,
+               CAST(coalesce(t.dias, 0) AS BIGINT) AS dias_con_datos,
+               round(coalesce(t.salidas / nullif(t.dias, 0), 0), 2) AS salidas_dia,
+               round(coalesce(t.llegadas / nullif(t.dias, 0), 0), 2) AS llegadas_dia
+        FROM {st} s LEFT JOIN t USING (station_id)
+        ORDER BY 1""").df()
+    estaciones["flujo_neto_dia"] = (estaciones["llegadas_dia"] - estaciones["salidas_dia"]).round(2)
+
+    estacion_hora = con.execute("""
+        SELECT station_id AS estacion_id, hora, tipo_dia,
+               CAST(round(avg(departures), 3) AS FLOAT) AS salidas,
+               CAST(round(avg(departures_member), 3) AS FLOAT) AS salidas_miembros,
+               CAST(round(avg(departures_casual), 3) AS FLOAT) AS salidas_ocasionales,
+               CAST(round(avg(arrivals), 3) AS FLOAT) AS llegadas,
+               CAST(round(avg(net_flow), 3) AS FLOAT) AS flujo_neto
+        FROM shd GROUP BY 1, 2, 3 ORDER BY 3, 2, 1""").df()
+    _escribir(estacion_hora, salida / "estacion_hora.parquet")
+
+    # Sistema completo: viajes por hora, promedio entre los días de cada tipo.
+    demanda_hora = con.execute("""
+        WITH d AS (
+            SELECT fecha, tipo_dia, hora, sum(departures) AS s, sum(departures_member) AS m,
+                   sum(departures_casual) AS c, sum(arrivals) AS a
+            FROM shd GROUP BY 1, 2, 3)
+        SELECT tipo_dia, hora, round(avg(s), 1) AS salidas, round(avg(m), 1) AS salidas_miembros,
+               round(avg(c), 1) AS salidas_ocasionales, round(avg(a), 1) AS llegadas,
+               count(*) AS dias
+        FROM d GROUP BY 1, 2 ORDER BY 1, 2""").df()
+    _escribir(demanda_hora, salida / "demanda_hora.parquet")
+
+    top = estaciones.sort_values(["salidas", "estacion_id"], ascending=[False, True]).head(TOP).copy()
+    top.insert(0, "puesto", range(1, len(top) + 1))
+    _escribir(top, salida / "top_estaciones.parquet")
+
+    rutas = con.execute(f"""
+        SELECT r.start_station_id AS origen_id, a.name AS origen,
+               r.end_station_id AS destino_id, b.name AS destino, r.trips AS viajes,
+               a.lat AS origen_lat, a.lon AS origen_lon, b.lat AS destino_lat, b.lon AS destino_lon
+        FROM read_parquet('{datos / 'routes.parquet'}') r
+        LEFT JOIN {st} a ON a.station_id = r.start_station_id
+        LEFT JOIN {st} b ON b.station_id = r.end_station_id
+        ORDER BY r.trips DESC, 1, 3 LIMIT {TOP}""").df()
+    rutas.insert(0, "puesto", range(1, len(rutas) + 1))
+    rutas["origen"] = rutas["origen"].fillna(rutas["origen_id"])
+    rutas["destino"] = rutas["destino"].fillna(rutas["destino_id"])
+    rutas["misma_estacion"] = rutas["origen_id"] == rutas["destino_id"]
+    rutas["ruta"] = rutas["origen"] + " → " + rutas["destino"]
+    _escribir(rutas, salida / "top_rutas.parquet")
+
+    pares, viajes_rutas = con.execute(
+        f"SELECT count(*), sum(trips) FROM read_parquet('{datos / 'routes.parquet'}')").fetchone()
+    ini, fin, dias = con.execute("SELECT min(fecha), max(fecha), count(DISTINCT fecha) FROM shd").fetchone()
+    return {
+        "estaciones_df": estaciones,
+        "resumen": {
+            "viajes_analizados": int(estaciones["salidas"].sum()),
+            "llegadas": int(estaciones["llegadas"].sum()),
+            "estaciones": int(len(estaciones)),
+            "estaciones_con_capacidad": int(estaciones["capacidad"].notna().sum()),
+            "estaciones_con_tipo": int(estaciones["tipo"].notna().sum()),
+            "pares_de_estaciones": int(pares or 0),
+            "viajes_en_rutas": int(viajes_rutas or 0),
+            "periodo": {"inicio": str(ini), "fin": str(fin), "dias": int(dias)},
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Pronóstico contra observado (solo validación)
+# --------------------------------------------------------------------------- #
+
+def _pronostico(con, datos: Path, salida: Path, estaciones: pd.DataFrame) -> dict:
+    pr = f"read_parquet('{datos / 'predictions.parquet'}')"
+    # Solo split = 'val'. La prueba final no entra (decisión 4).
+    cols = ", ".join(
+        f"CAST(max({c}_{q}) FILTER (model = '{m}') AS FLOAT) AS {pref}_{nom}_{q}"
+        for m, pref in (("baseline", "base"), ("lgbm", "modelo"))
+        for c, nom in (("dep", "sal"), ("arr", "lle"))
+        for q in ("q10", "q50", "q90"))
+    con.execute(f"""
+        CREATE TEMP TABLE pv AS
+        WITH p AS (
+            SELECT station_id, CAST(ts_hour AS TIMESTAMP) AS ts, {cols}
+            FROM {pr} WHERE split = 'val' GROUP BY 1, 2)
+        SELECT p.station_id AS estacion_id, p.ts, CAST(p.ts AS DATE) AS fecha,
+               CAST(hour(p.ts) AS TINYINT) AS hora,
+               CAST(o.departures AS INTEGER) AS sal_obs, CAST(o.arrivals AS INTEGER) AS lle_obs,
+               p.* EXCLUDE (station_id, ts)
+        FROM p JOIN sh o ON o.station_id = p.station_id AND o.ts = p.ts""")
+    tabla = con.execute("SELECT * FROM pv ORDER BY estacion_id, ts").df()
+    _escribir(tabla, salida / "pronostico.parquet", grupo=8192)
+
+    if tabla.empty:
+        val = {"inicio": None, "fin": None, "dias": 0}
+        corte = None
+    else:
+        corte = tabla["fecha"].min()
+        val = {"inicio": str(pd.Timestamp(corte).date()), "fin": str(pd.Timestamp(tabla["fecha"].max()).date()),
+               "dias": int(tabla["fecha"].nunique())}
+
+    # Tercios de volumen con las salidas ANTERIORES a validación.
+    con.execute(f"""
+        CREATE TEMP TABLE vol AS
+        WITH e AS (SELECT DISTINCT estacion_id FROM pv),
+        h AS (SELECT station_id, sum(departures) AS s FROM sh
+              WHERE ts < {"TIMESTAMP '" + str(pd.Timestamp(corte)) + "'" if corte is not None else "ts"}
+              GROUP BY 1)
+        SELECT e.estacion_id, coalesce(h.s, 0) AS previas,
+               ntile(3) OVER (ORDER BY coalesce(h.s, 0), e.estacion_id) AS tercio
+        FROM e LEFT JOIN h ON h.station_id = e.estacion_id""")
+    vol = con.execute("SELECT * FROM vol ORDER BY 1").df()
+    nombres = {1: "bajo", 2: "medio", 3: "alto"}
+    estaciones = estaciones.merge(vol.rename(columns={"previas": "salidas_previas"}), on="estacion_id", how="left")
+    estaciones["volumen"] = estaciones["tercio"].map(nombres)
+    estaciones["tiene_pronostico"] = estaciones["tercio"].notna()
+    # Sin viajes antes de validación: su pronóstico histórico es un marcador
+    # (promedio del sistema), no un pronóstico de esa estación.
+    estaciones["sin_historia"] = estaciones["tiene_pronostico"] & (estaciones["salidas_previas"].fillna(0) == 0)
+    estaciones = estaciones.drop(columns=["tercio", "salidas_previas"])
+
+    bloque = "CASE " + " ".join(f"WHEN hora BETWEEN {a} AND {b} THEN '{n}'" for n, a, b in BLOQUES) + " END"
+    partes = []
+    for modelo, pref in (("baseline", "base"), ("lgbm", "modelo")):
+        for objetivo, nom in (("salidas", "sal"), ("llegadas", "lle")):
+            partes.append(f"""
+                SELECT '{modelo}' AS modelo, '{objetivo}' AS objetivo, estacion_id, hora,
+                       {nom}_obs AS y, {pref}_{nom}_q10 AS q10, {pref}_{nom}_q50 AS q50, {pref}_{nom}_q90 AS q90
+                FROM pv WHERE {pref}_{nom}_q50 IS NOT NULL""")
+    largo = " UNION ALL ".join(partes)
+    medidas = """count(*) AS n, avg(abs(y - q50)) AS mae, sqrt(avg((y - q50) * (y - q50))) AS rmse,
+                 sum(abs(y - q50)) / nullif(sum(y), 0) AS wape,
+                 avg(CASE WHEN y >= q10 AND y <= q90 THEN 1.0 ELSE 0.0 END) AS cobertura,
+                 avg(q90 - q10) AS ancho"""
+    metricas = con.execute(f"""
+        WITH l AS ({largo}), lv AS (SELECT l.*, v.tercio, {bloque} AS bloque FROM l JOIN vol v USING (estacion_id))
+        SELECT 'general' AS corte, 'todas' AS grupo, 0 AS orden, modelo, objetivo, {medidas} FROM lv GROUP BY ALL
+        UNION ALL
+        SELECT 'bloque', bloque, min(hora), modelo, objetivo, {medidas} FROM lv GROUP BY bloque, modelo, objetivo
+        UNION ALL
+        SELECT 'hora', lpad(CAST(hora AS VARCHAR), 2, '0'), hora, modelo, objetivo, {medidas} FROM lv GROUP BY hora, modelo, objetivo
+        UNION ALL
+        SELECT 'volumen', CASE tercio WHEN 1 THEN 'bajo' WHEN 2 THEN 'medio' ELSE 'alto' END, tercio, modelo, objetivo, {medidas}
+        FROM lv GROUP BY tercio, modelo, objetivo
+        ORDER BY 1, 3, 4, 5""").df()
+    _escribir(metricas, salida / "metricas.parquet")
+
+    general = {}
+    for fila in metricas[metricas["corte"] == "general"].itertuples():
+        general.setdefault(fila.modelo, {})[fila.objetivo] = {
+            "n": int(fila.n), "mae": _f(fila.mae), "rmse": _f(fila.rmse), "wape": _f(fila.wape),
+            "cobertura": _f(fila.cobertura), "ancho": _f(fila.ancho)}
+    return {"estaciones_df": estaciones, "validacion": val, "pronostico": general}
+
+
+# --------------------------------------------------------------------------- #
+# Simulación: recomendaciones, curva e indicadores
+# --------------------------------------------------------------------------- #
+
+def _recomendaciones(con, datos: Path, salida: Path, reporte: dict, estaciones: pd.DataFrame):
+    ruta = datos / "recommendations.parquet"
+    franjas = {}
+    for f in (reporte.get("reglas") or {}).get("franjas") or []:
+        if _hora(f.get("inicio")) is not None:
+            franjas[_hora(f["inicio"])] = f.get("nombre")
+    rec = con.execute(f"""
+        SELECT station_id AS estacion_id, CAST(CAST(window_start AS TIMESTAMP) AS DATE) AS fecha,
+               CAST(hour(CAST(window_start AS TIMESTAMP)) AS INTEGER) AS hora_inicio,
+               CAST(hour(CAST(window_end AS TIMESTAMP)) AS INTEGER) AS hora_fin,
+               policy AS politica, CAST(bikes_to_move AS INTEGER) AS bicis,
+               risk_level AS nivel_riesgo, feasible AS factible,
+               CAST(start_inventory_target AS INTEGER) AS inventario
+        FROM read_parquet('{ruta}') ORDER BY 1, 2, 3, 5""").df() if ruta.exists() else pd.DataFrame(
+        columns=["estacion_id", "fecha", "hora_inicio", "hora_fin", "politica", "bicis",
+                 "nivel_riesgo", "factible", "inventario"])
+    rec.insert(2, "franja", [franjas.get(h) or ("manana" if h < 12 else "tarde") for h in rec["hora_inicio"]])
+    _escribir(rec, salida / "recomendaciones.parquet", grupo=8192)
+
+    simuladas = set(rec["estacion_id"].unique())
+    estaciones["simulada"] = estaciones["estacion_id"].isin(simuladas)
+
+    # Reparto de niveles de riesgo por franja y por tipo de estación.
+    r = rec.merge(estaciones[["estacion_id", "tipo"]], on="estacion_id", how="left")
+    r["tipo"] = r["tipo"].fillna("sin_dato")
+    partes = []
+    for corte, col in (("franja", "franja"), ("tipo_estacion", "tipo")):
+        g = (r.groupby([col, "politica", "nivel_riesgo"]).size().unstack("nivel_riesgo", fill_value=0)
+             .reindex(columns=["alto", "medio", "bajo"], fill_value=0).reset_index()
+             .rename(columns={col: "grupo"}))
+        g.insert(0, "corte", corte)
+        partes.append(g)
+    niveles = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+    if niveles.empty:
+        niveles = pd.DataFrame(columns=["corte", "grupo", "politica", "alto", "medio", "bajo"])
+    niveles["total"] = niveles[["alto", "medio", "bajo"]].sum(axis=1)
+    niveles["pct_alto"] = (niveles["alto"] / niveles["total"].where(niveles["total"] > 0)).astype(float)
+    niveles = niveles.sort_values(["corte", "grupo", "politica"])
+    _escribir(niveles, salida / "riesgo_niveles.parquet")
+    return rec, estaciones
+
+
+def _curva(datos: Path, salida: Path) -> pd.DataFrame:
+    ruta = datos / "policy_curve.parquet"
+    cols = ["politica", "presupuesto", "riesgo", "ic_bajo", "ic_alto"]
+    if ruta.exists():
+        curva = pq.read_table(ruta).to_pandas()
+        curva.columns = cols
+    else:
+        curva = pd.DataFrame(columns=cols)
+    base = curva[curva["politica"] == "none"].set_index("presupuesto")["riesgo"]
+    curva["riesgo_sin_intervencion"] = curva["presupuesto"].map(base).astype(float)
+    curva["evitado"] = curva["riesgo_sin_intervencion"] - curva["riesgo"]
+    curva["pct_evitado"] = curva["evitado"] / curva["riesgo_sin_intervencion"].where(curva["riesgo_sin_intervencion"] > 0)
+    orden = {p: i for i, p in enumerate(POLITICAS)}
+    curva = curva.sort_values("presupuesto", kind="stable")
+    curva = curva.iloc[curva["politica"].map(orden).fillna(9).argsort(kind="stable")]
+    _escribir(curva, salida / "curva.parquet")
+    return curva
+
+
+def _umbral(curva: pd.DataFrame) -> dict:
+    """Presupuesto desde el cual cada bici extra evita muy poco (ver el encabezado)."""
+    por_politica = {}
+    for politica in ("historical", "model"):
+        c = curva[curva["politica"] == politica].sort_values("presupuesto")
+        b, r = c["presupuesto"].tolist(), c["riesgo"].tolist()
+        pasos = [{"desde": int(b[i]), "hasta": int(b[i + 1]),
+                  "horas_evitadas_por_bici": (r[i] - r[i + 1]) / (b[i + 1] - b[i])}
+                 for i in range(len(b) - 1) if b[i + 1] > b[i]]
+        dato = {"presupuesto": None, "ganancia_inicial": None, "ganancia_despues": None, "pasos": pasos}
+        if pasos and pasos[0]["horas_evitadas_por_bici"] > 0:
+            inicial = pasos[0]["horas_evitadas_por_bici"]
+            dato["ganancia_inicial"] = inicial
+            for paso in pasos[1:]:
+                if paso["horas_evitadas_por_bici"] < UMBRAL_GANANCIA * inicial:
+                    dato["presupuesto"] = paso["desde"]
+                    dato["ganancia_despues"] = paso["horas_evitadas_por_bici"]
+                    break
+        por_politica[politica] = dato
+    return {"umbral_relativo": UMBRAL_GANANCIA, "politicas": por_politica}
+
+
+def _limitaciones(reporte: dict) -> list[str]:
+    """Primera oración de cada limitación del reporte, sin las que nombran tablas o
+    columnas ni las de más de 140 letras (no caben en un renglón)."""
+    lineas = []
+    for texto in reporte.get("limitaciones") or []:
+        texto = str(texto).replace("**", "")
+        primera = re.split(r"(?<=[a-záéíóúñ\)])\.\s", texto, maxsplit=1)[0].strip()
+        if "`" in primera or '"' in primera or not primera or len(primera) > 140:
+            continue
+        lineas.append(primera if primera.endswith(".") else primera + ".")
+    return lineas
+
+
+def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: Path) -> dict:
+    reglas = reporte.get("reglas") or {}
+    presupuestos = sorted(curva["presupuesto"].unique().tolist())
+    ref = reglas.get("presupuesto_de_referencia_en_bicis")
+    if ref is None and presupuestos and not rec.empty:
+        # Sin reporte: el presupuesto más cercano a las bicis recibidas por día.
+        mov = rec[(rec["politica"] != "none") & (rec["bicis"] > 0)]
+        if not mov.empty:
+            por_dia = mov.groupby(["politica", "fecha"])["bicis"].sum().groupby("politica").mean().max()
+            ref = min(presupuestos, key=lambda b: (abs(b - por_dia), b))
+    if ref is not None and int(ref) not in presupuestos:
+        ref = None
+    ref = None if ref is None else int(ref)
+
+    resultados = {(r.get("politica"), r.get("presupuesto_del_dia_en_bicis")): r
+                  for r in reporte.get("resultados") or []}
+    referencia = {"presupuesto": ref, "bicis_por_estacion": _f(reglas.get("presupuesto_de_referencia")),
+                  "riesgo_sin_intervencion": None, "politicas": {}}
+    horas = []
+    if ref is not None:
+        en_ref = curva[curva["presupuesto"] == ref].set_index("politica")
+        sin = _f(en_ref["riesgo"].get("none"))
+        referencia["riesgo_sin_intervencion"] = sin
+        for politica in ("historical", "model"):
+            if politica not in en_ref.index:
+                continue
+            fila = en_ref.loc[politica]
+            dato = {"riesgo": _f(fila["riesgo"]), "ic_bajo": _f(fila["ic_bajo"]), "ic_alto": _f(fila["ic_alto"]),
+                    "evitado": _f(fila["evitado"]), "evitado_ic_bajo": None, "evitado_ic_alto": None,
+                    "pct_evitado": _f(fila["pct_evitado"]), "pct_ic_bajo": None, "pct_ic_alto": None,
+                    "viajes_bloqueados_por_dia": None}
+            res = resultados.get((politica, ref)) or {}
+            ev = res.get("riesgo_simulado_evitado_por_dia") or {}
+            if sin and ev.get("ic_bajo") is not None and ev.get("ic_alto") is not None:
+                dato["evitado_ic_bajo"], dato["evitado_ic_alto"] = _f(ev["ic_bajo"]), _f(ev["ic_alto"])
+                dato["pct_ic_bajo"], dato["pct_ic_alto"] = ev["ic_bajo"] / sin, ev["ic_alto"] / sin
+            dato["viajes_bloqueados_por_dia"] = _f((res.get("viajes_bloqueados") or {}).get("por_dia"))
+            referencia["politicas"][politica] = dato
+        # Horas de riesgo por franja, por causa y (si el reporte lo trae) por tipo de estación.
+        claves = (("franja", "riesgo_por_franja"), ("causa", "riesgo_por_tipo"),
+                  ("tipo_estacion", "riesgo_por_tipo_de_estacion"), ("tipo_estacion", "riesgo_por_tipo_estacion"))
+        for politica in POLITICAS:
+            res = resultados.get((politica, ref)) or {}
+            for corte, clave in claves:
+                for grupo, v in (res.get(clave) or {}).items():
+                    v = v if isinstance(v, dict) else {"media": v}
+                    horas.append({"corte": corte, "grupo": str(grupo), "politica": politica,
+                                  "riesgo": _f(v.get("media")), "ic_bajo": _f(v.get("ic_bajo")),
+                                  "ic_alto": _f(v.get("ic_alto"))})
+    horas_df = pd.DataFrame(horas, columns=["corte", "grupo", "politica", "riesgo", "ic_bajo", "ic_alto"])
+    for col in ("riesgo", "ic_bajo", "ic_alto"):
+        horas_df[col] = horas_df[col].astype(float)
+    _escribir(horas_df, salida / "riesgo_horas.parquet")
+
+    # Sensibilidad al inventario inicial.
+    filas = []
+    for f in (reporte.get("sensibilidad_al_inventario_inicial") or {}).get("filas") or []:
+        sin = _f(f.get("riesgo_sin_intervencion_por_dia"))
+        fila = {"inventario_inicial": f.get("inventario_inicial"), "riesgo_sin_intervencion": sin}
+        for politica, v in (f.get("por_politica") or {}).items():
+            ev = _f(v.get("riesgo_simulado_evitado_por_dia"))
+            fila[politica] = {"riesgo": _f(v.get("riesgo_por_dia")), "evitado": ev,
+                              "pct_evitado": ev / sin if sin and ev is not None else None}
+        filas.append(fila)
+    rango = {}
+    for politica in ("historical", "model"):
+        pcts = [f[politica]["pct_evitado"] for f in filas if f.get(politica) and f[politica]["pct_evitado"] is not None]
+        evs = [f[politica]["evitado"] for f in filas if f.get(politica) and f[politica]["evitado"] is not None]
+        if pcts:
+            rango[politica] = {"pct_min": min(pcts), "pct_max": max(pcts),
+                               "evitado_min": min(evs), "evitado_max": max(evs), "escenarios": len(pcts)}
+
+    tramo = reporte.get("tramo") or {}
+    dias = sorted(rec["fecha"].astype(str).unique().tolist()) if not rec.empty else []
+    return {
+        "simulacion": {
+            "con_reporte": bool(reporte),
+            "dias_evaluados": len(tramo.get("dias_evaluados") or dias),
+            "inicio": (tramo.get("dias_evaluados") or dias or [None])[0],
+            "fin": (tramo.get("dias_evaluados") or dias or [None])[-1],
+            "estaciones_simuladas": (reporte.get("estaciones") or {}).get("simuladas")
+            or (int(rec["estacion_id"].nunique()) if not rec.empty else None),
+            "reglas_provisionales": (reglas.get("estado") == "provisional") if reglas.get("estado") else None,
+            "bicis_minimas": reglas.get("bicis_minimas"),
+            "lugares_libres_minimos": reglas.get("lugares_libres_minimos"),
+            "nivel_del_intervalo": (reporte.get("intervalo") or {}).get("nivel"),
+            "presupuestos": [int(b) for b in presupuestos],
+            "politicas": [p for p in POLITICAS if p in set(curva["politica"])],
+            "franjas": [{"nombre": f.get("nombre"), "inicio": f.get("inicio"), "fin": f.get("fin"),
+                         "momento_intervencion": f.get("momento_intervencion")}
+                        for f in reglas.get("franjas") or []],
+        },
+        "referencia": referencia,
+        "sensibilidad": {"filas": filas, "rango": rango},
+        "presupuesto_umbral": _umbral(curva),
+        "limitaciones": _limitaciones(reporte),
+    }
+
+
+def _comparacion(pronostico: dict, referencia: dict) -> dict:
+    """El modelo contra la regla histórica: error de pronóstico y riesgo, lado a lado."""
+    base = (pronostico.get("baseline") or {}).get("salidas") or {}
+    lgbm = (pronostico.get("lgbm") or {}).get("salidas") or {}
+    hist = referencia["politicas"].get("historical") or {}
+    modelo = referencia["politicas"].get("model") or {}
+    mejor = None
+    if base.get("mae") is not None and lgbm.get("mae") is not None:
+        mejor = lgbm["mae"] < base["mae"]
+    evita = None  # "mas", "menos" o "igual" (los intervalos se traslapan)
+    if hist.get("riesgo") is not None and modelo.get("riesgo") is not None:
+        if modelo["ic_alto"] < hist["ic_bajo"]:
+            evita = "mas"
+        elif modelo["ic_bajo"] > hist["ic_alto"]:
+            evita = "menos"
+        else:
+            evita = "igual"
+    return {"modelo_pronostica_mejor": mejor, "modelo_evita": evita,
+            "diferencia_de_riesgo": (modelo["riesgo"] - hist["riesgo"]) if evita else None}
+
+
+# --------------------------------------------------------------------------- #
+# Punto de entrada
+# --------------------------------------------------------------------------- #
+
+def build(datos: Path | str = DATOS, salida: Path | str = SALIDA) -> dict:
+    """Construye todas las tablas de la app. Devuelve el diccionario de indicadores."""
+    datos, salida = Path(datos), Path(salida)
+    for nombre in ("stations", "station_hour", "predictions", "routes"):
+        if not (datos / f"{nombre}.parquet").exists():
+            raise FileNotFoundError(f"Falta {datos / (nombre + '.parquet')}")
+    salida.mkdir(parents=True, exist_ok=True)
+    reporte = _leer_json(datos / "reports" / "simulacion.json")
+
+    con = duckdb.connect()
+    try:
+        con.execute(f"SET TimeZone = '{ZONA}'")
+        demanda = _demanda(con, datos, salida)
+        pron = _pronostico(con, datos, salida, demanda["estaciones_df"])
+        rec, estaciones = _recomendaciones(con, datos, salida, reporte, pron["estaciones_df"])
+    finally:
+        con.close()
+    _escribir(estaciones, salida / "estaciones.parquet")
+    curva = _curva(datos, salida)
+    sim = _simulacion(reporte, curva, rec, salida)
+
+    indicadores = {
+        # data/sample es sintética: la app lo dice mientras la use.
+        "sinteticos": datos.resolve().name == "sample",
+        **demanda["resumen"],
+        "validacion": pron["validacion"],
+        "pronostico": pron["pronostico"],
+        **sim,
+        "comparacion": _comparacion(pron["pronostico"], sim["referencia"]),
+        "bloques_de_hora": [{"nombre": n, "desde": a, "hasta": b} for n, a, b in BLOQUES],
+    }
+    (salida / INDICADORES).write_text(
+        json.dumps(indicadores, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+    return indicadores
