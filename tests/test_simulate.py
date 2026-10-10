@@ -36,6 +36,7 @@ los archivos reales y se saltan si todavía no existen.
 """
 
 import copy
+import dataclasses
 import json
 import re
 from datetime import date
@@ -1601,3 +1602,68 @@ def test_las_salidas_reales_siguen_al_dia():
     if not all(path.exists() for path in inputs) or not FROZEN_FILE.exists():
         pytest.skip("Faltan tablas de entrada en data/processed o config/gbfs_congelado.csv: no hay contra qué comparar.")
     check_outputs_are_current(DATA_PROCESSED)
+
+
+# --------------------------------------------------------------------------- #
+# Tipo de estación, estaciones con valet y grupos aislados
+# --------------------------------------------------------------------------- #
+
+def test_el_riesgo_por_tipo_de_estacion_suma_el_total_y_el_reporte_lo_trae():
+    case = make_case()
+    case["stations"] = case["stations"].assign(
+        station_type=pd.Series(["oficinas", "oficinas", "residencial", "mixta", None, None, None, None], dtype="object")
+    )
+    result = simulate_case(case, lgbm=True)
+    report = result.report
+    assert report["estaciones"]["simuladas_por_tipo"] == {
+        "oficinas": 2, "residencial": 1, "recreativa": 0, "mixta": 1, "sin tipo": 2,
+    }
+    for row in report["resultados"]:
+        by_type = row["riesgo_por_tipo_de_estacion"]
+        assert list(by_type) == ["oficinas", "residencial", "recreativa", "mixta", "sin tipo"]
+        total = sum(cell["riesgo_por_dia"]["media"] for cell in by_type.values())
+        assert total == pytest.approx(row["riesgo_por_dia"]["media"])
+        avoided = sum(cell["riesgo_simulado_evitado_por_dia"]["media"] for cell in by_type.values())
+        assert avoided == pytest.approx(row["riesgo_simulado_evitado_por_dia"]["media"])
+        each_day = np.sum([cell["riesgo_de_cada_dia"] for cell in by_type.values()], axis=0)
+        assert each_day == pytest.approx(row["riesgo_de_cada_dia"])
+    text = build_report(report, anexo=None)
+    assert "## Riesgo por tipo de estación" in text and "| sin tipo | 2 |" in text and "| todas | 6 |" in text
+
+
+def test_valet_y_grupos_aislados_cambian_la_corrida_y_el_reporte_dice_cuanto():
+    case = make_case()
+    plain = simulate_case(case)
+    # Días evaluados: del 2 al 4 de septiembre de 2026 (miércoles a viernes). Valet de A: miércoles y jueves.
+    cfg = make_cfg(
+        excepciones_valet={"dias": ["miercoles", "jueves"], "estaciones": {"A": [["07:00", "11:00"]], "ZZ": [["07:00", "08:00"]]}},
+        grupos_aislados={"isla": ["B", "C", "ZZ"]},
+    )
+    result = simulate_case(case, cfg=cfg)
+    facts = result.report["excepciones"]
+    valet = facts["valet"]
+    assert valet["estaciones_en_el_archivo"] == ["A", "ZZ"] and valet["estaciones_simuladas"] == ["A"]
+    days = [date.fromisoformat(day).weekday() for day in result.report["tramo"]["dias_evaluados"]]
+    with_valet = sum(day in (2, 3) for day in days)
+    assert valet["dias_evaluados_con_valet"] == with_valet
+    assert valet["horas_de_estacion_excluidas"]["total"] == 4.0 * with_valet
+    assert valet["estacion_intervencion_dentro_de_un_intervalo"] == 0   # se interviene a las 05:00 y a las 14:00
+    group = facts["grupos_aislados"]["isla"]
+    assert group["estaciones_simuladas"] == ["B", "C"] and group["vecinas_de_fuera_dentro_de_la_distancia_maxima"] == 4
+    # Ningún traslado cruza el grupo, en ninguna corrida.
+    inside = {result.network.station_ids.index(name) for name in ("B", "C")}
+    moves = [move for run in result.runs.values() for record in run.interventions for move in record.moves]
+    assert moves and all((move.origin in inside) == (move.destination in inside) for move in moves)
+    crossing = [
+        move for run in plain.runs.values() for record in run.interventions for move in record.moves
+        if (move.origin in inside) != (move.destination in inside)
+    ]
+    assert crossing, "sin la regla el caso sí tiene traslados que cruzan: la prueba distingue"
+    # Sin intervención lo único que cambia es el tiempo con valet, que ya no cuenta.
+    none, none_plain = result.runs[("none", 0)], plain.runs[("none", 0)]
+    assert none.risk_us[:, :, 0].sum() + none.valet_risk_us.sum() == none_plain.risk_us[:, :, 0].sum()
+    text = build_report(result.report, anexo=None)
+    assert "Estaciones con valet (`excepciones_valet`): 2 en el archivo, 1 simuladas" in text
+    assert "Grupo aislado `isla`" in text and "no miran el grupo" in text
+    rules = dataclasses.asdict(Reglas.from_operacion(cfg))
+    assert rules["valet_dias"] == (2, 3) and json.loads(json.dumps(rules))["grupos_aislados"] == [["isla", ["B", "C", "ZZ"]]]

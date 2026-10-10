@@ -43,6 +43,16 @@ Reglas del recorrido (puntos 11 a 16 de la especificación):
 - El riesgo se mide en tiempo exacto: una estación está en riesgo mientras
   tiene menos bicis que `bicis_minimas` o menos lugares libres que
   `lugares_libres_minimos`.
+- Estaciones con valet (`excepciones_valet`): en los días de la semana y las
+  horas que dice el archivo, el tiempo de esa estación no cuenta como riesgo
+  (en ninguna política), y en una intervención cuyo instante cae dentro de uno
+  de sus intervalos [inicio, fin) la estación no entrega ni recibe bicis: el
+  motor rechaza el traslado. El día se toma por su nombre; un festivo no se
+  trata distinto.
+- Grupos aislados (`grupos_aislados`): un traslado entre una estación de un
+  grupo y cualquier estación de fuera se rechaza. Las llegadas desviadas y
+  las bicis que vuelven de un viaje que termina fuera del conjunto siguen su
+  regla de siempre (la estación con lugar más cercana): no miran el grupo.
 
 Las horas se guardan como microsegundos enteros desde 1970 (UTC), así las
 sumas de tiempo son exactas.
@@ -61,7 +71,7 @@ import pandas as pd
 
 from src.contracts import STATION_TYPES
 from src.paths import TZ
-from src.sim.operacion import CLAVE_PARTE, presupuesto_en_bicis
+from src.sim.operacion import CLAVE_PARTE, DIAS_SEMANA, presupuesto_en_bicis
 
 US_PER_HOUR = 3_600_000_000
 EARTH_RADIUS_KM = 6371.0088
@@ -158,6 +168,11 @@ class Reglas:
     presupuestos_por_estacion: tuple[float, ...]
     presupuesto_de_referencia: float
     estado: str = "provisional"
+    # Estaciones con valet: días de la semana (lunes = 0) y, por estación, sus intervalos ("HH:MM", "HH:MM").
+    valet_dias: tuple = ()
+    valet_estaciones: tuple = ()         # ((station_id, ((inicio, fin), ...)), ...), ordenado por id
+    # Grupos aislados: ((nombre, (station_id, ...)), ...). Una estación está en un grupo como mucho.
+    grupos_aislados: tuple = ()
 
     @classmethod
     def from_operacion(cls, cfg: dict) -> "Reglas":
@@ -196,6 +211,11 @@ class Reglas:
         if reference not in budgets:
             raise SimulacionError("presupuesto_de_referencia debe ser uno de presupuestos_por_estacion.")
         strategy = cfg["estrategia_por_tipo"]
+        valet = cfg.get("excepciones_valet") or {}
+        groups = cfg.get("grupos_aislados") or {}
+        members = [station for stations in groups.values() for station in stations]
+        if len(set(members)) != len(members):
+            raise SimulacionError("grupos_aislados: una estación está en más de un grupo.")
         return cls(
             franjas=franjas,
             bicis_minimas=int(cfg["umbral_riesgo"]["bicis_minimas"]),
@@ -209,7 +229,16 @@ class Reglas:
             presupuestos_por_estacion=budgets,
             presupuesto_de_referencia=reference,
             estado=str(cfg.get("estado", "provisional")),
+            valet_dias=tuple(sorted(DIAS_SEMANA.index(dia) for dia in valet.get("dias") or ())),
+            valet_estaciones=tuple(
+                (str(station), tuple((str(a), str(b)) for a, b in intervals))
+                for station, intervals in sorted((valet.get("estaciones") or {}).items())
+            ),
+            grupos_aislados=tuple(
+                (str(name), tuple(str(station) for station in stations)) for name, stations in groups.items()
+            ),
         )
+
 
 def daily_budget(per_station: float, stations: int) -> int:
     """Presupuesto del día en bicis: bicis por estación por día por estaciones simuladas."""
@@ -347,6 +376,32 @@ def nearest_station(network: Network, lat, lon) -> tuple[np.ndarray, np.ndarray]
         best[first : first + len(chunk)] = choice
         best_km[first : first + len(chunk)] = dist[np.arange(len(chunk)), choice]
     return best[inverse], best_km[inverse]
+
+
+def station_groups(network: Network, reglas: Reglas) -> np.ndarray:
+    """Grupo aislado de cada estación de la red: su posición en `reglas.grupos_aislados`, o -1 si no tiene.
+
+    Un traslado solo se permite entre estaciones con el mismo valor.
+    """
+    group = np.full(network.size, -1, dtype=np.int64)
+    position = {station: s for s, station in enumerate(network.station_ids)}
+    for g, (_, stations) in enumerate(reglas.grupos_aislados):
+        for station in stations:
+            if station in position:
+                group[position[station]] = g
+    return group
+
+
+def move_neighbors(network: Network, reglas: Reglas) -> list[np.ndarray]:
+    """Por estación, con cuáles puede intercambiar bicis: dentro de la distancia máxima y en su mismo grupo.
+
+    De la más cercana a la más lejana. Sin grupos aislados es `neighbors_within(distancia_maxima_km)`.
+    """
+    near = network.neighbors_within(reglas.distancia_maxima_km)
+    group = station_groups(network, reglas)
+    if (group < 0).all():
+        return near
+    return [other[group[other] == group[s]] for s, other in enumerate(near)]
 
 
 # --------------------------------------------------------------------------- #
@@ -501,6 +556,87 @@ def build_calendar(
         bin_day=np.array(bin_day, dtype=np.int64),
         bin_label=np.array(bin_label, dtype=np.int64),
     )
+
+
+def valet_windows(network: Network, days: tuple, reglas: Reglas) -> dict:
+    """Intervalos con valet de cada estación de la red: {índice: [(inicio_us, fin_us), ...]}, en orden.
+
+    Un intervalo por cada día de `days` cuyo día de la semana está en `reglas.valet_dias` y por cada
+    intervalo de la estación. Las estaciones del archivo que no están en la red se ignoran.
+    """
+    position = {station: s for s, station in enumerate(network.station_ids)}
+    out: dict[int, list] = {}
+    for station, intervals in reglas.valet_estaciones:
+        if station not in position:
+            continue
+        windows = [
+            (local_us(day, start), local_us(day, end))
+            for day in days
+            if day.weekday() in reglas.valet_dias
+            for start, end in intervals
+        ]
+        if windows:
+            out[position[station]] = sorted(windows)
+    return out
+
+
+def valet_at(windows: dict, instant_us: int, size: int) -> np.ndarray:
+    """Qué estaciones están en un intervalo con valet [inicio, fin) en ese instante."""
+    active = np.zeros(size, dtype=bool)
+    for station, spans in windows.items():
+        active[station] = any(start <= instant_us < end for start, end in spans)
+    return active
+
+
+def valet_hours(windows: dict, calendar: Calendar) -> np.ndarray:
+    """Horas de estación con valet de cada día simulado: el tiempo que no puede contar como riesgo."""
+    out = np.zeros(len(calendar.days), dtype="float64")
+    edges = np.array(calendar.day_start_us, dtype=np.int64)
+    for spans in windows.values():
+        for start, end in spans:
+            out += (np.clip(end, edges[:-1], edges[1:]) - np.clip(start, edges[:-1], edges[1:])) / US_PER_HOUR
+    return out
+
+
+def split_valet(intervals: list, windows: dict) -> tuple[list, list]:
+    """Parte los intervalos en riesgo en (lo que cuenta, lo que cae en un intervalo con valet y no cuenta)."""
+    if not windows:
+        return intervals, []
+    kept, removed = [], []
+    for item in intervals:
+        spans = windows.get(item[0])
+        if spans is None:
+            kept.append(item)
+            continue
+        s, cursor, end, state = item
+        for low, high in spans:
+            if high <= cursor:
+                continue
+            if low >= end:
+                break
+            if low > cursor:
+                kept.append((s, cursor, low, state))
+            removed.append((s, max(cursor, low), min(end, high), state))
+            cursor = min(end, high)
+            if cursor >= end:
+                break
+        if cursor < end:
+            kept.append((s, cursor, end, state))
+    return kept, removed
+
+
+def station_day_risk(intervals: list, calendar: Calendar, size: int) -> np.ndarray:
+    """Microsegundos en riesgo (de cualquier tipo) por [día, estación]."""
+    edges = np.array(calendar.day_start_us, dtype=np.int64)
+    low, high = edges[:-1], edges[1:]
+    out = np.zeros((size, len(low)), dtype=np.int64)
+    if intervals:
+        data = np.array(intervals, dtype=np.int64)
+        for first in range(0, len(data), _CHUNK):
+            chunk = data[first : first + _CHUNK]
+            overlap = np.clip(chunk[:, 2, None], low, high) - np.clip(chunk[:, 1, None], low, high)
+            np.add.at(out, chunk[:, 0], overlap)
+    return out.T.copy()
 
 
 # --------------------------------------------------------------------------- #
@@ -702,6 +838,7 @@ class InterventionContext:
     franja: Franja            # franja que se prepara
     inventory: np.ndarray     # bicis por estación en este momento, en la corrida de esta política
     budget: int               # bicis que todavía se pueden mover en esta intervención
+    valet: np.ndarray | None = None   # estaciones con valet en este instante: ni entregan ni reciben
 
 
 class Policy(Protocol):
@@ -741,6 +878,8 @@ class RunResult:
     budget_used: np.ndarray        # [día, franja]
     risk_us: np.ndarray            # [día, etiqueta, tipo de riesgo] en microsegundos
     interventions: tuple[InterventionRecord, ...]
+    risk_station_us: np.ndarray | None = None   # [día, estación]: riesgo de cualquier tipo, en microsegundos
+    valet_risk_us: np.ndarray | None = None     # [día]: tiempo bajo un umbral en intervalos con valet (no cuenta)
 
     @property
     def risk_hours(self) -> np.ndarray:
@@ -872,8 +1011,14 @@ def _as_index(value, size: int, what: str) -> int:
     return int(value)
 
 
-def _apply_moves(moves, inv, cap, network, reglas, available, state, since, intervals, instant) -> int:
-    """Valida y aplica los traslados en orden. Devuelve las bicis movidas. Falla al primer límite roto."""
+def _apply_moves(
+    moves, inv, cap, network, reglas, available, state, since, intervals, instant, group=None, valet=None
+) -> int:
+    """Valida y aplica los traslados en orden. Devuelve las bicis movidas. Falla al primer límite roto.
+
+    `group` es el grupo aislado de cada estación (-1 sin grupo) y `valet` qué estaciones están en un intervalo
+    con valet en este instante.
+    """
     used = 0
     n = network.size
     bmin = reglas.bicis_minimas
@@ -893,6 +1038,16 @@ def _apply_moves(moves, inv, cap, network, reglas, available, state, since, inte
             raise MoveError(
                 f"Presupuesto: mover {bikes} bicis ({names}) pasa de las {available} disponibles en esta "
                 f"intervención (ya se usaron {used})."
+            )
+        if group is not None and group[origin] != group[destination]:
+            raise MoveError(
+                f"Grupo aislado: {names} no están en el mismo grupo. Las estaciones de un grupo aislado solo "
+                "intercambian bicis entre ellas."
+            )
+        if valet is not None and (valet[origin] or valet[destination]):
+            raise MoveError(
+                f"Valet: {names} toca una estación que está en un intervalo con valet en esta intervención; "
+                "ahí no entrega ni recibe bicis."
             )
         distance = float(network.dist_km[origin, destination])
         if distance > reglas.distancia_maxima_km:
@@ -961,6 +1116,9 @@ def simulate(
     nearest = network.nearest
     initial_total = sum(inv)
     shares = split_budget(int(budget), reglas.franjas)
+    group = station_groups(network, reglas)
+    group = None if (group < 0).all() else group
+    windows = valet_windows(network, calendar.days, reglas)
 
     blocked, diverted, no_room, in_transit = (np.zeros(n_days, dtype=np.int64) for _ in range(4))
     transit = 0  # bicis que van en un viaje en este momento
@@ -1008,15 +1166,21 @@ def simulate(
             available = shares[f] + carry
             before = np.array(inv, dtype=np.int64)
             before.setflags(write=False)
+            valet = valet_at(windows, instant, n) if windows else None
+            if valet is not None:
+                valet.setflags(write=False)
             context = InterventionContext(
                 instant=to_timestamp(instant),
                 day=calendar.days[day],
                 franja=reglas.franjas[f],
                 inventory=before,
                 budget=int(available),
+                valet=valet,
             )
             moves = tuple(Move(*move) if len(move) == 3 else move for move in policy.decide(context))
-            used = _apply_moves(moves, inv, cap, network, reglas, available, state, since, intervals, instant)
+            used = _apply_moves(
+                moves, inv, cap, network, reglas, available, state, since, intervals, instant, group, valet
+            )
             after = np.array(inv, dtype=np.int64)
             if int(after.sum()) != int(before.sum()):
                 raise CheckError("Los traslados cambiaron el total de bicis.")
@@ -1038,7 +1202,13 @@ def simulate(
     check_total("al final del tramo")
     in_transit[n_days - 1] = transit
     final = np.array(inv, dtype=np.int64)
+    # El tiempo de una estación dentro de sus intervalos con valet no cuenta como riesgo.
+    intervals, in_valet = split_valet(intervals, windows)
     risk_us = bin_risk(intervals, calendar)
+    risk_station_us = station_day_risk(intervals, calendar, n)
+    if (risk_station_us.sum(axis=1) != risk_us[:, :, 0].sum(axis=1)).any():
+        raise CheckError("El riesgo por estación no suma el riesgo por franja.")
+    valet_risk_us = bin_risk(in_valet, calendar)[:, :, 0].sum(axis=1)
     lengths = np.zeros((n_days, len(calendar.labels)), dtype=np.int64)
     np.add.at(lengths, (calendar.bin_day, calendar.bin_label), np.diff(calendar.bin_edges_us))
     if (risk_us < 0).any() or (risk_us > n * lengths[:, :, None]).any():
@@ -1056,4 +1226,6 @@ def simulate(
         budget_used=used_by,
         risk_us=risk_us,
         interventions=tuple(records),
+        risk_station_us=risk_station_us,
+        valet_risk_us=valet_risk_us,
     )

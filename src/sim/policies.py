@@ -27,9 +27,14 @@ Qué hacen con su pronóstico, las dos igual:
    dejar menos de `lugares_libres_minimos`.
 3. Rango aceptado. Si `lo <= hi`, los enteros dentro de [lo, hi]: una estación
    que ya está dentro no se mueve, y una que está fuera va solo hasta el borde
-   más cercano. Si no hay solución (`lo > hi`), una estación CON tipo va a
-   `ocupacion_respaldo` de su tipo por su capacidad, sin quedar bajo ningún
-   umbral; una estación SIN tipo no se toca en esa franja.
+   más cercano. Si no hay solución (`lo > hi`), una estación CON tipo va a su
+   inventario de respaldo: `ocupacion_respaldo` de su tipo por su capacidad,
+   redondeado y acotado a [bicis_minimas, capacidad - lugares_libres_minimos]
+   (`respaldo_inventory`). Una estación SIN tipo no se toca en esa franja.
+   **La regla histórica y el modelo usan el respaldo exactamente igual**: el
+   valor sale solo del tipo, la franja y la capacidad, no del pronóstico. Lo
+   que puede diferir entre ellas es en qué estación-franja no hay solución,
+   porque eso sí depende del pronóstico de cada una.
 4. Los rangos se convierten en traslados con `match_moves`, que reparte el
    presupuesto: primero el tipo con más prioridad y, dentro de la misma
    prioridad, la estación a la que le falta o le sobra menos. Se atiende solo
@@ -37,7 +42,11 @@ Qué hacen con su pronóstico, las dos igual:
    una estación con la necesidad contraria y después una que ya está dentro
    de su rango, que presta o recibe sin salir de él.
 
-Una estación sin información no pide ni presta bicis.
+Una estación sin información no pide ni presta bicis. Tampoco una estación
+con valet en el instante de la intervención (`context.valet`). Las vecinas de
+una estación son las que están dentro de la distancia máxima y en su mismo
+grupo aislado (`move_neighbors`): una estación de un grupo solo intercambia
+bicis con las de su grupo.
 
 Aparte está el **piso de azar** (`RandomPolicy`, "random"): gasta el mismo
 presupuesto por franja moviendo bicis al azar, sin pronóstico. No es una de
@@ -59,7 +68,16 @@ import pandas as pd
 
 from src.contracts import QUANTILE_COLUMNS
 from src.paths import TZ
-from src.sim.engine import EPS, InterventionContext, Move, Network, Reglas, SimulacionError, round_half_up
+from src.sim.engine import (
+    EPS,
+    InterventionContext,
+    Move,
+    Network,
+    Reglas,
+    SimulacionError,
+    move_neighbors,
+    round_half_up,
+)
 
 # Prioridad de una estación sin tipo en el reparto: va después de todas las que tienen tipo
 # (las prioridades de config/operacion.yaml son 1, 2 o 3).
@@ -84,10 +102,13 @@ def safe_range(network: Network, reglas: Reglas, dip, rise) -> tuple[np.ndarray,
 def respaldo_inventory(network: Network, reglas: Reglas, franja: str) -> np.ndarray:
     """Inventario de respaldo de cada estación en una franja; -1 en las estaciones sin tipo.
 
-    Es `ocupacion_respaldo` del tipo de la estación por su capacidad, llevado
-    a [bicis_minimas, capacidad - lugares_libres_minimos] para no dejar la
-    estación bajo un umbral. Si la estación es tan chica que ese rango no
-    existe, manda bicis_minimas, sin pasar de la capacidad.
+    Es `ocupacion_respaldo` del tipo de la estación por su capacidad,
+    redondeado (un medio exacto sube) y acotado a
+    [bicis_minimas, capacidad - lugares_libres_minimos] para no dejar la
+    estación bajo un umbral: np.clip(round(f x capacidad), bicis_minimas,
+    capacidad - lugares_libres_minimos). Si la estación es tan chica que ese
+    rango no existe, manda bicis_minimas, sin pasar de la capacidad. Es el
+    único lugar donde se calcula, y lo usan igual las dos políticas.
     """
     out = np.full(network.size, -1, dtype=np.int64)
     for s, kind in enumerate(network.station_type):
@@ -369,7 +390,9 @@ class RandomPolicy:
     2. Sortea el destino entre esas vecinas con lugar libre.
 
     Así cada traslado respeta los cuatro límites: bicis en el origen, lugar en
-    el destino, distancia máxima y presupuesto. Se detiene antes solo si ya no
+    el destino, distancia máxima y presupuesto. También respeta los grupos
+    aislados (las vecinas ya vienen filtradas) y no toca una estación con
+    valet en el instante de la intervención. Se detiene antes solo si ya no
     queda ningún traslado posible. No mira umbrales ni rangos: puede vaciar o
     llenar una estación.
 
@@ -383,7 +406,7 @@ class RandomPolicy:
         self.network = network
         self.reglas = reglas
         self.seed = tuple(int(value) for value in np.atleast_1d(seed))
-        self.neighbors = neighbors if neighbors is not None else network.neighbors_within(reglas.distancia_maxima_km)
+        self.neighbors = neighbors if neighbors is not None else move_neighbors(network, reglas)
         self._has_neighbors = np.array([len(near) > 0 for near in self.neighbors], dtype=bool)
 
     def decide(self, context: InterventionContext) -> list[Move]:
@@ -394,15 +417,17 @@ class RandomPolicy:
         rng = np.random.default_rng([*self.seed, context.day.toordinal(), franja])
         current = np.asarray(context.inventory, dtype=np.int64).copy()
         capacity = self.network.capacity
+        # Una estación con valet en este instante no entrega ni recibe.
+        usable = np.ones(self.network.size, dtype=bool) if context.valet is None else ~np.asarray(context.valet)
         stuck = np.zeros(self.network.size, dtype=bool)  # orígenes sin ninguna vecina con lugar, por ahora
         moves: list[Move] = []
         while left > 0:
-            origins = np.nonzero(self._has_neighbors & ~stuck & (current > 0))[0]
+            origins = np.nonzero(self._has_neighbors & usable & ~stuck & (current > 0))[0]
             if origins.size == 0:
                 break
             origin = int(origins[rng.integers(origins.size)])
             near = self.neighbors[origin]
-            free = near[current[near] < capacity[near]]
+            free = near[(current[near] < capacity[near]) & usable[near]]
             if free.size == 0:
                 stuck[origin] = True
                 continue
@@ -436,7 +461,7 @@ class ForecastPolicy:
         self.reglas = reglas
         self.forecast = forecast
         self.band = float(band)
-        self.neighbors = neighbors if neighbors is not None else network.neighbors_within(reglas.distancia_maxima_km)
+        self.neighbors = neighbors if neighbors is not None else move_neighbors(network, reglas)
         self.priority = np.array(
             [UNTYPED_PRIORITY if kind is None else reglas.prioridad[kind] for kind in network.station_type],
             dtype=np.int64,
@@ -448,14 +473,16 @@ class ForecastPolicy:
     def targets(self, context: InterventionContext) -> Targets:
         window = self.forecast.window(context.day, context.franja.nombre, self.band)
         low, high = safe_range(self.network, self.reglas, window.lower_dip, window.upper_rise)
+        # Una estación con valet en este instante se trata como una sin información: no pide ni presta.
+        has_info = window.has_info if context.valet is None else window.has_info & ~np.asarray(context.valet)
         low_int, high_int, feasible = accepted_range(
-            context.inventory, low, high, window.has_info, self._respaldo[context.franja.nombre],
+            context.inventory, low, high, has_info, self._respaldo[context.franja.nombre],
             self.network.capacity,
         )
         return Targets(
             low=low,
             high=high,
-            has_info=window.has_info,
+            has_info=has_info,
             feasible=feasible,
             low_int=low_int,
             high_int=high_int,

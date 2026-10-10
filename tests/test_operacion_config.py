@@ -351,6 +351,82 @@ def test_tipo_si_falta_ya_no_se_acepta_y_el_mensaje_dice_que_se_borre(valor):
     assert "sin tipo" in problems[0]
 
 
+# --- Franjas que se tocan, estaciones con valet y grupos aislados ---
+
+
+def test_dos_franjas_pueden_tocarse_y_una_puede_empezar_en_su_intervencion():
+    """manana termina a las 14:00 y tarde interviene y empieza a las 14:00: es válido."""
+    cfg = copy.deepcopy(BASE)
+    cfg["franjas"][0].update(fin="14:00")
+    cfg["franjas"][1].update(momento_intervencion="14:00", inicio="14:00", fin="22:00")
+    assert validate_operacion(cfg) == []
+
+
+def test_valet_y_grupos_son_opcionales_y_el_archivo_del_repositorio_los_trae_validos(cfg):
+    assert "excepciones_valet" not in BASE and "grupos_aislados" not in BASE
+    assert validate_operacion(BASE) == []
+    for estaciones in cfg.get("grupos_aislados", {}).values():
+        assert all(isinstance(estacion, str) for estacion in estaciones)
+    for estacion in cfg.get("excepciones_valet", {}).get("estaciones", {}):
+        assert isinstance(estacion, str)
+
+
+VALET = {"dias": ["lunes", "sabado"], "estaciones": {"6492.08": [["07:00", "11:00"], ["16:00", "20:00"]]}}
+GRUPOS = {"isla": ["4631.02", "4440.02"], "otro": ["1.01"]}
+
+
+def test_valet_y_grupos_bien_escritos_son_validos():
+    cfg = copy.deepcopy(BASE)
+    cfg["excepciones_valet"] = copy.deepcopy(VALET)
+    cfg["grupos_aislados"] = copy.deepcopy(GRUPOS)
+    assert validate_operacion(cfg) == []
+    cfg["excepciones_valet"]["estaciones"] = {}  # sin estaciones también vale
+    assert validate_operacion(cfg) == []
+
+
+@pytest.mark.parametrize(
+    "cambio, mensaje",
+    [
+        (lambda v: v.update(dias=["miércoles"]), "'miércoles' va sin acento: escribe miercoles"),
+        (lambda v: v.update(dias=["Lunes"]), "'Lunes' no es un día válido"),
+        (lambda v: v.update(dias=[]), "excepciones_valet.dias: debe ser una lista con al menos un día"),
+        (lambda v: v.update(dias=["lunes", "lunes"]), "hay días repetidos"),
+        (lambda v: v.pop("dias"), "excepciones_valet: debe traer `dias`"),
+        (lambda v: v.update(horas=1), "excepciones_valet: debe traer `dias`"),
+        (lambda v: v.update(estaciones=["6492.08"]), "excepciones_valet.estaciones: debe ser un mapa"),
+        (lambda v: v.update(estaciones={6492.08: [["07:00", "11:00"]]}), "escríbelo entre comillas"),
+        (lambda v: v.update(estaciones={"6492.08": []}), "debe traer al menos un intervalo"),
+        (lambda v: v.update(estaciones={"6492.08": [["7:00", "11:00"]]}), "no es un intervalo"),
+        (lambda v: v.update(estaciones={"6492.08": ["07:00", "11:00"]}), "no es un intervalo"),
+        (lambda v: v.update(estaciones={"6492.08": [["11:00", "07:00"]]}), "el inicio debe ser anterior al fin"),
+        (lambda v: v.update(estaciones={"6492.08": [["07:00", "11:00"], ["10:00", "12:00"]]}), "se enciman"),
+    ],
+)
+def test_valet_mal_escrito_da_un_mensaje_claro(cambio, mensaje):
+    cfg = copy.deepcopy(BASE)
+    cfg["excepciones_valet"] = copy.deepcopy(VALET)
+    cambio(cfg["excepciones_valet"])
+    problems = validate_operacion(cfg)
+    assert problems and all(mensaje in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "grupos, mensaje",
+    [
+        (["4631.02"], "grupos_aislados: debe ser un mapa de nombre de grupo"),
+        ({"isla": []}, "grupos_aislados.isla: debe ser una lista con al menos un station_id"),
+        ({"isla": [4631.02]}, "escríbelo entre comillas"),
+        ({"isla": ["4631.02", "4631.02"]}, "la estación 4631.02 está repetida"),
+        ({"isla": ["4631.02"], "otra": ["4631.02"]}, "ya está en el grupo 'isla'. Una estación puede estar en un solo"),
+    ],
+)
+def test_grupos_aislados_mal_escritos_dan_un_mensaje_claro(grupos, mensaje):
+    cfg = copy.deepcopy(BASE)
+    cfg["grupos_aislados"] = grupos
+    problems = validate_operacion(cfg)
+    assert len(problems) == 1 and mensaje in problems[0], problems
+
+
 # --- Leer el archivo: errores de escritura ---
 
 

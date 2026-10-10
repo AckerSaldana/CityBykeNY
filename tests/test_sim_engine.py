@@ -57,6 +57,9 @@ from src.sim.engine import (
     simulate,
     split_budget,
 )
+from src.sim.engine import (
+    hour_labels, move_neighbors, station_groups, to_timestamp, valet_at, valet_hours, valet_windows,
+)
 from src.sim.policies import NoIntervention
 
 DAY1, DAY2, DAY3 = date(2026, 9, 1), date(2026, 9, 2), date(2026, 9, 3)
@@ -886,7 +889,7 @@ def test_none_no_mueve_nada_y_dos_corridas_iguales_dan_lo_mismo():
 
 def test_una_politica_recibe_solo_el_contexto_y_el_contexto_no_trae_viajes():
     fields = {field.name for field in dataclasses.fields(InterventionContext)}
-    assert fields == {"instant", "day", "franja", "inventory", "budget"}
+    assert fields == {"instant", "day", "franja", "inventory", "budget", "valet"}
     # Los datos fijos de la red tampoco traen nada de los viajes.
     assert {field.name for field in dataclasses.fields(Network)} == {
         "station_ids", "capacity", "lat", "lon", "station_type", "typed", "dist_km", "nearest",
@@ -1062,3 +1065,116 @@ def test_el_recorrido_da_lo_mismo_que_el_simulador_de_referencia(seed):
     assert (0 <= result.final_inventory).all() and (result.final_inventory <= network.capacity).all()
     # La identidad: en estaciones más en tránsito, siempre el total inicial.
     assert result.final_docked + result.final_in_transit == result.initial_total == sum(start)
+
+
+# --------------------------------------------------------------------------- #
+# Franjas que se tocan, estaciones con valet y grupos aislados
+# --------------------------------------------------------------------------- #
+
+TOUCHING = [
+    {"nombre": "manana", "momento_intervencion": "05:00", "inicio": "06:00", "fin": "14:00",
+     "parte_del_presupuesto": 0.6},
+    {"nombre": "tarde", "momento_intervencion": "14:00", "inicio": "14:00", "fin": "22:00",
+     "parte_del_presupuesto": 0.4},
+]
+IDLE_TRIP = [("r1", "2026-09-05 08:00", "2026-09-05 08:10", "A", "B")]   # fuera de los días simulados
+HOUR = 3_600_000_000
+
+
+def test_dos_franjas_que_se_tocan_y_una_que_empieza_en_su_intervencion_se_simulan():
+    """manana 06-14 y tarde 14-22 con intervención a las 14:00: el minuto 14:00 es de la tarde."""
+    reglas = make_reglas(franjas=TOUCHING)
+    assert [f.nombre for f in reglas.franjas] == ["manana", "tarde"]
+    assert reglas.franjas[0].hours == tuple(range(5, 14)) and reglas.franjas[1].hours == tuple(range(14, 22))
+    labels = hour_labels(reglas.franjas, ("22:00", "06:00"))
+    assert labels[13] == "manana" and labels[14] == "tarde" and labels[21] == "tarde" and labels[22] == "noche"
+    network = make_network({"A": 10, "B": 10})
+    policy = Scripted({(DAY1, "tarde"): [Move(1, 0, 3)]})
+    result, calendar = run(
+        network, make_trips(IDLE_TRIP), [0, 5], reglas=reglas, policy=policy, budget=10, noche=("22:00", "06:00")
+    )
+    assert [to_timestamp(slot.instant_us).hour for slot in calendar.slots] == [5, 14]
+    assert result.budget_available.tolist() == [[6, 10]] and result.budget_used.tolist() == [[0, 3]]
+    # A está vacía hasta las 14:00 en punto: 6 horas de noche (00-06), 8 de la mañana y 0 de la tarde.
+    hours = dict(zip(calendar.labels, result.risk_hours[0, :, TOTAL]))
+    assert hours == {"manana": 8.0, "tarde": 0.0, "noche": 6.0, "resto": 0.0}
+
+
+def valet_reglas(**changes) -> Reglas:
+    """A tiene valet los martes de 07:00 a 11:00 (el 1 de septiembre de 2026 es martes)."""
+    return make_reglas(
+        excepciones_valet={"dias": ["martes"], "estaciones": {"A": [["07:00", "11:00"]], "Z": [["07:00", "11:00"]]}},
+        **changes,
+    )
+
+
+def test_el_tiempo_con_valet_no_cuenta_como_riesgo_y_solo_en_sus_dias():
+    network = make_network({"A": 10, "B": 10})
+    reglas = valet_reglas()
+    assert reglas.valet_dias == (1,) and dict(reglas.valet_estaciones)["A"] == (("07:00", "11:00"),)
+    result, calendar = run(network, make_trips(IDLE_TRIP), [0, 5], days=(DAY1, DAY2), reglas=reglas)
+    plain, _ = run(network, make_trips(IDLE_TRIP), [0, 5], days=(DAY1, DAY2))
+    # A está vacía los dos días. El martes se le quitan sus 4 horas con valet; el miércoles, nada.
+    assert plain.risk_hours[:, :, TOTAL].sum(axis=1).tolist() == [24.0, 24.0]
+    assert result.risk_hours[:, :, TOTAL].sum(axis=1).tolist() == [20.0, 24.0]
+    assert (result.risk_station_us / HOUR).tolist() == [[20.0, 0.0], [24.0, 0.0]]
+    assert (result.valet_risk_us / HOUR).tolist() == [4.0, 0.0] and plain.valet_risk_us.tolist() == [0, 0]
+    # Las 4 horas salen de la franja de la mañana (06 a 12), que pasa de 6 a 2.
+    assert result.risk_hours[0, calendar.labels.index("manana"), TOTAL] == 2.0
+    # Horas de estación con valet: la estación Z del archivo no está en la red y no cuenta.
+    windows = valet_windows(network, calendar.days, reglas)
+    assert list(windows) == [0] and valet_hours(windows, calendar).tolist() == [4.0, 0.0]
+
+
+def test_una_estacion_con_valet_en_el_instante_de_la_intervencion_no_entrega_ni_recibe():
+    """Con la intervención a las 08:00, dentro del valet de A: el motor rechaza el traslado y la política lo ve."""
+    franjas = [dict(TOUCHING[0], momento_intervencion="08:00", inicio="08:00"), TOUCHING[1]]
+    reglas = valet_reglas(franjas=franjas)
+    network = make_network({"A": 10, "B": 10})
+    for moves in ([Move(1, 0, 2)], [Move(0, 1, 1)]):
+        with pytest.raises(MoveError, match="Valet"):
+            run(network, make_trips(IDLE_TRIP), [3, 5], reglas=reglas, policy=Scripted({(DAY1, "manana"): moves}),
+                budget=10)
+    # El miércoles no hay valet, y el martes a las 14:00 tampoco: ahí el mismo traslado se acepta.
+    policy = Scripted({(DAY1, "tarde"): [Move(1, 0, 2)], (DAY2, "manana"): [Move(1, 0, 1)]})
+    result, calendar = run(network, make_trips(IDLE_TRIP), [3, 5], days=(DAY1, DAY2), reglas=reglas, policy=policy,
+                           budget=10)
+    assert result.final_inventory.tolist() == [6, 2]
+    assert [None if c.valet is None else c.valet.tolist() for c in policy.seen] == [
+        [True, False], [False, False], [False, False], [False, False],
+    ]
+    windows = valet_windows(network, calendar.days, reglas)
+    assert valet_at(windows, calendar.slots[0].instant_us, 2).tolist() == [True, False]
+    # El fin del intervalo queda fuera: a las 11:00 en punto ya no hay valet.
+    assert not valet_at(windows, local_us(DAY1, "11:00"), 2).any()
+    assert valet_at(windows, local_us(DAY1, "07:00"), 2).tolist() == [True, False]
+
+
+def test_un_grupo_aislado_solo_intercambia_bicis_entre_sus_estaciones():
+    network = make_network({"A": 10, "B": 10, "C": 10, "D": 10})
+    reglas = make_reglas(grupos_aislados={"isla": ["A", "B", "no_esta_en_la_red"]})
+    assert station_groups(network, reglas).tolist() == [0, 0, -1, -1]
+    # Sin grupos B tiene de vecinas a A y C; con el grupo, solo a A. C pierde a B y se queda con D.
+    assert [sorted(near.tolist()) for near in move_neighbors(network, make_reglas())] == [[1], [0, 2], [1, 3], [2]]
+    assert [near.tolist() for near in move_neighbors(network, reglas)] == [[1], [0], [3], [2]]
+    for moves in ([Move(1, 2, 1)], [Move(2, 1, 1)]):   # del grupo hacia fuera y de fuera hacia el grupo
+        with pytest.raises(MoveError, match="Grupo aislado"):
+            run(network, make_trips(IDLE_TRIP), [5, 5, 5, 5], reglas=reglas,
+                policy=Scripted({(DAY1, "manana"): moves}), budget=8)
+    policy = Scripted({(DAY1, "manana"): [Move(0, 1, 2), Move(2, 3, 1)]})   # dentro del grupo y entre dos de fuera
+    result, _ = run(network, make_trips(IDLE_TRIP), [5, 5, 5, 5], reglas=reglas, policy=policy, budget=8)
+    assert result.final_inventory.tolist() == [3, 7, 4, 6]
+
+
+def test_las_llegadas_desviadas_no_miran_el_grupo_aislado():
+    """Regla de siempre: una llegada a una estación llena va a la más cercana con lugar, sea o no de su grupo."""
+    network = make_network({"A": 5, "B": 5, "C": 5})
+    reglas = make_reglas(grupos_aislados={"isla": ["A", "B"]})
+    trips = make_trips([("r1", "2026-09-01 08:00", "2026-09-01 08:10", "A", "C")])
+    result, _ = run(network, trips, [3, 0, 5], reglas=reglas)
+    assert result.diverted.tolist() == [1] and result.final_inventory.tolist() == [2, 1, 5]
+
+
+def test_una_estacion_no_puede_estar_en_dos_grupos():
+    with pytest.raises(SimulacionError, match="más de un grupo"):
+        make_reglas(grupos_aislados={"uno": ["A"], "dos": ["A"]})

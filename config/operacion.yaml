@@ -62,9 +62,10 @@ umbral_riesgo:
   bicis_minimas: 2
   lugares_libres_minimos: 3
 
-# NUEVO, aceptado por programación (el validador todavía no lo revisa):
-# estaciones con valet. En estas horas no cuentan como riesgo ni reciben
-# presupuesto, porque el valet recibe bicis fuera de los anclajes.
+# Estaciones con valet (opcional; el validador revisa días, ids y horas). En
+# estas horas no cuentan como riesgo ni reciben presupuesto, porque el valet
+# recibe bicis fuera de los anclajes. Días sin acento: lunes, martes,
+# miercoles, jueves, viernes, sabado, domingo.
 # Los station_id van entre comillas: son texto y los ceros finales importan.
 # Días de North Moore St por confirmar (se suponen de lunes a viernes).
 excepciones_valet:
@@ -105,8 +106,8 @@ presupuesto_de_referencia: 1.4
 # declara como limitación).
 distancia_maxima_km: 2.0
 
-# NUEVO, aceptado por programación (el validador todavía no lo revisa): grupos
-# de estaciones que solo intercambian bicis entre ellas. Governors Island no
+# Grupos aislados (opcional; el validador revisa que una estación esté en un
+# solo grupo): estaciones que solo intercambian bicis entre ellas. Governors Island no
 # tiene puente y queda a ~1 km de Manhattan y Brooklyn en línea recta.
 grupos_aislados:
   governors_island: ["4631.02", "4440.02", "4374.01"]   # Soissons Landing, Yankee Ferry Terminal, Picnic Point
@@ -151,8 +152,3 @@ estrategia_por_tipo:
     ocupacion_respaldo:
       manana: 0.50
       tarde: 0.50
-
-# tipo_si_falta: tipo que se aplica a una estación sin tipo. Mixta, igual que
-#   la regla de clasificación hace con las estaciones de poca actividad
-#   (notebooks/b/tipo_estacion.sql).
-tipo_si_falta: mixta

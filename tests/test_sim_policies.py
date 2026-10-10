@@ -27,6 +27,7 @@ estas pruebas están escritas aquí: no dependen de config/operacion.yaml.
 """
 
 import copy
+import dataclasses
 import inspect
 from datetime import date
 
@@ -734,3 +735,50 @@ def test_el_piso_de_azar_pasa_por_el_motor_conserva_las_bicis_y_se_repite_con_la
         assert first.policy == "random"
         runs[seed] = first
     assert runs[(7, 0)].digest() != runs[(7, 1)].digest()
+
+
+# --------------------------------------------------------------------------- #
+# Estaciones con valet y grupos aislados
+# --------------------------------------------------------------------------- #
+
+def _valet_case(**cfg_changes):
+    """A (20 lugares) necesita llegar a 9 bicis con banda 0 (ver `case`); B, C y D no tienen información útil.
+
+    Para que haya contrapartes, C recibe un pronóstico plano con historia: su rango con banda 0 es 2 a 8.
+    """
+    network = make_network({"A": 20, "B": 10, "C": 10, "D": 10})
+    a = {hour: ZERO for hour in MANANA} | {6: (2, 5, 9, 0, 1, 4), 7: (1, 3, 6, 0, 0, 0)}
+    flat = {hour: ZERO for hour in MANANA}
+    rows = hourly("A", WEDNESDAY, a) + hourly("B", WEDNESDAY, flat) + hourly("C", WEDNESDAY, flat)
+    reglas = make_reglas(**cfg_changes)
+    days = (date(2026, 9, 1), WEDNESDAY)
+    forecast = ForecastInfo.from_predictions(forecast_table(rows), network, reglas, days, np.ones(4, dtype=bool))
+    return network, reglas, ForecastPolicy("historical", network, reglas, forecast, 0.0)
+
+
+def test_una_estacion_con_valet_no_se_atiende_ni_sirve_de_contraparte():
+    network, reglas, policy = _valet_case()
+    franja = reglas.franjas[0]
+    plain = context(WEDNESDAY, franja, [5, 8, 5, 5])
+    # Sin valet: a A le faltan 4 bicis para llegar a 9 y se las presta B, que queda en 4 (dentro de 2 a 8).
+    assert policy.decide(plain) == [Move(1, 0, 4)]
+    # A con valet: no se atiende. B con valet: no presta, y C queda fuera de la distancia de A.
+    for valet in ([True, False, False, False], [False, True, False, False]):
+        blocked = dataclasses.replace(plain, valet=np.array(valet))
+        assert policy.decide(blocked) == []
+        assert policy.targets(blocked).has_info.tolist() == [not valet[0], not valet[1], True, False]
+    # El piso de azar tampoco toca una estación con valet.
+    chance = RandomPolicy(network, reglas, 7)
+    moves = chance.decide(dataclasses.replace(plain, budget=40, valet=np.array([False, True, False, False])))
+    assert len(moves) > 0 and all(1 not in (move.origin, move.destination) for move in moves)
+
+
+def test_las_politicas_no_cruzan_un_grupo_aislado():
+    network, reglas, policy = _valet_case(grupos_aislados={"isla": ["B", "C"]})
+    franja = reglas.franjas[0]
+    # La única vecina de A dentro de la distancia es B, que ahora es de un grupo: A se queda sin contraparte.
+    assert policy.decide(context(WEDNESDAY, franja, [5, 8, 5, 5])) == []
+    chance = RandomPolicy(network, reglas, 7)
+    moves = chance.decide(context(WEDNESDAY, franja, [5, 8, 5, 5], budget=60))
+    inside = {1, 2}
+    assert len(moves) > 0 and all((move.origin in inside) == (move.destination in inside) for move in moves)

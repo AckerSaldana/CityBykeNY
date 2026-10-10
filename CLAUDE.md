@@ -409,7 +409,7 @@ Reglas de la limpieza (`src/data/build_tables.py`), cada una con su conteo en
    como nulo. Al revés no vale: 11 estaciones de las tablas no están
    instaladas hoy y conservan su capacidad. Para saber cuáles ya no existen se
    usa `is_installed` de `station_status`.
-8. `station_type` queda nulo (decisión 13).
+8. `station_type` sale de `notebooks/b/tipo_estacion.sql`, calculado solo con el entrenamiento; 42 estaciones sin historia quedan sin tipo.
 
 *Las reglas 4, 6 y 7 y el corte del 30 de septiembre son decisiones de
 programación: si se cambian, se cambian en el YAML o aquí y se avisa.*
@@ -535,10 +535,11 @@ Segunda versión (decisiones del usuario del 10 de octubre de 2026):
 - **Reparto:** primero la diferencia más pequeña. El reparto por riesgo
   evitado por bici no se implementó: necesita un modelo de riesgo esperado por
   estación y franja. Las bicis solo van de una estación sobre su rango a una
-  bajo su rango; una estación dentro de su rango ni presta ni recibe.
+  bajo su rango; una estación dentro de su rango puede prestar o recibir sin
+  salirse de él.
 - **Franjas sin solución:** `ocupacion_respaldo` del tipo solo si la estación
   tiene tipo, acotado entre el umbral y la capacidad menos el umbral. Sin tipo
-  (hoy todas) no se tocan. `tipo_si_falta` ya no existe.
+  no se tocan. `tipo_si_falta` ya no existe.
 - **Conservación:** el total de bicis (en estación más en tránsito) no cambia.
   Una bici cuyo destino queda fuera del conjunto vuelve a la estación simulada
   más cercana a su punto final, o a la de origen si no hay coordenadas. *Regla
@@ -557,41 +558,67 @@ Segunda versión (decisiones del usuario del 10 de octubre de 2026):
   el promedio por día evaluado.
 - La prueba final no se simula salvo petición explícita (decisión 4).
 
-Resultado en validación (2 a 14 de septiembre de 2026, 13 días, 2,315
-estaciones, reglas provisionales, banda elegida 0.5). Horas de estación en
-riesgo por día; sin intervención son 10,328.5:
+**Corrida final congelada** (10 de octubre de 2026): validación, 2 a 14 de
+septiembre, 13 días, 2,315 estaciones, reglas confirmadas por logística
+(franjas 06–14 y 14–22, umbral 2 bicis y 3 lugares, 2 km, reparto 0.6 / 0.4),
+tipos de estación de `notebooks/b/tipo_estacion.sql`, contrapartes dentro de
+su rango, `excepciones_valet` (en esas estaciones y horas no se cuenta riesgo
+ni se asigna presupuesto) y `grupos_aislados` (sus estaciones solo
+intercambian bicis entre ellas). Banda elegida una sola vez: **0**.
+
+Horas de estación en riesgo por día (sin intervención: 12,477.5):
 
 | Bicis al día | Regla histórica | Modelo (LightGBM) |
 |---|---|---|
-| 232 | 8,276.1 | 8,384.5 |
-| 579 | 6,112.9 | 6,149.0 |
-| 1,158 (referencia) | 4,757.7 | 4,752.7 |
-| 2,315 | 4,259.2 | 4,230.0 |
-| 4,630 | 4,193.2 | 4,160.1 |
+| 810 | 9,680.5 (22.4 % evitado) | 9,674.3 (22.5 %) |
+| 1,620 | 7,517.4 (39.8 %) | 7,139.8 (42.8 %) |
+| 3,241 (referencia) | 5,374.9 (56.9 %) | 5,367.4 (57.0 %) |
+| 6,019 | 4,948.9 (60.3 %) | 5,082.7 (59.3 %) |
+| 9,954 | 4,890.3 (60.8 %) | 5,082.7 (59.3 %) |
 
-**El modelo no supera a la regla histórica: son indistinguibles.** Con el
-presupuesto de referencia el riesgo simulado evitado es 5,570.8 (intervalo
-5,141.6 a 5,989.8) contra 5,575.8 (5,135.2 a 5,989.8). Por día, el modelo
-queda mejor del 7 al 11 de septiembre (el festivo y los cuatro laborables
-siguientes) y peor los otros ocho días; las diferencias son de decenas de
-horas sobre miles. No hay desglose por tipo de estación porque ninguna tiene
-tipo.
+**El modelo no supera a la regla histórica** con el presupuesto de
+referencia: 7.5 horas al día de diferencia, con intervalo pareado de −129.5 a
++194.9; el modelo queda mejor en 4 de 13 días. Solo con 1,620 bicis al día el
+modelo es mejor de forma consistente (377.5 horas, 12 de 13 días); con 6,019 o
+más es peor. Por tipo de día (modelo menos histórica, referencia): laborables
+−121.6, fin de semana +163.6, festivo +221.2. Por tipo de estación: mixta
+−92.4, oficinas +36.5, residencial +43.9. Más allá de la referencia mover más
+casi no ayuda.
 
-Por banda, con el presupuesto de referencia (histórica / modelo): banda 0,
-5,116.9 / 5,250.6; banda 0.5, 4,757.7 / 4,752.7; banda 1, 4,989.5 / 5,215.8.
-La banda se eligió en los mismos días en que se reporta.
+- **Por franja** (sin intervención / histórica / modelo): mañana 4,161.5 /
+  1,527.3 / 1,544.1; tarde 4,066.8 / 1,636.6 / 1,607.9; noche de 22 a 06,
+  4,249.2 / 2,210.9 / 2,215.4.
+- **Por tipo de estación** (% evitado, histórica / modelo): oficinas 42.0 /
+  39.5; residencial 41.9 / 39.9; recreativa 41.2 / 40.5; mixta 66.6 / 67.7;
+  sin tipo 1.0 / 0.2 (no tienen historia y ninguna política las toca).
+- **Viajes bloqueados por día (simulados):** sin intervención 4,983.2;
+  histórica 3,424.9; modelo 3,476.7; piso de azar 5,083.9.
+- **Piso de azar** (mover las mismas bicis al azar): 11,486.9 horas en riesgo,
+  7.9 % evitado.
+- **Por banda** (histórica / modelo): 0, 5,374.9 / 5,367.4; 0.5, 6,349.9 /
+  6,196.9; 1, 8,415.6 / 8,587.5.
+- **Sensibilidad al inventario inicial** (% evitado, histórica / modelo):
+  observado en GBFS 56.9 / 57.0; todas al 40 %, 39.5 / 39.4; al 50 %, 48.6 /
+  46.9; al 60 %, 47.5 / 47.1. El riesgo sin intervención va de 7,033 a 12,478
+  según el arranque.
+- **Valet:** 432 horas de estación excluidas. Con las horas de intervención
+  de hoy (05:00 y 14:00) ningún intervalo de valet las contiene, así que la
+  regla solo cambia la cuenta del riesgo.
+- **Piso del WAPE** (`reports/piso_wape.md`): línea base 49.1 %, LightGBM
+  45.8 %, media global 115.9 %, pronóstico revuelto entre estaciones 128.5 %.
+- OJO: `metricas_validacion.md` y `metricas_lgbm.md` todavía desglosan con
+  las franjas anteriores; las de hoy están en `piso_wape.md`.
 
-Por franja, con el presupuesto de referencia (sin intervención / histórica /
-modelo): mañana 2,511 / 1,002 / 1,007; tarde 2,524 / 1,101 / 1,109; noche de
-22 a 06, 3,495 / 1,826 / 1,805; resto 1,798 / 829 / 832.
+Contexto de las estaciones (`docs/contexto_estaciones.md`, LODES 2023): la
+proporción de empleos a 300 m se relaciona con el índice de flujo neto de la
+mañana (Spearman 0.53, n 2,350). Mediana de la proporción: oficinas 0.87,
+residencial 0.29, mixta 0.32. Son trabajadores residentes, no población; el
+Censo agrega ruido a propósito.
 
-**Sensibilidad al inventario inicial** (presupuesto de referencia, riesgo sin
-intervención y riesgo evitado por la regla histórica): observado en GBFS,
-10,328.5 y 5,570.8; parejo al 40 %, 6,335.9 y 1,967.5; al 50 %, 6,213.2 y
-2,792.5; al 60 %, 8,169.4 y 3,180.1. El arranque observado es disparejo:
-muchas estaciones empiezan vacías o llenas, y de ahí sale buena parte del
-riesgo y del riesgo evitado. **El nivel de los resultados depende más del
-inventario inicial que de la política.**
+Dashboard: seis páginas en `app/vistas/`, que leen tablas agregadas de
+`data/processed/app` (`python scripts/build_app_tables.py`, y
+`python scripts/build_station_context.py` para la de contexto). Hay que
+volver a correr esos dos scripts si cambian las tablas o la simulación.
 
 Lo que hay que saber antes de citar un número:
 
@@ -602,7 +629,7 @@ Lo que hay que saber antes de citar un número:
 - La línea recta ignora ríos y puentes. Los movimientos son instantáneos y
   sin límite de camiones.
 - Solo se conoce la demanda atendida: los viajes bloqueados son simulados.
-- Las reglas de operación son provisionales.
+- La prueba final (15 a 29 de septiembre) no se ha simulado ni calificado.
 
 ## Sin fuga de información, en concreto
 
@@ -642,14 +669,11 @@ el pronóstico de clima emitido antes de decidir).
 - `ocupacion_respaldo` tiene un valor por franja y la decisión 14 no dice cuál
   da el inventario inicial de la simulación. Programación usará el de la
   primera franja del día salvo que logística diga otra cosa.
-- **Rama de Rodrigo:** falta fusionarla. De ella dependen la clave única
-  `reparto_presupuesto`, `excepciones_valet` y `grupos_aislados` en el
-  validador, y `notebooks/b/tipo_estacion.sql` para llenar `station_type`.
 - **Prueba final y rezagos:** las filas de prueba de LightGBM usan como rezago
-  lo observado en días de prueba anteriores. Ningún valor de prueba se usó como
-  etiqueta ni en una métrica. Falta que el usuario diga si eso es aceptable.
-- **Contrapartes:** permitir que una estación dentro de su rango preste o
-  reciba mejora unas 190 horas al día (medido); hoy no se permite.
+  lo observado en días de prueba anteriores. Falta que el usuario diga si eso
+  es aceptable antes del cierre.
+- `docs/reglas_operacion.md` todavía menciona `tipo_si_falta` en cuatro
+  lugares; es de logística.
 - Las seis tablas del dashboard ya son reales. `recommendations` y
   `policy_curve` son resultados simulados con reglas provisionales.
 - Aún no existen: regla de `station_type` y variables externas.

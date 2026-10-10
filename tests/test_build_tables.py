@@ -1742,3 +1742,75 @@ def test_trips_real_trae_el_viaje_conocido_y_cuadra_con_station_hour(
     row = table[table["ts_hour"] == hour]
     assert len(row) == 1
     assert int((trips["start_station_id"] == station).sum()) == int(row["departures"].iloc[0])
+
+
+# --------------------------------------------------------------------------- #
+# Tipo de estación: la consulta de logística (decisión 13)
+# --------------------------------------------------------------------------- #
+
+_TYPE_SQL = """SET TimeZone = 'America/New_York';
+WITH params AS (
+    SELECT TIMESTAMPTZ '{t0} 00:00:00' AS t0,
+           TIMESTAMPTZ '{t1} 00:00:00' AS t1
+)
+SELECT s.station_id, CASE WHEN sum(s.departures) >= 10 THEN 'oficinas' ELSE 'mixta' END AS station_type
+FROM read_parquet('data/processed/station_hour.parquet') s, params p
+WHERE s.ts_hour >= p.t0 AND s.ts_hour < p.t1
+GROUP BY s.station_id;
+"""
+
+
+def _type_inputs(tmp_path: Path, t0: str, t1: str):
+    """Tres estaciones; station_hour con dos en entrenamiento y una (C) solo en validación."""
+    datos = load_datos()
+    assert datos.tramos["entrenamiento"].inicio.isoformat() == "2026-07-01"
+    stations = pa.table({"station_id": ["A", "B", "C"], "station_type": pa.array([None] * 3, pa.string())})
+    hours = pd.DataFrame(
+        {
+            "station_id": ["A", "B", "C", "B"],
+            "ts_hour": pd.to_datetime(
+                ["2026-07-02 08:00", "2026-07-02 08:00", "2026-09-02 08:00", "2026-09-02 08:00"]
+            ).tz_localize("America/New_York"),
+            "departures": [12, 3, 50, 50],
+        }
+    )
+    path = tmp_path / "station_hour.parquet"
+    hours.to_parquet(path)
+    sql = tmp_path / "tipo.sql"
+    sql.write_text(_TYPE_SQL.format(t0=t0, t1=t1), encoding="utf-8")
+    return stations, path, sql, datos
+
+
+def test_el_tipo_de_estacion_sale_de_la_consulta_y_solo_del_tramo_de_entrenamiento(tmp_path):
+    stations, hours, sql, datos = _type_inputs(tmp_path, "2026-07-01", "2026-09-01")
+    table, report = bt.apply_station_types(stations, hours, sql, datos)
+    # B tiene 50 salidas en validación: no cuentan. C no tiene filas de entrenamiento: queda sin tipo.
+    assert table["station_type"].to_pylist() == ["oficinas", "mixta", None]
+    assert report["aplicada"] and report["por_tipo"] == {"mixta": 1, "oficinas": 1} and report["sin_tipo"] == 1
+    assert "oficinas 1" in bt._type_line(report) and "sin tipo" in bt._type_line(report)
+
+
+def test_si_las_fechas_de_la_consulta_no_son_las_del_entrenamiento_no_se_aplica(tmp_path):
+    stations, hours, sql, datos = _type_inputs(tmp_path, "2026-07-01", "2026-09-15")
+    table, report = bt.apply_station_types(stations, hours, sql, datos)
+    assert table["station_type"].null_count == 3
+    assert not report["aplicada"] and "no son las del tramo de entrenamiento" in report["motivo"]
+    assert "va vacía" in bt._type_line(report)
+
+
+def test_sin_consulta_el_tipo_queda_vacio(tmp_path):
+    stations, hours, _, datos = _type_inputs(tmp_path, "2026-07-01", "2026-09-01")
+    for sql in (None, tmp_path / "no_existe.sql"):
+        table, report = bt.apply_station_types(stations, hours, sql, datos)
+        assert table["station_type"].null_count == 3 and not report["aplicada"] and report["motivo"]
+
+
+def test_la_consulta_del_repositorio_usa_el_tramo_de_entrenamiento_y_lee_station_hour():
+    """Si alguien cambia el tramo o la consulta, build_tables dejaría de aplicar el tipo: que se note aquí."""
+    import re
+
+    sql = bt.TIPO_ESTACION_SQL.read_text(encoding="utf-8")
+    train = load_datos().tramos["entrenamiento"]
+    found = [re.search(bt._TIPO_SQL_FECHA % name, sql).group(1) for name in ("t0", "t1")]
+    assert found == [train.inicio.isoformat(), (train.fin + timedelta(days=1)).isoformat()]
+    assert bt._TIPO_SQL_FUENTE in sql

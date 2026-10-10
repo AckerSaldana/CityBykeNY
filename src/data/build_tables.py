@@ -94,6 +94,13 @@ from src.data.gbfs_frozen import FROZEN_FILE, GbfsFrozenError, load_frozen
 from src.paths import DATA_PROCESSED, DATA_RAW, DATA_SAMPLE, DATOS_YAML, REPORTS, ROOT, TZ
 
 TABLES = ("stations", "station_hour", "routes")      # las tres tablas de contrato que salen de aquí
+# Regla de `station_type` (decisión 13): la consulta de logística. Lee station_hour del tramo de
+# entrenamiento y devuelve una fila por estación con su tipo. `main` la aplica; ver `apply_station_types`.
+TIPO_ESTACION_SQL = ROOT / "notebooks" / "b" / "tipo_estacion.sql"
+# Así nombra la consulta a station_hour: se cambia por el archivo recién construido.
+_TIPO_SQL_FUENTE = "read_parquet('data/processed/station_hour.parquet')"
+_TIPO_SQL_FECHA = r"TIMESTAMPTZ\s+'(\d{4}-\d{2}-\d{2}) 00:00:00'\s+AS\s+%s\b"
+SIN_TIPO = "sin tipo"
 REPORT_FOLDER = REPORTS.relative_to(DATA_PROCESSED)  # "reports", dentro de la carpeta de salida
 REPORT_NAME = "limpieza"
 WORK_FOLDER = "_tmp_build_tables"                    # temporal dentro de la salida; se borra al terminar
@@ -1078,7 +1085,7 @@ def _stations_table(
             "lat": pa.array([r[2] for r in rows], pa.float64()),
             "lon": pa.array([r[3] for r in rows], pa.float64()),
             "capacity": pa.array([r[4] for r in rows], pa.int64()),
-            # Decisión 13: la regla de station_type todavía no existe.
+            # Decisión 13: el tipo lo pone después `apply_station_types`, con la consulta de logística.
             "station_type": pa.array([None] * len(rows), pa.string()),
         }
     )
@@ -1493,6 +1500,73 @@ def _write_text(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
+def apply_station_types(
+    stations: pa.Table, station_hour_path: Path, sql_path: Path | None, datos: Datos
+) -> tuple[pa.Table, dict]:
+    """Llena `station_type` con la consulta de logística (notebooks/b/tipo_estacion.sql).
+
+    La consulta se corre tal cual, en una conexión aparte de DuckDB, cambiando solo el archivo que lee
+    (`data/processed/station_hour.parquet`) por el `station_hour` recién construido. Una estación que la
+    consulta no devuelve queda sin tipo (nulo).
+
+    La consulta trae escritas las fechas del tramo de ENTRENAMIENTO. Si no son las de config/datos.yaml no se
+    aplica (todas las estaciones quedan sin tipo) y el reporte dice por qué: así el tipo nunca se calcula con
+    filas de validación ni de la prueba final (decisiones 4 y 8).
+
+    Devuelve la tabla y el resumen que va en limpieza.json (`tipo_de_estacion`).
+    """
+    report = {"consulta": None, "aplicada": False, "motivo": None, "por_tipo": {}, "sin_tipo": stations.num_rows}
+    if sql_path is None:
+        report["motivo"] = "no se pidió aplicar ninguna consulta"
+        return stations, report
+    report["consulta"] = _short(sql_path)
+    if not Path(sql_path).exists():
+        report["motivo"] = f"no existe {_short(sql_path)}"
+        return stations, report
+    sql = Path(sql_path).read_text(encoding="utf-8")
+    train = datos.tramos["entrenamiento"]
+    expected = (train.inicio.isoformat(), (train.fin + timedelta(days=1)).isoformat())
+    found = tuple(
+        (match.group(1) if (match := re.search(_TIPO_SQL_FECHA % name, sql)) else None) for name in ("t0", "t1")
+    )
+    report["tramo_de_la_consulta"] = {"desde": found[0], "antes_de": found[1]}
+    if found != expected:
+        report["motivo"] = (
+            f"las fechas de la consulta ({found[0]} a {found[1]}, sin incluir el último) no son las del tramo de "
+            f"entrenamiento de config/datos.yaml ({expected[0]} a {expected[1]}, sin incluir el último)"
+        )
+        return stations, report
+    if _TIPO_SQL_FUENTE not in sql:
+        raise BuildError(
+            f"{_short(sql_path)} ya no lee station_hour con {_TIPO_SQL_FUENTE}: no se puede apuntar al "
+            "station_hour recién construido. Ajusta la consulta o `_TIPO_SQL_FUENTE` en src/data/build_tables.py."
+        )
+    sql = sql.replace(_TIPO_SQL_FUENTE, f"read_parquet({_sql_text(str(station_hour_path))})")
+    con = duckdb.connect()
+    try:
+        cursor = con.execute(sql)
+        names = [column[0] for column in cursor.description]
+        rows = [dict(zip(names, row)) for row in cursor.fetchall()]
+    finally:
+        con.close()
+    kinds = {row["station_id"]: row["station_type"] for row in rows}
+    if len(kinds) != len(rows):
+        raise BuildError(f"{_short(sql_path)} devolvió una estación más de una vez.")
+    values = [kinds.get(station) for station in stations["station_id"].to_pylist()]
+    table = stations.set_column(
+        stations.schema.get_field_index("station_type"), "station_type", pa.array(values, pa.string())
+    )
+    counts = Counter(SIN_TIPO if value is None else value for value in values)
+    report.update(
+        aplicada=True,
+        estaciones_que_devolvio_la_consulta=len(rows),
+        de_ellas_fuera_de_stations=len(set(kinds) - set(stations["station_id"].to_pylist())),
+        por_tipo={kind: count for kind, count in sorted(counts.items()) if kind != SIN_TIPO},
+        sin_tipo=counts.get(SIN_TIPO, 0),
+    )
+    return table, report
+
+
 def build(
     datos: Datos,
     raw_dir: Path,
@@ -1500,6 +1574,7 @@ def build(
     out_dir: Path,
     *,
     config_path: Path | None = None,
+    tipo_sql: Path | None = None,
     log=print,
 ) -> dict:
     """Corre la limpieza completa y escribe las tres tablas, trips.parquet y el reporte.
@@ -1564,10 +1639,13 @@ def build(
         # está trips.parquet. Solo si las tres cumplen su contrato, y el
         # reporte se pudo armar, pasan las cuatro a la carpeta de salida. Así
         # nunca quedan tablas de una corrida con el reporte de otra.
+        sizes = {"station_hour": write_contract(station_hour, "station_hour", work / "station_hour.parquet").stat().st_size}
+        # El tipo de estación sale del station_hour ya escrito (solo su tramo de entrenamiento).
+        stations, type_report = apply_station_types(stations, work / "station_hour.parquet", tipo_sql, datos)
+        stations = to_contract_table(stations, "stations")
         tables = {"stations": stations, "station_hour": station_hour, "routes": routes}
-        sizes = {}
-        for name, table in tables.items():
-            sizes[name] = write_contract(table, name, work / f"{name}.parquet").stat().st_size
+        for name in ("stations", "routes"):
+            sizes[name] = write_contract(tables[name], name, work / f"{name}.parquet").stat().st_size
         trips_report = {
             "archivo": _short(out_dir / f"{TRIPS_NAME}.parquet"),
             "es_contrato": False,
@@ -1591,6 +1669,7 @@ def build(
             datos, config_path, raw_dir, out_dir, period, rows, accounting, plan, capacity_report, gbfs_info,
             tables, sizes, zero_runs, tz_trips, checks, started, trips_report,
         )
+        report["tipo_de_estacion"] = type_report
         report_json = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         report_md = render_markdown(report)
         for name in (*TABLES, TRIPS_NAME):
@@ -1969,10 +2048,24 @@ def render_markdown(report: dict) -> str:
         f"- **Estaciones que no se unieron.** Los {_n(merge['grupos_no_unidos'])} grupos de la sección 3 quedan "
         "como estaciones",
         "  separadas. Si en realidad son la misma estación, su historia está partida en dos ids.",
-        "- **Tipo de estación.** La columna `station_type` va vacía: la regla todavía no existe.",
+        _type_line(report.get("tipo_de_estacion")),
         "",
     ]
     return "\n".join(lines)
+
+
+def _type_line(kinds: dict | None) -> str:
+    """Renglón del reporte sobre `station_type`: cuántas estaciones de cada tipo, o por qué va vacía."""
+    if not kinds or not kinds["aplicada"]:
+        why = kinds["motivo"] if kinds else "no se aplicó ninguna consulta"
+        return f"- **Tipo de estación.** La columna `station_type` va vacía: {why}."
+    counts = ", ".join(f"{kind} {_n(count)}" for kind, count in kinds["por_tipo"].items())
+    window = kinds["tramo_de_la_consulta"]
+    return (
+        f"- **Tipo de estación.** `station_type` sale de `{kinds['consulta']}`, con las filas de `station_hour` "
+        f"del tramo de entrenamiento ({window['desde']} a {window['antes_de']}, sin incluir el último): {counts}; "
+        f"sin tipo (la consulta no las devuelve: no tienen filas en ese tramo), {_n(kinds['sin_tipo'])}."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2033,6 +2126,13 @@ def build_parser() -> argparse.ArgumentParser:
     options.add_argument(
         "--config", metavar="ARCHIVO", help="archivo de periodo y reglas (por defecto config/datos.yaml)"
     )
+    options.add_argument(
+        "--tipo-sql", metavar="ARCHIVO",
+        help=(
+            "consulta que da el tipo de cada estación (por defecto notebooks/b/tipo_estacion.sql). Solo se aplica "
+            "si sus fechas son las del tramo de entrenamiento"
+        ),
+    )
     options.add_argument("-h", "--help", action="help", help="muestra esta ayuda y termina")
     return parser
 
@@ -2049,7 +2149,11 @@ def main(argv: list[str] | None = None) -> int:
     gbfs_file = Path(args.gbfs).expanduser() if args.gbfs else FROZEN_FILE
     try:
         datos = load_datos(config_path)
-        report = build(datos, raw_dir, gbfs_file, out_dir, config_path=config_path, log=lambda m: print(m, flush=True))
+        tipo_sql = Path(args.tipo_sql).expanduser() if args.tipo_sql else TIPO_ESTACION_SQL
+        report = build(
+            datos, raw_dir, gbfs_file, out_dir, config_path=config_path, tipo_sql=tipo_sql,
+            log=lambda m: print(m, flush=True),
+        )
     except KeyboardInterrupt:
         print("\nInterrumpido por el usuario. No se escribió nada.", file=sys.stderr)
         return 130
@@ -2062,6 +2166,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Reporte:   {out_dir / REPORT_FOLDER / (REPORT_NAME + '.md')}")
     # Las predicciones se calculan sobre station_hour: si la tabla cambió, quedan viejas.
     print("Ahora corre: python scripts/run_baseline.py", flush=True)
+    kinds = report["tipo_de_estacion"]
+    if kinds["aplicada"]:
+        counts = ", ".join(f"{kind} {count:,}" for kind, count in kinds["por_tipo"].items())
+        print(f"Tipo de estación ({kinds['consulta']}): {counts}; sin tipo {kinds['sin_tipo']:,}.", flush=True)
+    else:
+        print(f"Tipo de estación: station_type quedó vacía en todas las estaciones: {kinds['motivo']}.", flush=True)
     # Avisos: la corrida terminó bien, pero hay algo que quien la corrió debe saber.
     if report["entradas"]["gbfs"]["foto"] is None:
         print(

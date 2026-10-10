@@ -12,6 +12,11 @@ Unidades que conviene tener presentes al leer el resultado:
   `presupuesto_en_bicis`.
 - `parte_del_presupuesto` de cada franja es una fracción del presupuesto del
   día; las de todas las franjas suman 1.
+- `excepciones_valet` y `grupos_aislados` son opcionales: si no están, no hay
+  estaciones con valet ni grupos aislados.
+- Dos franjas pueden tocarse (una termina donde empieza la siguiente) y una
+  franja puede empezar en su momento de intervención (inicio igual a
+  momento_intervencion).
 - Una estación sin tipo no tiene estrategia: no usa ninguna `ocupacion_respaldo`
   y en el reparto va después de las que sí tienen tipo.
 """
@@ -46,6 +51,11 @@ _PISTA_LISTA = (
 # Clave del YAML con la parte del presupuesto del día que le toca a cada franja. Es el único lugar donde
 # está escrito su nombre para LEERLA: el validador y el simulador (`Reglas.from_operacion`) usan esta constante.
 CLAVE_PARTE = "parte_del_presupuesto"
+
+# Días de la semana como se escriben en `excepciones_valet.dias`: sin acento. La posición es el día de la
+# semana de Python (lunes = 0).
+DIAS_SEMANA = ("lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo")
+_DIAS_CON_ACENTO = {"miércoles": "miercoles", "sábado": "sabado"}
 
 
 class OperacionError(ValueError):
@@ -148,6 +158,111 @@ def presupuesto_en_bicis(por_estacion: float, estaciones: int) -> int:
     movidas al día.
     """
     return round(por_estacion * estaciones)
+
+
+def _pista_id(valor) -> str:
+    """Pista para quien escribió un station_id sin comillas: YAML lo lee como número y pierde los ceros finales."""
+    if _es_numero(valor):
+        return f" (escríbelo entre comillas: \"{valor}\"; sin comillas YAML lo lee como número y 5470.10 queda 5470.1)"
+    return ""
+
+
+def _revisar_valet(valet) -> list[str]:
+    """Problemas de `excepciones_valet`. Es opcional: si no está, no hay estaciones con valet."""
+    if valet is None:
+        return []
+    if not isinstance(valet, dict) or set(valet) - {"dias", "estaciones"} or "dias" not in valet:
+        return [
+            "excepciones_valet: debe traer `dias` (lista de días de la semana) y `estaciones` (station_id -> "
+            "lista de intervalos [\"HH:MM\", \"HH:MM\"]), y nada más"
+        ]
+    problems: list[str] = []
+    dias = valet["dias"]
+    if not isinstance(dias, list) or not dias:
+        problems.append(f"excepciones_valet.dias: debe ser una lista con al menos un día de {list(DIAS_SEMANA)}")
+    else:
+        for dia in dias:
+            if dia in _DIAS_CON_ACENTO:
+                problems.append(
+                    f"excepciones_valet.dias: '{dia}' va sin acento: escribe {_DIAS_CON_ACENTO[dia]}"
+                )
+            elif dia not in DIAS_SEMANA:
+                problems.append(
+                    f"excepciones_valet.dias: {dia!r} no es un día válido. Usa, en minúsculas y sin acento: "
+                    f"{', '.join(DIAS_SEMANA)}"
+                )
+        if len(set(map(str, dias))) != len(dias):
+            problems.append("excepciones_valet.dias: hay días repetidos")
+    estaciones = valet.get("estaciones")
+    if estaciones is None:
+        estaciones = {}
+    if not isinstance(estaciones, dict):
+        return problems + [
+            "excepciones_valet.estaciones: debe ser un mapa de station_id a su lista de intervalos, por ejemplo "
+            "\"6492.08\": [[\"07:00\", \"11:00\"]]"
+        ]
+    for estacion, intervalos in estaciones.items():
+        etiqueta = f"excepciones_valet.estaciones.{estacion}"
+        if not isinstance(estacion, str) or not estacion.strip():
+            problems.append(f"{etiqueta}: el station_id debe ser texto{_pista_id(estacion)}")
+            continue
+        if not isinstance(intervalos, list) or not intervalos:
+            problems.append(f"{etiqueta}: debe traer al menos un intervalo [\"HH:MM\", \"HH:MM\"]")
+            continue
+        buenos = []
+        for intervalo in intervalos:
+            formato = (
+                isinstance(intervalo, list) and len(intervalo) == 2
+                and all(isinstance(hora, str) and _HORA.match(hora) for hora in intervalo)
+            )
+            if not formato:
+                problems.append(
+                    f"{etiqueta}: {intervalo!r} no es un intervalo. Va como [\"HH:MM\", \"HH:MM\"], con las horas "
+                    "entre comillas"
+                )
+            elif _minutos(intervalo[0]) >= _minutos(intervalo[1]):
+                problems.append(
+                    f"{etiqueta}: en {intervalo} el inicio debe ser anterior al fin (un intervalo no cruza la "
+                    "medianoche)"
+                )
+            else:
+                buenos.append((_minutos(intervalo[0]), _minutos(intervalo[1]), intervalo))
+        buenos.sort(key=lambda item: item[:2])
+        for (_, fin_a, a), (inicio_b, _, b) in zip(buenos, buenos[1:]):
+            if inicio_b < fin_a:
+                problems.append(f"{etiqueta}: los intervalos {a} y {b} se enciman")
+    return problems
+
+
+def _revisar_grupos(grupos) -> list[str]:
+    """Problemas de `grupos_aislados`. Es opcional: si no está, no hay grupos."""
+    if grupos is None:
+        return []
+    if not isinstance(grupos, dict):
+        return [
+            "grupos_aislados: debe ser un mapa de nombre de grupo a su lista de station_id, por ejemplo "
+            "governors_island: [\"4631.02\", \"4440.02\"]"
+        ]
+    problems: list[str] = []
+    grupo_de: dict[str, str] = {}
+    for nombre, estaciones in grupos.items():
+        etiqueta = f"grupos_aislados.{nombre}"
+        if not isinstance(estaciones, list) or not estaciones:
+            problems.append(f"{etiqueta}: debe ser una lista con al menos un station_id entre comillas")
+            continue
+        for estacion in estaciones:
+            if not isinstance(estacion, str) or not estacion.strip():
+                problems.append(f"{etiqueta}: el station_id {estacion!r} debe ser texto{_pista_id(estacion)}")
+            elif grupo_de.get(estacion) == nombre:
+                problems.append(f"{etiqueta}: la estación {estacion} está repetida")
+            elif estacion in grupo_de:
+                problems.append(
+                    f"{etiqueta}: la estación {estacion} ya está en el grupo '{grupo_de[estacion]}'. Una estación "
+                    "puede estar en un solo grupo"
+                )
+            else:
+                grupo_de[estacion] = nombre
+    return problems
 
 
 def validate_operacion(cfg: dict) -> list[str]:
@@ -303,6 +418,9 @@ def validate_operacion(cfg: dict) -> list[str]:
                         f"estrategia_por_tipo.{tipo}.ocupacion_respaldo.{franja}: debe estar entre 0 y 1"
                         f"{_pista_coma(valor)}"
                     )
+
+    problems += _revisar_valet(cfg.get("excepciones_valet"))
+    problems += _revisar_grupos(cfg.get("grupos_aislados"))
 
     if "tipo_si_falta" in cfg:
         problems.append(

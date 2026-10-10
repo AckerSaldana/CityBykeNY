@@ -83,7 +83,16 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from src.contracts import POLICIES, QUANTILE_COLUMNS, RISK_LEVELS, TS, read_contract, validate_file, write_contract
+from src.contracts import (
+    POLICIES,
+    QUANTILE_COLUMNS,
+    RISK_LEVELS,
+    STATION_TYPES,
+    TS,
+    read_contract,
+    validate_file,
+    write_contract,
+)
 from src.data.datos_config import SPLIT_NAMES, TRAMOS, Tramo, load_datos
 from src.data.gbfs_frozen import FROZEN_FILE, GbfsFrozenError, load_frozen
 from src.models.metrics import FinalTestError
@@ -93,6 +102,7 @@ from src.sim.engine import (
     KINDS,
     POINT_COLUMNS,
     TRIP_COLUMNS,
+    US_PER_HOUR,
     Calendar,
     CheckError,
     InterventionContext,
@@ -104,12 +114,17 @@ from src.sim.engine import (
     build_network,
     daily_budget,
     initial_inventory,
+    move_neighbors,
     prepare_events,
     simulate,
     split_budget,
+    station_groups,
     to_timestamp,
+    valet_at,
+    valet_hours,
+    valet_windows,
 )
-from src.sim.operacion import load_operacion
+from src.sim.operacion import DIAS_SEMANA, load_operacion
 from src.sim.policies import (
     ForecastInfo,
     ForecastPolicy,
@@ -133,6 +148,7 @@ FORECAST_OF = {"historical": "baseline", "model": "lgbm"}
 OBSERVED = "observado en GBFS"
 NOT_SIMULATED = "ninguno"  # lo que dice el reporte del pronóstico de "model" cuando no se simuló
 FULL_BAND = 1.0  # la banda completa, de q10 a q90: la que separa el riesgo "medio" del "bajo"
+UNTYPED = "sin tipo"  # renglón de las estaciones sin `station_type` en el desglose por tipo de estación
 RANDOM_LABEL = "piso de azar"  # mover bicis al azar: referencia del reporte, no es una política del contrato
 # Registro fechado de un experimento descartado. El reporte lo lleva al final, tal cual, si el archivo existe.
 EXPERIMENT_FILE = ROOT / "docs" / "experimento_mediodia.md"
@@ -426,8 +442,20 @@ def daily_risk(result: RunResult, calendar: Calendar) -> np.ndarray:
     return result.risk_hours[calendar.evaluated][:, :, 0].sum(axis=1)
 
 
-def summarize(result: RunResult, none: RunResult, calendar: Calendar, reglas: Reglas, draws, nivel: float) -> dict:
-    """Métricas de una corrida sobre los días evaluados (sin el calentamiento)."""
+def station_type_masks(network: Network) -> dict:
+    """Qué estaciones de la red son de cada tipo, con UNTYPED al final para las que no tienen."""
+    kinds = np.array([UNTYPED if kind is None else kind for kind in network.station_type], dtype=object)
+    return {kind: kinds == kind for kind in (*STATION_TYPES, UNTYPED)}
+
+
+def summarize(
+    result: RunResult, none: RunResult, calendar: Calendar, reglas: Reglas, draws, nivel: float,
+    network: Network | None = None,
+) -> dict:
+    """Métricas de una corrida sobre los días evaluados (sin el calentamiento).
+
+    Con `network` agrega el riesgo por tipo de estación (`station_type`, y UNTYPED para las que no tienen).
+    """
     days = calendar.evaluated
 
     def stat(values) -> dict:
@@ -439,7 +467,22 @@ def summarize(result: RunResult, none: RunResult, calendar: Calendar, reglas: Re
     base = daily_risk(none, calendar)
     moved = result.budget_used[days].sum(axis=1)
     warm = np.arange(calendar.warmup_days)
+    by_station_type = {}
+    if network is not None and result.risk_station_us is not None and none.risk_station_us is not None:
+        mine, theirs = result.risk_station_us[days] / US_PER_HOUR, none.risk_station_us[days] / US_PER_HOUR
+        for kind, mask in station_type_masks(network).items():
+            risk, without = mine[:, mask].sum(axis=1), theirs[:, mask].sum(axis=1)
+            by_station_type[kind] = {
+                "estaciones": int(mask.sum()),
+                "riesgo_por_dia": stat(risk),
+                "riesgo_simulado_evitado_por_dia": stat(without - risk),
+                "riesgo_simulado_evitado_pct": avoided_percent(float((without - risk).mean()), float(without.mean())),
+                "riesgo_de_cada_dia": [float(v) for v in risk],
+            }
+    in_valet = np.zeros(len(days)) if result.valet_risk_us is None else result.valet_risk_us[days] / US_PER_HOUR
     return {
+        "riesgo_por_tipo_de_estacion": by_station_type,
+        "tiempo_bajo_umbral_en_valet_no_contado_por_dia": float(in_valet.mean()),
         "riesgo_por_dia": stat(total),
         "riesgo_simulado_evitado_por_dia": stat(base - total),
         "riesgo_por_franja": {label: stat(hours[:, i, 0]) for i, label in enumerate(calendar.labels)},
@@ -600,7 +643,10 @@ def compare_policies(runs: dict, budget: int, policies: dict, calendar: Calendar
     """
     days = len(calendar.evaluated)
     out = {}
+    windows = None
     for name, policy in policies.items():
+        if windows is None:
+            windows = valet_windows(policy.network, calendar.days, reglas)
         count = dict.fromkeys(
             ("con_informacion", "sin_solucion", "sin_solucion_sin_tipo", "faltan", "sobran", "con_traslado",
              "recibidas", "entregadas", "recibidas_sin_solucion", "entregadas_sin_solucion"), 0,
@@ -616,6 +662,7 @@ def compare_policies(runs: dict, budget: int, policies: dict, calendar: Calendar
                     franja=reglas.franjas[record.franja_index],
                     inventory=before,
                     budget=record.budget_available,
+                    valet=valet_at(windows, record.instant_us, policy.network.size) if windows else None,
                 )
             )
             unsolved = ~targets.feasible  # una estación sin información queda como "con solución"
@@ -708,7 +755,7 @@ def run_simulation(
         name: ForecastInfo.from_predictions(forecasts[name], network, reglas, calendar.days, with_history)
         for name in names
     }
-    neighbors = network.neighbors_within(reglas.distancia_maxima_km)
+    neighbors = move_neighbors(network, reglas)  # dentro de la distancia máxima y en el mismo grupo aislado
 
     def policy(name: str, band: float) -> ForecastPolicy:
         return ForecastPolicy(name, network, reglas, info[name], band, neighbors)
@@ -843,7 +890,7 @@ def run_simulation(
     curve = []
     for name in present:
         for total, per_station in budgets.items():
-            summary = summarize(runs[(name, total)], none, calendar, reglas, draws, nivel)
+            summary = summarize(runs[(name, total)], none, calendar, reglas, draws, nivel, network)
             results.append(
                 {
                     "politica": name,
@@ -892,7 +939,51 @@ def run_simulation(
             "por_politica": per_policy,
         }
 
+    # Estaciones con valet y grupos aislados: qué se excluyó y cuánto.
+    windows = valet_windows(network, calendar.days, reglas)
+    excluded_hours = valet_hours(windows, calendar)[evaluated]
+    in_valet_slots = sum(
+        int(valet_at(windows, slot.instant_us, n).sum())
+        for slot in calendar.slots
+        if slot.day_index >= calendar.warmup_days
+    )
+    valet_ids = [station for station, _ in reglas.valet_estaciones]
+    group_of = station_groups(network, reglas)
+    within = network.neighbors_within(reglas.distancia_maxima_km)
+    groups_report = {}
+    for g, (group_name, members) in enumerate(reglas.grupos_aislados):
+        inside = np.nonzero(group_of == g)[0]
+        groups_report[group_name] = {
+            "estaciones_en_el_archivo": list(members),
+            "estaciones_simuladas": [network.station_ids[s] for s in inside],
+            # Estaciones de fuera del grupo a menos de la distancia máxima de alguna del grupo: sin la regla
+            # podrían intercambiar bicis con él.
+            "vecinas_de_fuera_dentro_de_la_distancia_maxima": int(
+                len({int(other) for s in inside for other in within[s] if group_of[other] != g})
+            ),
+            "traslados_que_cruzan_el_grupo": 0,  # el motor los rechaza: una corrida con uno no termina
+        }
+    exceptions = {
+        "valet": {
+            "dias": [DIAS_SEMANA[d] for d in reglas.valet_dias],
+            "intervalos": {station: [list(pair) for pair in intervals] for station, intervals in reglas.valet_estaciones},
+            "estaciones_en_el_archivo": valet_ids,
+            "estaciones_simuladas": [network.station_ids[s] for s in sorted(windows)],
+            "dias_evaluados_con_valet": int(
+                sum(calendar.days[d].weekday() in reglas.valet_dias for d in evaluated) if windows else 0
+            ),
+            "horas_de_estacion_excluidas": {
+                "total": float(excluded_hours.sum()),
+                "por_dia_evaluado": float(excluded_hours.mean()),
+                "cada_dia": [float(v) for v in excluded_hours],
+            },
+            "estacion_intervencion_dentro_de_un_intervalo": int(in_valet_slots),
+        },
+        "grupos_aislados": groups_report,
+    }
+
     report = {
+        "excepciones": exceptions,
         "tramo": {
             "nombre": tramo.nombre,
             "inicio": tramo.inicio.isoformat(),
@@ -906,7 +997,10 @@ def run_simulation(
             "inicio": prueba_final.inicio.isoformat() if prueba_final else None,
             "fin": prueba_final.fin.isoformat() if prueba_final else None,
         },
-        "estaciones": station_report,
+        "estaciones": {
+            **station_report,
+            "simuladas_por_tipo": {kind: int(mask.sum()) for kind, mask in station_type_masks(network).items()},
+        },
         "viajes": events.counts,
         "inventario_inicial": {
             "bicis": int(start.sum()),
@@ -979,6 +1073,9 @@ def run_simulation(
             "Los traslados no crearon ni destruyeron bicis.",
             "Ninguna franja usó más presupuesto del disponible.",
             "Todos los traslados quedaron dentro de la distancia máxima.",
+            "Ningún traslado cruzó un grupo aislado ni tocó una estación con valet en el instante de la "
+            "intervención (el motor los rechaza y detiene la corrida).",
+            "En cada corrida el riesgo por estación suma el riesgo por franja.",
             'La política "none" no movió bicis.',
             f"Se repitió la corrida de {POLICY_LABELS[names[0]]} con {reference:,} bicis al día y dio el mismo "
             "resultado.",
@@ -1075,6 +1172,14 @@ def limitations(report: dict) -> list[str]:
         "está fuera del suyo, sin salir de su propio rango. Después de hacerlo puede quedar en el borde de su "
         "rango: su mínimo si prestó, su máximo si recibió.",
         "Bicis clásicas y eléctricas se cuentan juntas.",
+        "Estaciones con valet: el día se toma por su nombre (lunes a domingo); un festivo que cae en uno de esos "
+        "días se trata como día con valet. Fuera de sus intervalos la estación cuenta como cualquier otra. Los "
+        "viajes bloqueados y las llegadas desviadas de esas estaciones se siguen contando también dentro de los "
+        "intervalos: lo que no se cuenta es el tiempo bajo el umbral. El inventario de la estación sigue limitado "
+        "por su capacidad: no se modela que el valet reciba bicis fuera de los anclajes.",
+        "Grupos aislados: la regla aplica solo a los traslados de rebalanceo. Una llegada desviada y una bici que "
+        "vuelve de un viaje que terminó fuera del conjunto siguen la regla de siempre (la estación con lugar más "
+        "cercana en línea recta), así que pueden entrar o salir del grupo.",
         "Una estación cerrada varios días se ve como demanda cero: la simulación no sabe que estaba cerrada.",
         "La banda trata las horas como independientes entre sí y las salidas como independientes de las "
         "llegadas al sumar la incertidumbre.",
@@ -1354,6 +1459,102 @@ def _random_section(report: dict) -> list[str]:
         "Horas de estación en riesgo por día del piso de azar menos las de cada política (positivo: la política "
         f"tiene menos riesgo simulado que mover al azar): {'; '.join(over)}. El detalle de cada corrida está en "
         "`simulacion.json` (`piso_de_azar`).",
+        "",
+    ]
+
+
+def _exceptions_lines(report: dict) -> list[str]:
+    """Renglones de "Reglas usadas" sobre las estaciones con valet y los grupos aislados, con sus conteos."""
+    facts = report.get("excepciones")
+    if not facts:
+        return []
+    lines = []
+    valet = facts["valet"]
+    if valet["estaciones_en_el_archivo"]:
+        hours = valet["horas_de_estacion_excluidas"]
+        spans = "; ".join(
+            f"{station}: {', '.join(f'{a} a {b}' for a, b in pairs)}" for station, pairs in valet["intervalos"].items()
+        )
+        rows = _at_reference(report)
+        uncounted = ", ".join(
+            f"{POLICY_LABELS[name]} {_n(rows[name]['tiempo_bajo_umbral_en_valet_no_contado_por_dia'])}"
+            for name in _policies(report)
+        )
+        lines.append(
+            f"- Estaciones con valet (`excepciones_valet`): {len(valet['estaciones_en_el_archivo'])} en el archivo, "
+            f"{len(valet['estaciones_simuladas'])} simuladas, los días {', '.join(valet['dias'])} ({spans}). En esos "
+            "intervalos el tiempo de la estación no cuenta como riesgo, en ninguna política, y en una intervención "
+            "cuyo instante cae dentro de un intervalo la estación no entrega ni recibe bicis. **Horas de estación "
+            f"excluidas del riesgo: {_n(hours['total'])} en los días evaluados ({_n(hours['por_dia_evaluado'])} por "
+            f"día; días evaluados con valet: {valet['dias_evaluados_con_valet']}).** De ese tiempo, la estación "
+            f"estuvo bajo un umbral, en horas por día evaluado: {uncounted}. Estación-intervención que cae dentro "
+            f"de un intervalo con valet en los días evaluados: {valet['estacion_intervencion_dentro_de_un_intervalo']:,}"
+            + (
+                " (ningún momento de intervención cae dentro de un intervalo: la regla solo cambia la cuenta del "
+                "riesgo)."
+                if not valet["estacion_intervencion_dentro_de_un_intervalo"]
+                else "."
+            )
+        )
+    for name, group in facts["grupos_aislados"].items():
+        lines.append(
+            f"- Grupo aislado `{name}` (`grupos_aislados`): {len(group['estaciones_en_el_archivo'])} estaciones en "
+            f"el archivo, {len(group['estaciones_simuladas'])} simuladas "
+            f"({', '.join(group['estaciones_simuladas']) or 'ninguna'}). Solo intercambian bicis entre ellas: el "
+            "motor rechaza un traslado entre una estación del grupo y una de fuera. Estaciones de fuera a menos de "
+            f"la distancia máxima de alguna del grupo: {group['vecinas_de_fuera_dentro_de_la_distancia_maxima']:,}. "
+            "Las llegadas desviadas y las bicis que vuelven de un viaje que terminó fuera del conjunto conservan "
+            "su regla (la estación con lugar más cercana): no miran el grupo."
+        )
+    return lines
+
+
+def _station_type_section(report: dict) -> list[str]:
+    """Riesgo simulado por tipo de estación con el presupuesto de referencia, por política."""
+    rows = _at_reference(report)
+    none = rows["none"].get("riesgo_por_tipo_de_estacion")
+    if not none:
+        return []
+    names = [policy for policy in _policies(report) if policy != "none"]
+    level = f"{report['intervalo']['nivel'] * 100:g} %"
+    table = []
+    for kind, base in none.items():
+        cells = [kind, f"{base['estaciones']:,}", _n(base["riesgo_por_dia"]["media"])]
+        for name in names:
+            cell = rows[name]["riesgo_por_tipo_de_estacion"][kind]
+            cells += [
+                _n(cell["riesgo_por_dia"]["media"]),
+                _n(cell["riesgo_simulado_evitado_por_dia"]["media"]),
+                _range(cell["riesgo_simulado_evitado_por_dia"]),
+                _pct(cell["riesgo_simulado_evitado_pct"]),
+            ]
+        table.append(cells)
+    total = ["todas", f"{sum(base['estaciones'] for base in none.values()):,}", _n(rows["none"]["riesgo_por_dia"]["media"])]
+    for name in names:
+        avoided = rows[name]["riesgo_simulado_evitado_por_dia"]
+        total += [
+            _n(rows[name]["riesgo_por_dia"]["media"]), _n(avoided["media"]), _range(avoided),
+            _pct(avoided_percent(avoided["media"], rows["none"]["riesgo_por_dia"]["media"])),
+        ]
+    table.append(total)
+    return [
+        "## Riesgo por tipo de estación",
+        "",
+        "Horas de estación en riesgo por día evaluado, con el presupuesto de referencia "
+        f"({report['reglas']['presupuesto_de_referencia_en_bicis']:,} bicis al día), según el `station_type` de "
+        "`stations` (regla de logística, calculada solo con el tramo de entrenamiento). \"sin tipo\" son las "
+        "estaciones que esa regla no devuelve: no tienen filas en el entrenamiento. \"% evitado\" es contra el "
+        f"riesgo sin intervención de ese mismo tipo. Intervalo del {level} por remuestreo de días, indicativo. "
+        "Los renglones suman el total del día.",
+        "",
+        _table(
+            ["tipo de estación", "estaciones", "sin intervención",
+             *[f"{POLICY_LABELS[name]}: {what}" for name in names
+               for what in ("en riesgo", "riesgo simulado evitado", f"intervalo {level}", "% evitado")]],
+            table,
+        ),
+        "",
+        "El riesgo de cada tipo en cada día está en `simulacion.json` (`riesgo_por_tipo_de_estacion`).",
         "",
     ]
 
@@ -1675,10 +1876,13 @@ def build_report(
         "usuario: necesita un modelo del riesgo esperado por estación y franja.",
         "- Franja sin solución (ningún inventario evita los dos umbrales con la banda): una estación con tipo "
         "va a `ocupacion_respaldo` de su tipo por su capacidad, sin quedar bajo ningún umbral; una estación sin "
-        "tipo no se toca en esa franja.",
+        "tipo no se toca en esa franja. El inventario de respaldo es el mismo para la regla histórica y el "
+        "modelo: sale del tipo, la franja y la capacidad, acotado entre `bicis_minimas` y la capacidad menos "
+        "`lugares_libres_minimos`.",
         f"- Franja de noche del reporte: {rules['franja_noche'][0]} a {rules['franja_noche'][1]} "
         "(`simulacion.franja_noche` de config/datos.yaml). No es una franja de operación.",
     ]
+    lines += _exceptions_lines(report)
     if rules["presupuestos_con_el_mismo_total_que_otro"]:
         lines.append(
             "- Presupuestos que dan el mismo total de bicis que otro y no se repiten: "
@@ -1739,6 +1943,7 @@ def build_report(
         "",
         "El riesgo de cada franja en cada día está en `simulacion.json` (`riesgo_por_franja_de_cada_dia`).",
         "",
+        *_station_type_section(report),
         "## Sensibilidad al inventario inicial",
         "",
         f"La corrida con el presupuesto de referencia ({reference:,} bicis al día) y la banda elegida, repetida "
