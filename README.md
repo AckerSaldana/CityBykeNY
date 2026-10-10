@@ -158,6 +158,13 @@ histórica (sin intervención: 10,328.5), y fue peor que el modelo sin corregir
 en los 13 días. Se descartó. Son números de una versión anterior del simulador
 y no se recalcularon ([`docs/experimento_mediodia.md`](docs/experimento_mediodia.md)).
 
+## Datos de muestra
+
+`data/sample` es una muestra **sintética**: sirve para abrir el dashboard y
+correr las pruebas sin los datos reales, y ningún número suyo es un resultado.
+La página de Contexto solo aparece con los datos del censo (LODES), que se
+generan con `python scripts/build_station_context.py`.
+
 ## Notebooks
 
 Tres notebooks en `notebooks/`, guardados ya ejecutados (tablas y gráficas a
