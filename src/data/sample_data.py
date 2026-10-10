@@ -42,7 +42,7 @@ from src.contracts import (
     write_contract,
 )
 from src.paths import DATA_PROCESSED, DATA_RAW, DATA_SAMPLE, ROOT, TZ
-from src.sim.operacion import load_operacion
+from src.sim.operacion import load_operacion, presupuesto_en_bicis
 
 SEED = 20251013
 
@@ -54,7 +54,6 @@ VAL_START = pd.Timestamp("2025-10-27", tz=TZ)   # antes de esto: historia del ba
 TEST_START = pd.Timestamp("2025-11-03", tz=TZ)  # val = 27 oct a 2 nov, test = 3 a 9 nov
 
 DEFAULT_CAPACITY = 20        # capacidad que se supone cuando capacity viene vacío
-DEFAULT_OCCUPANCY = 0.5      # ocupación de respaldo que se supone cuando station_type viene vacío
 MAX_TOTAL_BYTES = 1_500_000  # la carpeta va en Git: debe seguir siendo pequeña
 
 # Estaciones que no cubren todo el periodo: (primer día con viajes, último día
@@ -136,7 +135,7 @@ DESCRIPTIONS = {
         "Números inventados."
     ),
     "policy_curve": (
-        "Curva de riesgo contra presupuesto diario, por política. "
+        "Curva de riesgo contra presupuesto, por política. `budget` es el total de bicis movidas al día. "
         "Números inventados para acomodar la gráfica."
     ),
     "routes": (
@@ -213,8 +212,9 @@ columnas.
   - En estos datos inventados, las tres políticas empiezan cada franja con el
     mismo inventario: la `ocupacion_respaldo` de esa franja (según el tipo de
     la estación) por su capacidad, redondeado. Es una simplificación de la
-    muestra: cuál de los valores por franja dará el inventario inicial de la
-    simulación real sigue abierto (ver `config/operacion.yaml`).
+    muestra. En la simulación real solo el primer día empieza con la
+    ocupación de respaldo, y ese día es de calentamiento; después cada día
+    empieza con las bicis que dejó el anterior.
   - Con `policy = "none"` no se mueve nada: `start_inventory_target` es ese
     inventario de respaldo.
   - En las otras dos, lo que reciben unas estaciones es lo que entregan
@@ -222,19 +222,34 @@ columnas.
     inventario que busca se inventa aparte.
   - Unas pocas filas tienen `feasible` en falso. En ellas las tres políticas
     se quedan con el inventario de respaldo y `bikes_to_move` es 0.
-  - Donde falta `capacity` se supuso {default_capacity}. Donde falta `station_type` se
-    supuso una ocupación de respaldo de {default_occupancy}.
+  - Donde falta `capacity` se supuso {default_capacity}. Donde falta `station_type` se usa
+    la estrategia del tipo que dice `tipo_si_falta` en
+    `config/operacion.yaml` (hoy `{default_type}`).
+  - Los traslados de la muestra no respetan ningún presupuesto ni el reparto
+    por franja (`parte_del_presupuesto`): son inventados. Aquí se llevan
+    entre {moved_min} y {moved_max} bicis al día, según el día y la política; el
+    presupuesto de referencia serían {reference_budget}. Los reales salen de la
+    simulación con el presupuesto de referencia.
   - Hay filas con los tres niveles de riesgo.
-- `policy_curve.parquet`: una fila por política y presupuesto de
-  `presupuestos_diarios`.
+- `policy_curve.parquet`: una fila por política y presupuesto. `budget` es el
+  total de bicis que se pueden mover en un día. `config/operacion.yaml` da
+  los presupuestos en bicis por estación por día
+  (`presupuestos_por_estacion`: {per_station}).
+  Aquí cada uno se multiplica por las {stations} estaciones de la muestra y se
+  redondea: {budgets}.
+  Si dos valores dan el mismo total, queda una sola fila.
+  El presupuesto de referencia (`presupuesto_de_referencia`: {reference}) es
+  la fila con `budget` = {reference_budget}.
 
 ## Cómo regenerarlos
 
     python scripts/make_sample_data.py
 
-El resultado es siempre el mismo (la semilla es fija). Si cambian las franjas,
-los presupuestos o la `ocupacion_respaldo` en `config/operacion.yaml`, hay que
-volver a correrlo.
+El resultado es siempre el mismo (la semilla es fija). Hay que volver a
+correrlo si en `config/operacion.yaml` cambian las franjas (cuántas son, sus
+nombres o sus horas), `presupuestos_por_estacion`,
+`presupuesto_de_referencia`, `tipo_si_falta` o la `ocupacion_respaldo`.
+Cambiar solo `parte_del_presupuesto` no cambia la muestra.
 
 No edites estos archivos a mano. Este LEEME lo escribe el mismo script.
 """
@@ -507,12 +522,18 @@ def build_recommendations(
 
     - Es el inventario inicial común de las tres políticas. Aquí, las tres
       empiezan cada franja con ocupacion_respaldo x capacidad, redondeado.
-      Es una simplificación de la muestra: cuál de los valores por franja da
-      el inventario inicial de la simulación real sigue abierto.
+      Es una simplificación de la muestra: en la simulación real solo el
+      primer día empieza así y después el inventario pasa de un día al otro.
     - Es el valor que se usa cuando no hay solución factible. Aquí, en las
       filas con feasible en falso las tres políticas se quedan con ese
       inventario y no mueven nada.
     - La regla histórica NO lo usa: el inventario que busca se inventa aparte.
+
+    Una estación sin tipo usa la estrategia del tipo que dice `tipo_si_falta`.
+
+    Los traslados NO respetan ningún presupuesto ni el reparto por franja: son
+    inventados. Los reales salen de la simulación con el presupuesto de
+    referencia.
 
     Una estación entra en una franja solo si tiene fila en station_hour a la
     hora en que la franja empieza (ver PARTIAL_STATIONS).
@@ -528,10 +549,11 @@ def build_recommendations(
             n, cap = int(present.sum()), capacity[present]
 
             # Ocupación de respaldo de la franja según el tipo de la estación.
+            # Una estación sin tipo usa la del tipo que dice tipo_si_falta.
             rules = cfg["estrategia_por_tipo"]
             by_type = {kind: rule["ocupacion_respaldo"][franja["nombre"]] for kind, rule in rules.items()}
             kinds = stations.loc[present, "station_type"]
-            occupancy = np.array([by_type.get(kind, DEFAULT_OCCUPANCY) for kind in kinds])
+            occupancy = np.array([by_type.get(kind, by_type[cfg["tipo_si_falta"]]) for kind in kinds])
             # Inventario de respaldo: con él empiezan la franja las tres políticas.
             fallback = np.rint(cap * occupancy).astype(int)
             # Inventario que de verdad convendría ese día. Inventado: no sale del respaldo.
@@ -576,19 +598,35 @@ def build_recommendations(
     return frame
 
 
-def build_policy_curve(cfg: dict) -> pd.DataFrame:
-    """Curva inventada de riesgo contra presupuesto. Solo sirve para acomodar la gráfica."""
+def build_policy_curve(cfg: dict, n_stations: int) -> pd.DataFrame:
+    """Curva inventada de riesgo contra presupuesto. Solo sirve para acomodar la gráfica.
+
+    `budget` es el total de bicis que se pueden mover en un día: cada valor de
+    presupuestos_por_estacion (bicis por estación por día) por el número de
+    estaciones de la muestra, redondeado al entero.
+
+    Con pocas estaciones, dos valores de la lista pueden dar el mismo total
+    (con 40 estaciones, 0 y 0.01 dan 0 bicis). La llave del contrato es
+    política y presupuesto, así que de cada total queda una sola fila.
+    """
     base = 420.0  # estaciones-hora en riesgo sin mover nada (número inventado)
     # (cuánto baja el riesgo como máximo, qué tan rápido baja). "none" no baja.
-    shape = {"none": (0.0, 1.0), "historical": (0.40, 300.0), "model": (0.60, 200.0)}
+    # La rapidez va en bicis por estación por día, para que la forma de la
+    # curva no dependa de cuántas estaciones tiene la muestra.
+    shape = {"none": (0.0, 1.0), "historical": (0.40, 0.75), "model": (0.60, 0.50)}
+    per_station: dict[int, float] = {}  # total de bicis al día -> bicis por estación por día
+    for value in sorted(cfg["presupuestos_por_estacion"]):
+        per_station.setdefault(presupuesto_en_bicis(value, n_stations), value)
     rows = []
     for policy in POLICIES:
         drop, speed = shape[policy]
-        for budget in sorted(cfg["presupuestos_diarios"]):
+        for budget, value in per_station.items():
             # Con presupuesto 0 las tres políticas dan exactamente `base`.
-            risk = round(base * (1.0 - drop * (1.0 - math.exp(-budget / speed))), 1)
+            risk = round(base * (1.0 - drop * (1.0 - math.exp(-value / speed))), 1)
             rows.append((policy, budget, risk, round(risk * 0.92, 1), round(risk * 1.08, 1)))
-    return pd.DataFrame(rows, columns=["policy", "budget", "risk_station_hours", "ci_low", "ci_high"])
+    frame = pd.DataFrame(rows, columns=["policy", "budget", "risk_station_hours", "ci_low", "ci_high"])
+    assert not frame.duplicated(["policy", "budget"]).any(), "hay presupuestos repetidos en la curva"
+    return frame
 
 
 # --------------------------------------------------------------------------- #
@@ -620,7 +658,7 @@ def build_sample(cfg: dict | None = None) -> dict[str, pd.DataFrame]:
         "station_hour": station_hour,
         "predictions": build_predictions(station_hour, rates, rng["predictions"]),
         "recommendations": build_recommendations(stations, station_hour, cfg, rng["recommendations"]),
-        "policy_curve": build_policy_curve(cfg),
+        "policy_curve": build_policy_curve(cfg, len(stations)),
         "routes": routes,
     }
 
@@ -642,9 +680,25 @@ def _partial_text(station_hour: pd.DataFrame) -> str:
     return ", ".join(notes)
 
 
-def write_leeme(tables: dict[str, pd.DataFrame], out_dir: Path) -> Path:
-    """Escribe el LEEME.md de la carpeta con los conteos reales de cada tabla."""
+def _number_list(values) -> str:
+    """Lista en palabras: "0, 4, 10 y 20"."""
+    values = [str(value) for value in values]
+    return values[0] if len(values) == 1 else ", ".join(values[:-1]) + " y " + values[-1]
+
+
+def write_leeme(tables: dict[str, pd.DataFrame], out_dir: Path, cfg: dict) -> Path:
+    """Escribe el LEEME.md de la carpeta con los conteos reales de cada tabla.
+
+    `cfg` es la configuración de operación con la que se armaron las tablas.
+    """
     stations, station_hour, routes = tables["stations"], tables["station_hour"], tables["routes"]
+    budgets = sorted(tables["policy_curve"]["budget"].unique().tolist())
+    reference_budget = presupuesto_en_bicis(cfg["presupuesto_de_referencia"], len(stations))
+    assert reference_budget in budgets, "el presupuesto de referencia no está en la curva"
+    # Bicis llevadas por día y política (cada bici llevada a una estación se retiró de otra).
+    delivered = tables["recommendations"].query("bikes_to_move > 0")
+    day = delivered["window_start"].dt.tz_localize(None).dt.normalize()
+    moved = delivered.groupby([delivered["policy"], day])["bikes_to_move"].sum()
     file_rows = "\n".join(
         f"| `{CONTRACTS[name].filename}` | {len(table)} | {DESCRIPTIONS[name]} |" for name, table in tables.items()
     )
@@ -658,7 +712,14 @@ def write_leeme(tables: dict[str, pd.DataFrame], out_dir: Path) -> Path:
         routes=len(routes),
         pairs=len(stations) ** 2,
         default_capacity=DEFAULT_CAPACITY,
-        default_occupancy=DEFAULT_OCCUPANCY,
+        default_type=cfg["tipo_si_falta"],
+        per_station=_number_list(cfg["presupuestos_por_estacion"]),
+        stations=len(stations),
+        budgets=_number_list(budgets),
+        reference=cfg["presupuesto_de_referencia"],
+        reference_budget=reference_budget,
+        moved_min=int(moved.min()),
+        moved_max=int(moved.max()),
     )
     path = out_dir / "LEEME.md"
     path.write_text(text, encoding="utf-8")
@@ -691,11 +752,12 @@ def write_sample(out_dir: str | Path = DATA_SAMPLE) -> dict[str, Path]:
     """Genera, guarda y vuelve a validar los seis archivos. Imprime un resumen."""
     out_dir = check_output_folder(out_dir)  # antes de crear o escribir nada
     out_dir.mkdir(parents=True, exist_ok=True)
-    tables = build_sample()
+    cfg = load_operacion()
+    tables = build_sample(cfg)
     paths = {}
     for name, table in tables.items():
         paths[name] = write_contract(table, name, out_dir / CONTRACTS[name].filename)
-    leeme = write_leeme(tables, out_dir)
+    leeme = write_leeme(tables, out_dir, cfg)
 
     # Segunda validación, ya sobre lo que quedó en disco.
     print(f"Datos SINTÉTICOS escritos en {out_dir} (no son resultados):")

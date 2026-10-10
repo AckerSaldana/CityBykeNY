@@ -25,7 +25,7 @@ reales.
 | `station_hour.parquet` | 26414 | Salidas y llegadas por estación y hora, 28 días. Tabla densa: una fila por estación y hora, también las que valen cero, solo entre el primer y el último viaje de cada estación. |
 | `predictions.parquet` | 26468 | Pronóstico por estación y hora de los últimos 14 días, modelos `baseline` y `lgbm`, para las horas que tienen fila en `station_hour`. Las filas `lgbm` son relleno simulado, no un modelo. |
 | `recommendations.parquet` | 1632 | Bicis a mover por estación, franja y política, para los 7 días de test. Números inventados. |
-| `policy_curve.parquet` | 18 | Curva de riesgo contra presupuesto diario, por política. Números inventados para acomodar la gráfica. |
+| `policy_curve.parquet` | 18 | Curva de riesgo contra presupuesto, por política. `budget` es el total de bicis movidas al día. Números inventados para acomodar la gráfica. |
 | `routes.parquet` | 1296 | Viajes entre pares de estaciones, sumados sobre los 28 días. Son viajes de usuarios de una estación a otra, NO rutas de camiones de rebalanceo. |
 
 Las columnas y sus tipos son los de los contratos de `src/contracts.py`. Los
@@ -71,8 +71,9 @@ columnas.
   - En estos datos inventados, las tres políticas empiezan cada franja con el
     mismo inventario: la `ocupacion_respaldo` de esa franja (según el tipo de
     la estación) por su capacidad, redondeado. Es una simplificación de la
-    muestra: cuál de los valores por franja dará el inventario inicial de la
-    simulación real sigue abierto (ver `config/operacion.yaml`).
+    muestra. En la simulación real solo el primer día empieza con la
+    ocupación de respaldo, y ese día es de calentamiento; después cada día
+    empieza con las bicis que dejó el anterior.
   - Con `policy = "none"` no se mueve nada: `start_inventory_target` es ese
     inventario de respaldo.
   - En las otras dos, lo que reciben unas estaciones es lo que entregan
@@ -80,18 +81,33 @@ columnas.
     inventario que busca se inventa aparte.
   - Unas pocas filas tienen `feasible` en falso. En ellas las tres políticas
     se quedan con el inventario de respaldo y `bikes_to_move` es 0.
-  - Donde falta `capacity` se supuso 20. Donde falta `station_type` se
-    supuso una ocupación de respaldo de 0.5.
+  - Donde falta `capacity` se supuso 20. Donde falta `station_type` se usa
+    la estrategia del tipo que dice `tipo_si_falta` en
+    `config/operacion.yaml` (hoy `mixta`).
+  - Los traslados de la muestra no respetan ningún presupuesto ni el reparto
+    por franja (`parte_del_presupuesto`): son inventados. Aquí se llevan
+    entre 202 y 310 bicis al día, según el día y la política; el
+    presupuesto de referencia serían 20. Los reales salen de la
+    simulación con el presupuesto de referencia.
   - Hay filas con los tres niveles de riesgo.
-- `policy_curve.parquet`: una fila por política y presupuesto de
-  `presupuestos_diarios`.
+- `policy_curve.parquet`: una fila por política y presupuesto. `budget` es el
+  total de bicis que se pueden mover en un día. `config/operacion.yaml` da
+  los presupuestos en bicis por estación por día
+  (`presupuestos_por_estacion`: 0, 0.1, 0.25, 0.5, 1.0 y 2.0).
+  Aquí cada uno se multiplica por las 40 estaciones de la muestra y se
+  redondea: 0, 4, 10, 20, 40 y 80.
+  Si dos valores dan el mismo total, queda una sola fila.
+  El presupuesto de referencia (`presupuesto_de_referencia`: 0.5) es
+  la fila con `budget` = 20.
 
 ## Cómo regenerarlos
 
     python scripts/make_sample_data.py
 
-El resultado es siempre el mismo (la semilla es fija). Si cambian las franjas,
-los presupuestos o la `ocupacion_respaldo` en `config/operacion.yaml`, hay que
-volver a correrlo.
+El resultado es siempre el mismo (la semilla es fija). Hay que volver a
+correrlo si en `config/operacion.yaml` cambian las franjas (cuántas son, sus
+nombres o sus horas), `presupuestos_por_estacion`,
+`presupuesto_de_referencia`, `tipo_si_falta` o la `ocupacion_respaldo`.
+Cambiar solo `parte_del_presupuesto` no cambia la muestra.
 
 No edites estos archivos a mano. Este LEEME lo escribe el mismo script.

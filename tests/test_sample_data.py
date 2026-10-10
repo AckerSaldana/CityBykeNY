@@ -4,16 +4,17 @@ Qué revisan:
 
 1. El generador da siempre las mismas tablas (semilla fija).
 2. data/sample es lo que el generador produce HOY. Si alguien cambia el
-   generador, o las franjas, los presupuestos o la ocupacion_respaldo de
-   config/operacion.yaml, y no vuelve a correr el script, la prueba FALLA y
-   dice qué correr.
+   generador, o las franjas, los presupuestos, el presupuesto de referencia,
+   tipo_si_falta o la ocupacion_respaldo de config/operacion.yaml, y no
+   vuelve a correr el script, la prueba FALLA y dice qué correr.
 3. Los datos se distinguen como sintéticos: ids "SIM-..." y nombres
    "Sintética ...".
 4. `feasible` es de la estación y la franja: vale lo mismo en las tres
    políticas.
 5. `ocupacion_respaldo` se usa como quedó decidido: es el inventario con el
    que empiezan las tres políticas y el que queda cuando no hay solución
-   factible. La regla histórica no lo usa.
+   factible. La regla histórica no lo usa. Una estación sin tipo usa la del
+   tipo que dice `tipo_si_falta`.
 6. station_hour es densa (una fila por estación y hora, con ceros, solo entre
    el primer y el último viaje de cada estación) y hay estaciones que no
    cubren todo el periodo.
@@ -21,6 +22,8 @@ Qué revisan:
    salidas y lo que llega suma sus llegadas.
 8. El generador se niega a escribir en data/processed y en data/raw, que son
    solo para datos reales.
+9. En policy_curve, `budget` es el total de bicis al día: cada valor de
+   `presupuestos_por_estacion` por el número de estaciones de la muestra.
 
 Si falla el punto 2, corre:  python scripts/make_sample_data.py
 """
@@ -37,7 +40,6 @@ from src.contracts import CONTRACTS, POLICIES, to_contract_table, validate_table
 from src.data import sample_data
 from src.data.sample_data import (
     DEFAULT_CAPACITY,
-    DEFAULT_OCCUPANCY,
     DST_DAY,
     END,
     START,
@@ -96,7 +98,8 @@ def _fail_if_outdated(folder: Path, tmp_path: Path) -> None:
     if outdated:
         pytest.fail(
             f"data/sample está desactualizado. Ya no coinciden con lo que produce el generador: {outdated}.\n"
-            "Cambió src/data/sample_data.py, o cambiaron las franjas o los presupuestos de config/operacion.yaml.\n"
+            "Cambió src/data/sample_data.py, o cambiaron las franjas, los presupuestos, el presupuesto de "
+            "referencia, tipo_si_falta o la ocupacion_respaldo de config/operacion.yaml.\n"
             f"Para regenerarlos: {COMMAND}",
             pytrace=False,
         )
@@ -116,11 +119,24 @@ def _changed_config(change) -> dict:
 
 
 def _one_more_budget(cfg: dict) -> None:
-    cfg["presupuestos_diarios"] = [*cfg["presupuestos_diarios"], max(cfg["presupuestos_diarios"]) + 123]
+    """Agrega un presupuesto mayor que todos (en bicis por estación por día)."""
+    budgets = cfg["presupuestos_por_estacion"]
+    cfg["presupuestos_por_estacion"] = [*budgets, max(budgets) + 1.5]
+
+
+def _another_reference(cfg: dict) -> None:
+    """Pone como referencia otro presupuesto de la lista. Si no hay otro mayor que 0, agrega uno."""
+    budgets = cfg["presupuestos_por_estacion"]
+    others = [value for value in budgets if value > 0 and value != cfg["presupuesto_de_referencia"]]
+    if not others:
+        others = [max(budgets) + 1.5]
+        cfg["presupuestos_por_estacion"] = [*budgets, *others]
+    cfg["presupuesto_de_referencia"] = others[-1]
 
 
 def _one_window_less(cfg: dict) -> None:
-    assert len(cfg["franjas"]) >= 2, "la prueba necesita al menos dos franjas en config/operacion.yaml"
+    if len(cfg["franjas"]) < 2:
+        pytest.skip("config/operacion.yaml tiene una sola franja: no se puede quitar otra")
     cfg["franjas"] = cfg["franjas"][:-1]
 
 
@@ -131,12 +147,31 @@ def _another_fallback(cfg: dict) -> None:
             rule["ocupacion_respaldo"][window] = 0.9 if value < 0.5 else 0.1
 
 
+def _another_default_type(cfg: dict) -> None:
+    """Cambia tipo_si_falta a otro tipo, con una ocupacion_respaldo lejos de la que hoy usan las estaciones sin tipo."""
+    rules = cfg["estrategia_por_tipo"]
+    today = rules[cfg["tipo_si_falta"]]["ocupacion_respaldo"]
+    other = next(kind for kind in rules if kind != cfg["tipo_si_falta"])
+    rules[other]["ocupacion_respaldo"] = {window: 0.9 if value < 0.5 else 0.1 for window, value in today.items()}
+    cfg["tipo_si_falta"] = other
+
+
+def _another_split(cfg: dict) -> None:
+    """Pasa la mitad de la parte del presupuesto de la primera franja a la última. Siguen sumando lo mismo."""
+    first, last = cfg["franjas"][0], cfg["franjas"][-1]
+    half = first["parte_del_presupuesto"] / 2
+    first["parte_del_presupuesto"] -= half
+    last["parte_del_presupuesto"] += half
+
+
 @pytest.mark.parametrize(
     "change, stale_file",
     [
         pytest.param(_one_more_budget, "policy_curve.parquet", id="un presupuesto más"),
+        pytest.param(_another_reference, "LEEME.md", id="otro presupuesto de referencia"),
         pytest.param(_one_window_less, "recommendations.parquet", id="una franja menos"),
         pytest.param(_another_fallback, "recommendations.parquet", id="otra ocupación de respaldo"),
+        pytest.param(_another_default_type, "recommendations.parquet", id="otro tipo para las estaciones sin tipo"),
     ],
 )
 def test_si_cambia_operacion_yaml_y_no_se_regenera_la_prueba_falla(change, stale_file, tmp_path, monkeypatch):
@@ -148,6 +183,16 @@ def test_si_cambia_operacion_yaml_y_no_se_regenera_la_prueba_falla(change, stale
     message = str(failure.value)
     assert stale_file in message
     assert f"Para regenerarlos: {COMMAND}" in message
+
+
+def test_cambiar_solo_el_reparto_del_presupuesto_no_obliga_a_regenerar(tmp_path, monkeypatch):
+    """La muestra no usa parte_del_presupuesto (lo dice su LEEME): con otro reparto sale idéntica."""
+    if len(load_operacion()["franjas"]) < 2:
+        pytest.skip("config/operacion.yaml tiene una sola franja: no hay reparto que cambiar")
+    cfg = _changed_config(_another_split)
+    assert cfg != load_operacion()
+    monkeypatch.setattr(sample_data, "load_operacion", lambda: cfg)
+    _fail_if_outdated(DATA_SAMPLE, tmp_path)
 
 
 def test_si_cambia_el_generador_y_no_se_regenera_la_prueba_falla(tmp_path, monkeypatch):
@@ -207,8 +252,9 @@ def _fallback_inventory(tables: dict[str, pd.DataFrame], cfg: dict) -> pd.Series
     """Inventario de respaldo de cada fila de recommendations, calculado aquí aparte.
 
     Es la ocupacion_respaldo de la franja (según el tipo de la estación) por la
-    capacidad, redondeado. Sin capacidad o sin tipo se usan los valores que el
-    generador supone y que el LEEME de la muestra declara.
+    capacidad, redondeado. Sin capacidad se usa la que el generador supone y
+    el LEEME de la muestra declara. Sin tipo se usa la estrategia del tipo que
+    dice tipo_si_falta.
     """
     stations = tables["stations"].set_index("station_id")
     recommendations = tables["recommendations"]
@@ -218,9 +264,8 @@ def _fallback_inventory(tables: dict[str, pd.DataFrame], cfg: dict) -> pd.Series
     kind = recommendations["station_id"].map(stations["station_type"])
     capacity = recommendations["station_id"].map(stations["capacity"]).fillna(DEFAULT_CAPACITY).astype(int)
     rules = cfg["estrategia_por_tipo"]
-    occupancy = [
-        rules[k]["ocupacion_respaldo"][w] if isinstance(k, str) else DEFAULT_OCCUPANCY for k, w in zip(kind, window)
-    ]
+    kind = kind.where(kind.notna(), cfg["tipo_si_falta"])
+    occupancy = [rules[k]["ocupacion_respaldo"][w] for k, w in zip(kind, window)]
     return pd.Series(np.rint(capacity * occupancy).astype(int), index=recommendations.index)
 
 
@@ -253,6 +298,21 @@ def test_el_inventario_de_respaldo_sale_del_yaml_y_no_del_codigo(tables):
     _assert_fallback_is_used_as_decided(changed, cfg)
     original, moved = _fallback_inventory(tables, load_operacion()), _fallback_inventory(changed, cfg)
     assert len(original) == len(moved) and (original != moved).mean() > 0.8
+
+
+def test_una_estacion_sin_tipo_usa_la_estrategia_de_tipo_si_falta(tables):
+    """Con otro tipo_si_falta, el inventario inicial de las estaciones sin tipo cambia con él."""
+    cfg = _changed_config(_another_default_type)
+    assert cfg["tipo_si_falta"] != load_operacion()["tipo_si_falta"]
+    changed = build_sample(cfg)
+    _assert_fallback_is_used_as_decided(changed, cfg)
+
+    stations = tables["stations"]
+    untyped = stations.loc[stations["station_type"].isna(), "station_id"]
+    assert len(untyped) >= 2, "la muestra debe traer estaciones sin tipo"
+    rows = tables["recommendations"]["station_id"].isin(untyped)
+    original, moved = _fallback_inventory(tables, load_operacion()), _fallback_inventory(changed, cfg)
+    assert rows.sum() > 20 and (original[rows] != moved[rows]).all()
 
 
 def test_la_regla_historica_no_busca_el_inventario_de_respaldo(tables):
@@ -478,3 +538,44 @@ def test_tampoco_escribe_dentro_de_esas_carpetas_ni_llegando_por_otra_ruta(tmp_p
     # Cualquier otra carpeta se acepta, también una vecina de nombre parecido.
     for out_dir in (tmp_path / "salida", tmp_path / "data" / "sample", tmp_path / "data" / "processed_copia"):
         assert check_output_folder(out_dir) == out_dir
+
+
+# --------------------------------------------------------------------------- #
+# 9) policy_curve: el presupuesto va en bicis totales al día
+# --------------------------------------------------------------------------- #
+
+def test_policy_curve_lleva_el_presupuesto_en_bicis_totales_al_dia(tables):
+    """`budget` es cada valor de presupuestos_por_estacion por el número de estaciones, redondeado."""
+    cfg = load_operacion()
+    curve, n_stations = tables["policy_curve"], len(tables["stations"])
+    expected = sorted({round(value * n_stations) for value in cfg["presupuestos_por_estacion"]})
+    assert set(curve["policy"]) == set(POLICIES)
+    for policy in POLICIES:
+        assert curve.loc[curve["policy"] == policy, "budget"].tolist() == expected, policy
+    assert pd.api.types.is_integer_dtype(curve["budget"])
+    # El presupuesto de referencia tiene su fila: es el de las recomendaciones.
+    assert round(cfg["presupuesto_de_referencia"] * n_stations) in expected
+
+    # La forma inventada sigue siendo creíble: sin intervención no cambia, y con
+    # más presupuesto el riesgo de las otras dos políticas no sube.
+    risk = curve.pivot(index="budget", columns="policy", values="risk_station_hours")
+    assert risk["none"].nunique() == 1
+    for policy in ("historical", "model"):
+        assert risk[policy].is_monotonic_decreasing, policy
+    if len(expected) > 1:
+        assert risk["model"].iloc[-1] < risk["historical"].iloc[-1] < risk["none"].iloc[-1]
+    if min(cfg["presupuestos_por_estacion"]) == 0:  # sin presupuesto las tres políticas son la misma
+        assert risk.loc[0].nunique() == 1
+
+
+def test_dos_presupuestos_que_dan_las_mismas_bicis_dejan_una_sola_fila():
+    """Con 40 estaciones, 0.001 bicis por estación son 0 bicis: el contrato no admite dos filas con budget 0."""
+    cfg = copy.deepcopy(load_operacion())
+    cfg["presupuestos_por_estacion"] = [0, 0.001, 0.002, 0.5, 0.501, 2.0]
+    curve = sample_data.build_policy_curve(cfg, 40)
+    assert validate_table(to_contract_table(curve, "policy_curve"), "policy_curve") == []
+    for policy in POLICIES:
+        assert curve.loc[curve["policy"] == policy, "budget"].tolist() == [0, 20, 80], policy
+    # Con muchas estaciones los mismos valores ya no chocan.
+    many = sample_data.build_policy_curve(cfg, 2000)
+    assert many.loc[many["policy"] == "model", "budget"].tolist() == [0, 2, 4, 1000, 1002, 4000]

@@ -12,12 +12,14 @@
 #  cambia aquí los valores y al final pon  estado: confirmado  con tu nombre
 #  y la fecha.
 #
-#  El simulador leerá TODO de este archivo (todavía no existe; hoy solo lo usan
-#  los datos de muestra): no habrá números de operación escritos en el código.
-#  Cambiar un valor aquí cambiará el resultado de la simulación.
+#  El simulador lee TODO de este archivo, igual que los datos de muestra: no
+#  hay números de operación escritos en el código. Cambiar un valor aquí
+#  cambia el resultado de la simulación.
 #
 #  Después de editar, comprueba que el archivo sigue siendo válido con:
 #      pytest tests/test_operacion_config.py
+#
+#  Los decimales van con punto (0.5), nunca con coma (0,5).
 # =============================================================================
 
 estado: provisional        # provisional | confirmado
@@ -31,15 +33,29 @@ fecha_confirmacion: null   # AAAA-MM-DD
 # la hora a la que los camiones ya dejaron las estaciones listas para esa
 # franja. Horas en formato "HH:MM", hora local de Nueva York.
 # Reglas: momento_intervencion <= inicio < fin, y las franjas no se enciman.
+#
+# parte_del_presupuesto: qué parte del presupuesto del día le toca a la franja
+#   (el presupuesto del día sale de la pregunta 3). Es una fracción, sin
+#   unidad: 0.5 es la mitad, 0.6 es el 60 %. Cada una debe ser mayor que 0 y
+#   las de todas las franjas deben sumar 1.
+#   Lo que una franja no usa pasa a la siguiente franja del MISMO día. Lo que
+#   sobra al terminar el día se pierde: nunca pasa al día siguiente.
+#   Ejemplo: con 1,158 bicis al día y 0.5 en cada franja, la mañana puede
+#   mover hasta 579. Si mueve 500, la tarde puede mover hasta 579 + 79 = 658.
+#   Las bicis no se parten: si el total del día es impar y cada franja tiene
+#   0.5, la bici que sobra va a la franja que interviene primero (579 bicis
+#   se reparten en 290 y 289).
 franjas:
   - nombre: manana                 # PROVISIONAL
     momento_intervencion: "05:00"  # PROVISIONAL
     inicio: "06:00"                # PROVISIONAL
     fin: "12:00"                   # PROVISIONAL
+    parte_del_presupuesto: 0.5     # PROVISIONAL
   - nombre: tarde                  # PROVISIONAL
     momento_intervencion: "14:00"  # PROVISIONAL
     inicio: "15:00"                # PROVISIONAL
     fin: "21:00"                   # PROVISIONAL
+    parte_del_presupuesto: 0.5     # PROVISIONAL
 
 # -----------------------------------------------------------------------------
 # Pregunta 2. Umbral de riesgo
@@ -47,23 +63,54 @@ franjas:
 # Una estación está "en riesgo" en una hora si le quedan MENOS bicis que
 # bicis_minimas (riesgo de vaciarse) o MENOS lugares libres que
 # lugares_libres_minimos (riesgo de llenarse).
+# Reglas: enteros, de 1 en adelante. Con 0 ninguna estación contaría como en
+# riesgo, porque nunca hay menos de 0. Para contar solo "vacía" o "llena",
+# escribe 1.
 umbral_riesgo:
   bicis_minimas: 2                 # PROVISIONAL
   lugares_libres_minimos: 2        # PROVISIONAL
 
 # -----------------------------------------------------------------------------
-# Pregunta 3. Presupuestos diarios para la curva
+# Pregunta 3. Presupuestos para la curva, en bicis por estación por día
 # -----------------------------------------------------------------------------
-# Total de bicis que la operación puede trasladar en un día. Se simulará cada
-# valor de la lista para dibujar la curva "riesgo contra presupuesto".
-# El 0 sirve de referencia (equivale a no intervenir).
-presupuestos_diarios: [0, 50, 100, 200, 400, 800]   # PROVISIONAL
+# presupuestos_por_estacion: cuántas bicis puede trasladar la operación en un
+#   día, repartidas entre el número de estaciones.
+#   Unidad: bicis movidas por estación por día. NO es el total del día: el
+#   simulador multiplica cada valor por el número de estaciones que simula y
+#   redondea a la bici entera más cercana (si queda justo en medio, va al
+#   número par).
+#   Hoy se simulan 2,315 estaciones (corrida del 10 de octubre de 2026). Ese
+#   número puede cambiar cuando se reconstruyen las tablas.
+#   Ejemplo: 0.5 con 2,315 estaciones da 1,157.5, que queda en 1,158 bicis
+#   movidas al día.
+#   Con 2,315 estaciones, la lista provisional 0 / 0.1 / 0.25 / 0.5 / 1.0 /
+#   2.0 da 0 / 232 / 579 / 1,158 / 2,315 / 4,630 bicis al día.
+#   Ejemplo: 1.0 es, en promedio, una bici movida por cada estación al día.
+#   Se escribe por estación porque el número de estaciones simuladas puede
+#   cambiar (quedan fuera las que no tienen capacidad y las inactivas). Así el
+#   esfuerzo sigue siendo comparable aunque cambie ese número.
+#   Se simula cada valor de la lista para dibujar la curva "riesgo contra
+#   presupuesto". El 0 sirve de referencia (equivale a no intervenir).
+#   Reglas: de menor a mayor, sin repetir y con punto decimal. Dentro de la
+#   lista la coma separa valores: 0,5 se leería como dos valores (0 y 5).
+presupuestos_por_estacion: [0, 0.1, 0.25, 0.5, 1.0, 2.0]   # PROVISIONAL
+
+# presupuesto_de_referencia: el valor de la lista de arriba con el que se
+#   calculan las recomendaciones del dashboard (cuántas bicis llevar o retirar
+#   en cada estación). Los demás valores solo se usan para la curva.
+#   Unidad: bicis movidas por estación por día, igual que la lista.
+#   Ejemplo: 0.5 con 2,315 estaciones son 1,158 bicis movidas al día.
+#   Reglas: debe ser uno de los valores de la lista y mayor que 0.
+presupuesto_de_referencia: 0.5     # PROVISIONAL
 
 # -----------------------------------------------------------------------------
 # Pregunta 4. Distancia máxima entre la estación que dona y la que recibe
 # -----------------------------------------------------------------------------
 # En kilómetros, en línea recta. Un traslado entre dos estaciones más lejanas
 # que esto no se permite.
+# Limitación: la línea recta no sabe de ríos ni de puentes. Dos estaciones con
+# un río en medio pueden quedar dentro de esta distancia aunque el camión
+# tenga que rodear.
 distancia_maxima_km: 3.0           # PROVISIONAL
 
 # -----------------------------------------------------------------------------
@@ -76,6 +123,12 @@ distancia_maxima_km: 3.0           # PROVISIONAL
 #   1. Es el inventario inicial común de las tres políticas (sin intervención,
 #      regla histórica y modelo predictivo): las tres empiezan con las mismas
 #      bicis en cada estación, para compararlas desde el mismo punto.
+#      Solo el primer día de la simulación empieza así. Ese día es de
+#      calentamiento y no cuenta en los resultados. Después cada día empieza
+#      con las bicis que dejó el día anterior.
+#      OJO: el calentamiento no quita la dependencia de este valor. Fija con
+#      cuántas bicis arranca la red, y el nivel de riesgo simulado y el riesgo
+#      simulado evitado cambian con él.
 #   2. Es el valor que se usa cuando ningún inventario inicial evita a la vez
 #      que la estación se vacíe y se llene.
 #   La regla histórica no usa este valor para decidir.
@@ -106,3 +159,14 @@ estrategia_por_tipo:
     ocupacion_respaldo:
       manana: 0.50                 # PROVISIONAL
       tarde: 0.50                  # PROVISIONAL
+
+# tipo_si_falta: qué tipo de arriba se le aplica a una estación que no tiene
+#   tipo. La estación usa la prioridad y la ocupacion_respaldo de ese tipo.
+#   Sin unidad: es uno de los cuatro nombres de arriba (oficinas, residencial,
+#   recreativa, mixta), en minúsculas.
+#   OJO: hoy NINGUNA estación tiene tipo, porque faltan los umbrales para
+#   clasificarlas (ver "Pendientes" en docs/reglas_operacion.md). Mientras
+#   falten, este valor decide la estrategia de TODAS las estaciones.
+#   Ejemplo: con mixta, las estaciones sin tipo usan la prioridad y la
+#   ocupacion_respaldo del bloque "mixta"; los otros tres bloques no se usan.
+tipo_si_falta: mixta               # PROVISIONAL
