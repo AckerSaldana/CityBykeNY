@@ -18,6 +18,7 @@ Reglas para las páginas:
 - Cada página empieza con `datos.encabezado("Título")`. Las páginas que solo
   describen viajes (mapa, estaciones y rutas, contexto) usan
   `datos.encabezado("Título", "viajes")`.
+  Inicio usa `datos.encabezado("Título", "inicio")`.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import streamlit as st
 CARPETA = Path(__file__).resolve().parents[1] / "data" / "processed" / "app"
 
 LINEA = "Resultados de simulación con datos de validación"
+LINEA_INICIO = "Resultados de simulación: validación y prueba final"  # Inicio, cuando ya hay prueba final
 LINEA_VIAJES = "Viajes reales"
 SIN_DATO = "Sin dato"
 CONSTRUIR = "python scripts/build_app_tables.py"
@@ -55,11 +57,15 @@ BLOQUES = {"madrugada": "Madrugada (00 a 05)", "manana": "Mañana (06 a 11)",
 VOLUMENES = {"bajo": "Demanda baja", "medio": "Demanda media", "alto": "Demanda alta"}
 CAUSAS = {"pocas_bicis": "Casi vacía", "pocos_lugares": "Casi llena"}
 OBJETIVOS = {"salidas": "Salidas", "llegadas": "Llegadas"}
+RONDAS = {"nocturna": "ronda nocturna", "mediodia": "ronda de mediodía"}
+AZAR = "Mover al azar"
+PERIODOS = {"validacion": "validación", "prueba": "la prueba final"}
 
 # Colores fijos para que las cinco páginas se vean iguales.
 COLORES_POLITICA = {"none": "#8A8F98", "historical": "#E69F00", "model": "#0072B2"}
 COLORES_RIESGO = {"alto": "#D55E00", "medio": "#E69F00", "bajo": "#009E73"}
 COLORES_MODELO = {"baseline": "#E69F00", "lgbm": "#0072B2"}
+COLOR_AZAR = "#CC79A7"
 COLOR_OBSERVADO = "#222222"
 COLOR_SE_VACIA = "#D55E00"  # flujo neto negativo: salen más bicis de las que llegan
 COLOR_SE_LLENA = "#0072B2"  # flujo neto positivo: llegan más de las que salen
@@ -133,8 +139,12 @@ def fecha(d, con_dia: bool = True) -> str:
     return f"{_DIAS[d.weekday()]} {base}" if con_dia else base
 
 
-def accion(bicis, hora_inicio=None) -> str:
-    """Texto de la tarjeta de acción: "Llevar 5 bicis antes de las 06:00"."""
+def accion(bicis, hora_inicio=None, ronda: dict | None = None) -> str:
+    """Texto de la tarjeta de acción: "Llevar 5 bicis en la ronda nocturna (lista a las 05:00)".
+
+    `ronda` es una entrada de `rondas()`: {"nombre", "hora"}. Sin ella (la simulación no
+    reportó el momento de intervención) queda "Llevar 5 bicis antes de las 06:00".
+    """
     if _falta(bicis):
         return SIN_DATO
     bicis = int(bicis)
@@ -142,7 +152,10 @@ def accion(bicis, hora_inicio=None) -> str:
         return "Sin traslado"
     verbo = "Llevar" if bicis > 0 else "Retirar"
     unidad = "bici" if abs(bicis) == 1 else "bicis"
-    cuando = "" if _falta(hora_inicio) else f" antes de las {hora(hora_inicio)}"
+    if ronda and ronda.get("nombre") and not _falta(ronda.get("hora")):
+        cuando = f" en la {ronda['nombre']} (lista a las {hora(ronda['hora'])})"
+    else:
+        cuando = "" if _falta(hora_inicio) else f" antes de las {hora(hora_inicio)}"
     return f"{verbo} {num(abs(bicis))} {unidad}{cuando}"
 
 
@@ -314,8 +327,18 @@ def estacion_de_ejemplo() -> dict:
     """La estación y el día con que abre "Pronóstico por estación":
     {"estacion_id", "fecha"}. La elige el constructor de las tablas con una regla
     fija (oficinas, demanda alta, traslado en todas las franjas y con solución,
-    en día laborable); si ninguna cumple, es la estación con más salidas."""
+    en día laborable; de esos días, el de error de pronóstico más típico de la
+    estación); si ninguna cumple, es la estación con más salidas."""
     return indicadores().get("estacion_de_ejemplo") or {}
+
+
+def rondas() -> dict:
+    """En qué ronda se hace el traslado de cada franja: {franja: {"nombre", "hora"}}.
+    La primera intervención del día es la ronda nocturna y la otra, la de mediodía;
+    la hora es el momento de intervención que reportó la simulación. Vacío si no lo reportó."""
+    franjas = (indicadores().get("simulacion") or {}).get("franjas") or []
+    return {f.get("nombre"): {"nombre": RONDAS[f["ronda"]], "hora": f.get("hora_intervencion")}
+            for f in franjas if f.get("ronda") in RONDAS and not _falta(f.get("hora_intervencion"))}
 
 
 def inventario(antes, despues) -> str:
@@ -398,33 +421,81 @@ def limitaciones(n: int = 6) -> list[str]:
     return ([inicial + ".", atendida] + resto)[:n]
 
 
+# Las filas de la comparación de Inicio, en orden: clave del archivo, texto en pantalla y unidad
+# (None deja la del archivo). Las demás filas del archivo no se muestran.
+FILAS_DE_COMPARACION = [
+    ("pct_evitado_historica", "Riesgo simulado evitado con la regla histórica", None),
+    ("pct_evitado_modelo", "Riesgo simulado evitado con el modelo", None),
+    ("pct_evitado_azar", "Riesgo simulado evitado moviendo las mismas bicis al azar", None),
+    ("ganancia_pct_al_duplicar_historica", "Puntos extra de riesgo simulado evitado {subir}, regla histórica", "puntos"),
+    ("bloqueados_sin_intervencion", "Viajes bloqueados por día en la simulación, sin intervención", None),
+    ("bloqueados_historica", "Viajes bloqueados por día en la simulación, con la regla histórica", None),
+    ("wape_promedio_historico", "Error del pronóstico de salidas, promedio histórico", None),
+    ("wape_modelo", "Error del pronóstico de salidas, modelo (LightGBM)", None),
+]
+
+
+def _casi_el_doble(factor) -> bool:
+    return not _falta(factor) and 1.7 <= float(factor) < 2
+
+
+def _subir_el_presupuesto(ind: dict) -> str:
+    """ "al casi duplicar el presupuesto", si el que sigue al de referencia es casi el doble."""
+    factor = ((ind.get("referencia") or {}).get("siguiente") or {}).get("factor")
+    return "al casi duplicar el presupuesto" if _casi_el_doble(factor) else "al pasar al siguiente presupuesto"
+
+
+def _filas_de_prueba(ind: dict) -> dict:
+    """Las filas de validación y prueba final, crudas, por su clave ({} si no hay archivo)."""
+    return {f.get("clave"): f for f in (ind.get("validacion_y_prueba") or {}).get("filas") or [] if f.get("clave")}
+
+
 def validacion_y_prueba() -> dict:
     """Validación y prueba final lado a lado: {"presupuesto": bicis o None,
-    "filas": [{"afirmacion", "validacion", "prueba"}]} con los valores ya
-    escritos según su unidad. Sin el archivo de la prueba final, "filas" va vacía."""
-    crudo = indicadores().get("validacion_y_prueba") or {}
+    "presupuestos": {"validacion", "prueba"}, "filas": [{"afirmacion", "validacion",
+    "prueba"}]} con los valores ya escritos según su unidad. Solo las filas de
+    FILAS_DE_COMPARACION, en ese orden. Sin el archivo de la prueba final, "filas" va vacía."""
+    ind = indicadores()
+    crudo = ind.get("validacion_y_prueba") or {}
 
     def escribir(valor, intervalo, unidad) -> str:
         def uno(x, decimales_pct=1):
             if unidad == "pct":
                 return pct(x, decimales_pct)
+            if unidad == "puntos":  # diferencia entre dos porcentajes
+                return SIN_DATO if _falta(x) else num(float(x) * 100, 1)
             if unidad in ("horas", "viajes"):
                 return num(x)
             return num(x, 0 if not _falta(x) and float(x) == int(float(x)) else 1)
         texto_valor = uno(valor)
         if texto_valor == SIN_DATO:
             return SIN_DATO
-        if unidad in ("horas", "viajes"):
+        if unidad in ("horas", "viajes", "puntos"):
             texto_valor += f" {unidad}"
         if intervalo and not any(_falta(x) for x in intervalo):
             texto_valor += f" ({uno(intervalo[0])} a {uno(intervalo[1])})"
         return texto_valor
 
-    filas = [{"afirmacion": texto(f.get("afirmacion")),
-              "validacion": escribir(f.get("validacion"), f.get("validacion_ic"), f.get("unidad")),
-              "prueba": escribir(f.get("prueba"), f.get("prueba_ic"), f.get("unidad"))}
-             for f in crudo.get("filas") or []]
-    return {"presupuesto": crudo.get("presupuesto_de_referencia"), "filas": filas}
+    por_clave = _filas_de_prueba(ind)
+    filas = []
+    for clave, afirmacion, unidad in FILAS_DE_COMPARACION:
+        f = por_clave.get(clave)
+        if f is None:
+            continue
+        unidad = unidad or f.get("unidad")
+        filas.append({"afirmacion": afirmacion.format(subir=_subir_el_presupuesto(ind)),
+                      "validacion": escribir(f.get("validacion"), f.get("validacion_ic"), unidad),
+                      "prueba": escribir(f.get("prueba"), f.get("prueba_ic"), unidad)})
+    return {"presupuesto": crudo.get("presupuesto_de_referencia"),
+            "presupuestos": crudo.get("presupuestos") or {}, "filas": filas}
+
+
+def hay_prueba_final() -> bool:
+    """Si ya se construyó la comparación de validación contra prueba final."""
+    try:
+        return bool(validacion_y_prueba()["filas"])
+    except FileNotFoundError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -456,10 +527,16 @@ def meses_de_historia() -> str:
     return periodo_en_meses(inicio, pd.Timestamp(corte) - pd.Timedelta(days=1))
 
 
+def _filas_validas(ind: dict) -> bool:
+    claves = _filas_de_prueba(ind)
+    return any(clave in claves for clave, _, _ in FILAS_DE_COMPARACION)
+
+
 def linea_discreta(clase: str = "simulacion") -> str:
     """La única nota de contexto que lleva cada página.
 
     "simulacion": páginas con resultados de la simulación o del pronóstico.
+    "inicio": la página de inicio; cuando ya hay prueba final, lo dice.
     "viajes": páginas que solo describen los viajes del periodo analizado.
     """
     try:
@@ -467,7 +544,7 @@ def linea_discreta(clase: str = "simulacion") -> str:
     except FileNotFoundError:
         ind = {}
     sinteticos = ind.get("sinteticos")
-    linea = LINEA
+    linea = LINEA_INICIO if clase == "inicio" and _filas_validas(ind) else LINEA
     if clase == "viajes":
         periodo = ind.get("periodo") or {}
         meses = periodo_en_meses(periodo.get("inicio"), periodo.get("fin"))
@@ -495,53 +572,167 @@ def _hallazgo_de_contexto(ind: dict) -> str:
             "sale del patrón de uso y los datos del Censo lo confirman por separado.")
 
 
-def hallazgos() -> list[str]:
-    """Los cuatro hallazgos de la página de inicio, armados con las cifras."""
+def _veredicto(valor, intervalo) -> str | None:
+    """De la diferencia de riesgo "modelo menos regla histórica" y su intervalo: "mas" (el
+    modelo evita más: todo el intervalo es negativo), "menos" o "igual" (el intervalo incluye
+    el cero). Sin intervalo no se puede decir: None."""
+    if _falta(valor) or not intervalo or any(_falta(x) for x in intervalo):
+        return None
+    bajo, alto = sorted(float(x) for x in intervalo)
+    return "mas" if alto < 0 else "menos" if bajo > 0 else "igual"
+
+
+def modelo_contra_regla(ind: dict | None = None) -> dict:
+    """¿El modelo evita más riesgo simulado que la regla histórica?
+
+    {"referencia": {periodo: veredicto}, "mitad": {periodo: veredicto}} con los periodos
+    ("validacion", "prueba") de los que hay dato y veredicto "mas", "menos" o "igual".
+    "mitad" es con la mitad del presupuesto de referencia. Sale de la diferencia entre las dos
+    políticas y su intervalo (archivo de validación y prueba final); en validación, si no hay
+    archivo, de si se traslapan las bandas de la curva.
+    """
+    ind = indicadores() if ind is None else ind
+    filas = _filas_de_prueba(ind)
+    comp = ind.get("comparacion") or {}
+    presupuesto = (ind.get("referencia") or {}).get("presupuesto")
+    prefijo = "diferencia_modelo_menos_historica_"
+    en_ref = filas.get(prefijo + "referencia") or {}
+    en_mitad = {}
+    for clave, f in filas.items():  # la fila de la mitad lleva el presupuesto en la clave
+        resto = clave[len(prefijo):] if clave.startswith(prefijo) else ""
+        if resto.isdigit() and presupuesto and 0.4 <= int(resto) / presupuesto <= 0.6:
+            en_mitad = f
+    de_la_curva = {"referencia": comp.get("modelo_evita"), "mitad": (comp.get("mitad") or {}).get("modelo_evita")}
+    resultado = {}
+    for nombre, fila in (("referencia", en_ref), ("mitad", en_mitad)):
+        por_periodo = {}
+        validacion = _veredicto(fila.get("validacion"), fila.get("validacion_ic")) or de_la_curva[nombre]
+        if validacion:
+            por_periodo["validacion"] = validacion
+        prueba = _veredicto(fila.get("prueba"), fila.get("prueba_ic"))
+        if prueba and validacion:
+            por_periodo["prueba"] = prueba
+        resultado[nombre] = por_periodo
+    return resultado
+
+
+def _donde(periodos: list[str], negado: bool = False) -> str:
+    """ "en validación", "en los dos periodos" o "en ninguno de los dos periodos"."""
+    if len(periodos) == 1:
+        return f"en {PERIODOS[periodos[0]]}"
+    return "en ninguno de los dos periodos" if negado else "en los dos periodos"
+
+
+def frase_de_la_curva() -> str:
+    """La frase bajo la curva de Inicio (validación). Vacía si no hay nada que decir."""
     ind = indicadores()
-    ref = ind["referencia"]
-    hist = ref["politicas"].get("historical") or {}
-    modelo = ref["politicas"].get("model") or {}
+    historica, modelo = POLITICAS["historical"], POLITICAS["model"]
+    politicas = (ind.get("referencia") or {}).get("politicas") or {}
+    if not (politicas.get("historical") and politicas.get("model")):
+        return ""
+    veredictos = modelo_contra_regla(ind)
+    en_ref, en_mitad = veredictos["referencia"].get("validacion"), veredictos["mitad"].get("validacion")
+    if en_ref == "igual" and en_mitad == "mas":
+        return (f"Con el presupuesto de referencia, {historica} y {modelo} dan casi lo mismo; "
+                f"con la mitad, el {modelo.lower()} evita más riesgo simulado.")
+    if en_ref == "igual":
+        return f"Las líneas de {historica} y {modelo} se enciman: su resultado es casi el mismo."
+    a, b = politicas["historical"].get("pct_evitado"), politicas["model"].get("pct_evitado")
+    if _falta(a) or _falta(b):
+        return ""
+    return (f"Con el presupuesto de referencia, la {historica.lower()} evita {pct(a)} del riesgo simulado "
+            f"y el {modelo.lower()}, {pct(b)}.")
+
+
+def _hallazgo_del_riesgo(ind: dict) -> str:
+    """1. Cuánto riesgo simulado evita planear con presupuesto, y contra mover al azar."""
+    ref = ind.get("referencia") or {}
+    politicas = ref.get("politicas") or {}
+    clave = next((p for p in ("historical", "model") if politicas.get(p)), None)
     presupuesto = ref.get("presupuesto")
-
-    # 1. Cuánto riesgo evita planear con presupuesto.
-    # El mismo rango que el indicador de la página: el de la regla histórica (si no se simuló, el del modelo).
-    por_politica = ind["sensibilidad"]["rango"]
-    rangos = [r for r in (por_politica.get("historical") or por_politica.get("model"),) if r]
-    if presupuesto is None or not (hist or modelo):
-        uno = f"Riesgo simulado evitado al planear con presupuesto: {SIN_DATO}."
-    elif rangos:
-        bajo, alto = min(r["pct_min"] for r in rangos), max(r["pct_max"] for r in rangos)
-        uno = (f"Planear los traslados con {num(presupuesto)} bicis al día evita entre "
-               f"{rango_pct(bajo, alto).replace(' a ', ' y ')} del riesgo simulado, según el inventario "
-               "inicial que se suponga.")
+    validacion = (politicas.get(clave) or {}).get("pct_evitado")
+    if presupuesto is None or _falta(validacion):
+        return f"Riesgo simulado evitado al planear con presupuesto: {SIN_DATO}."
+    filas = _filas_de_prueba(ind)
+    prueba = (filas.get({"historical": "pct_evitado_historica", "model": "pct_evitado_modelo"}[clave]) or {}).get("prueba")
+    evitado = {"validacion": validacion, **({} if _falta(prueba) else {"prueba": prueba})}
+    al_azar = {"validacion": (ind.get("piso_de_azar") or {}).get("pct_evitado"),
+               "prueba": (filas.get("pct_evitado_azar") or {}).get("prueba")}
+    cifras = " y ".join(f"{pct(v)} en {PERIODOS[p]}" for p, v in evitado.items())
+    if len(evitado) == 2:
+        frase = f"Planear los traslados con el presupuesto de referencia ({num(presupuesto)} bicis al día en validación) evita "
+        frase += (f"más de la mitad del riesgo simulado en los dos periodos: {cifras}"
+                  if min(evitado.values()) > 0.5 else f"{cifras.replace(' en ', ' del riesgo simulado en ', 1)}")
     else:
-        mejor = max((p for p in (hist, modelo) if p), key=lambda p: p["pct_evitado"] or 0)
-        uno = (f"Planear los traslados con {num(presupuesto)} bicis al día evita "
-               f"{pct(mejor['pct_evitado'], 0)} del riesgo simulado.")
+        frase = f"Planear los traslados con {num(presupuesto)} bicis al día evita "
+        frase += (f"más de la mitad del riesgo simulado en validación ({pct(validacion)})"
+                  if validacion > 0.5 else f"{pct(validacion)} del riesgo simulado en validación")
+    veces = [evitado[p] / al_azar[p] for p in evitado if not _falta(al_azar[p]) and al_azar[p] > 0]
+    if veces and min(veces) >= 1.5:
+        bajo, alto = round(min(veces)), round(max(veces))
+        cuantas = f"unas {num(bajo)} veces" if bajo == alto else f"entre {num(bajo)} y {num(alto)} veces"
+        solo = "" if len(veces) == len(evitado) else " (en validación)"
+        frase += f". Es {cuantas} lo que evita mover las mismas bicis al azar{solo}"
+    elif veces:
+        frase += f". Mover las mismas bicis al azar evita {pct(al_azar['validacion'])} en validación"
+    return frase + "."
 
-    # 2. El modelo contra la regla histórica.
-    comp = ind["comparacion"]
-    base = (ind["pronostico"].get("baseline") or {}).get("salidas") or {}
-    lgbm = (ind["pronostico"].get("lgbm") or {}).get("salidas") or {}
-    if comp["modelo_pronostica_mejor"] is None or comp["modelo_evita"] is None:
-        dos = f"Comparación entre el modelo y la regla histórica: {SIN_DATO}."
-    else:
-        error = (f"El modelo pronostica {'mejor' if comp['modelo_pronostica_mejor'] else 'peor'} que el promedio "
-                 f"histórico (error de {pct(lgbm['wape'])} contra {pct(base['wape'])})")
-        riesgo = {"igual": "no evita más riesgo", "mas": "evita más riesgo", "menos": "evita menos riesgo"}[comp["modelo_evita"]]
-        nexo = ("pero" if comp["modelo_pronostica_mejor"] != (comp["modelo_evita"] == "mas") else "y")
-        dos = (f"{error}, {nexo} {riesgo}: {pct(modelo['pct_evitado'])} contra "
-               f"{pct(hist['pct_evitado'])} de la regla histórica.")
 
-    # 3. Desde qué presupuesto deja de ayudar.
-    umbral = ind["presupuesto_umbral"]["politicas"]
-    u = umbral.get("historical") or umbral.get("model") or {}
-    if u.get("presupuesto") is not None:
-        tres = (f"Más allá de {num(u['presupuesto'])} bicis al día, mover más casi no ayuda: cada bici extra "
-                f"evita {num(u['ganancia_despues'], 1)} horas de riesgo, contra {num(u['ganancia_inicial'], 1)} "
-                "al principio.")
-    elif u.get("ganancia_inicial") is not None:
-        tres = "En los presupuestos simulados, cada bici extra todavía reduce el riesgo."
-    else:
-        tres = f"Presupuesto a partir del cual mover más deja de ayudar: {SIN_DATO}."
-    return [uno, dos, tres, _hallazgo_de_contexto(ind)]
+def _hallazgo_del_presupuesto(ind: dict) -> str:
+    """2. Cuánto agrega pasar del presupuesto de referencia al siguiente."""
+    ref = ind.get("referencia") or {}
+    siguiente = ref.get("siguiente") or {}
+    filas = _filas_de_prueba(ind)
+    en_validacion = [v for v in (siguiente.get("puntos") or {}).values() if not _falta(v)]
+    en_prueba = [f["prueba"] for c in ("ganancia_pct_al_duplicar_historica", "ganancia_pct_al_duplicar_modelo")
+                 if not _falta((f := filas.get(c) or {}).get("prueba"))]
+    if ref.get("presupuesto") is None or siguiente.get("presupuesto") is None or not en_validacion:
+        return f"Lo que agrega subir el presupuesto más allá del de referencia: {SIN_DATO}."
+    tope = math.floor(max(max(en_validacion + en_prueba), 0) * 100) + 1  # "menos de" el entero que sigue
+    pasar = f"de {num(ref['presupuesto'])} a {num(siguiente['presupuesto'])} bicis al día en validación"
+    sujeto = (f"Casi duplicar el presupuesto ({pasar})" if _casi_el_doble(siguiente.get("factor"))
+              else f"Subir el presupuesto {pasar}")
+    donde = _donde(["validacion", "prueba"] if en_prueba else ["validacion"])
+    return (f"{sujeto} agrega menos de {num(tope)} {'punto' if tope == 1 else 'puntos'} de riesgo simulado "
+            f"evitado {donde}.")
+
+
+def _hallazgo_del_modelo(ind: dict) -> str:
+    """3. Con qué presupuesto basta la regla histórica y con cuál gana el modelo."""
+    veredictos = modelo_contra_regla(ind)
+    historica, modelo = POLITICAS["historical"].lower(), POLITICAS["model"].lower()
+
+    def clausula(por_periodo: dict, inicio: str, basta: str, gana: str, mixto: str) -> tuple[str, bool]:
+        ganan = [p for p, v in por_periodo.items() if v == "mas"]
+        pierden = [p for p in por_periodo if p not in ganan]
+        if not ganan:
+            return f"{inicio}{basta} {_donde(pierden, negado=True)}", False
+        if not pierden:
+            return f"{inicio}{gana} {_donde(ganan)}", True
+        return f"{inicio}{mixto} en {PERIODOS[ganan[0]]}, pero no en {PERIODOS[pierden[0]]}", True
+
+    if not veredictos["referencia"]:
+        return f"Comparación entre el {modelo} y la {historica}: {SIN_DATO}."
+    frase, gana_en_referencia = clausula(
+        veredictos["referencia"], "Con el presupuesto de referencia",
+        f" basta la {historica}: el {modelo} no evita más riesgo simulado",
+        f", el {modelo} evita más riesgo simulado que la {historica}",
+        f", el {modelo} evita más riesgo simulado que la {historica}")
+    if veredictos["mitad"]:
+        si = "" if gana_en_referencia else "sí "
+        tambien = "también " if gana_en_referencia else ""
+        segunda, _ = clausula(
+            veredictos["mitad"], "con la mitad del presupuesto",
+            f", el {modelo} tampoco evita más" if not gana_en_referencia else f", el {modelo} no evita más",
+            f", el {modelo} {si}{tambien}evita más",
+            f", el {modelo} evita más")
+        frase += f"; {segunda}"
+    return frase + "."
+
+
+def hallazgos() -> list[str]:
+    """Los cuatro hallazgos de la página de inicio, armados con las cifras. Con la prueba
+    final hablan de los dos periodos; sin ella, solo de validación; sin cifra, "Sin dato"."""
+    ind = indicadores()
+    return [_hallazgo_del_riesgo(ind), _hallazgo_del_presupuesto(ind), _hallazgo_del_modelo(ind),
+            _hallazgo_de_contexto(ind)]

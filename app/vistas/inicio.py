@@ -1,5 +1,5 @@
 """Página "Inicio": el problema, cuatro indicadores, la curva de riesgo contra
-presupuesto, cuatro hallazgos y, cuando ya se corrió la prueba final, la
+presupuesto (con el punto de mover al azar), cuatro hallazgos y, cuando ya se corrió la prueba final, la
 comparación de validación contra prueba final. Ninguna cifra está escrita a
 mano: todas salen de app/datos.py, así que cambian solas al reconstruir las tablas."""
 
@@ -13,7 +13,7 @@ EJE_Y = "Horas de estación en riesgo por día"
 COLOR_REFERENCIA = "#8A8F98"
 ALTO = 340  # alto del área de la gráfica, en pixeles
 
-datos.encabezado("Rebalanceo de Citi Bike en Nueva York")
+datos.encabezado("Rebalanceo de Citi Bike en Nueva York", "inicio")
 
 ind = datos.indicadores()  # cifras ya calculadas; si faltan las tablas, avisa y se detiene
 referencia = ind.get("referencia") or {}
@@ -137,6 +137,26 @@ else:
                  alt.Tooltip("evitado_txt:N", title="Riesgo simulado evitado")])
     capas = [banda, lineas, puntos]
 
+    # Mover las mismas bicis al azar: un punto con su nombre, en el presupuesto con que se simuló.
+    azar = ind.get("piso_de_azar") or {}
+    if azar.get("riesgo") is not None and azar.get("presupuesto") is not None:
+        a_la_izquierda = azar["presupuesto"] > curva["presupuesto"].max() / 2
+        punto_azar = alt.Chart(alt.Data(values=[{
+            "presupuesto": azar["presupuesto"], "riesgo": float(azar["riesgo"]), "nombre": datos.AZAR,
+            "bicis_txt": datos.num(azar["presupuesto"]), "riesgo_txt": datos.num(azar["riesgo"]),
+            "evitado_txt": datos.pct(azar.get("pct_evitado")),
+        }]))
+        capas.append(punto_azar.mark_point(size=110, filled=True, opacity=1, shape="diamond", color=datos.COLOR_AZAR)
+                     .encode(x="presupuesto:Q", y="riesgo:Q",
+                             tooltip=[alt.Tooltip("nombre:N", title="Política"),
+                                      alt.Tooltip("bicis_txt:N", title=EJE_X),
+                                      alt.Tooltip("riesgo_txt:N", title=EJE_Y),
+                                      alt.Tooltip("evitado_txt:N", title="Riesgo simulado evitado")]))
+        capas.append(punto_azar.mark_text(color=datos.COLOR_AZAR, fontSize=12, fontWeight="bold", baseline="top",
+                                          align="right" if a_la_izquierda else "left",
+                                          dx=-9 if a_la_izquierda else 9, dy=5)
+                     .encode(x="presupuesto:Q", y="riesgo:Q", text="nombre:N"))
+
     if presupuesto is not None:
         # La etiqueta va hacia el lado donde hay espacio.
         a_la_derecha = presupuesto <= curva["presupuesto"].max() / 2
@@ -156,9 +176,9 @@ else:
                      .encode(x="presupuesto:Q", y="altura:Q", text="texto:N"))
 
     st.altair_chart(alt.layer(*capas).properties(height=ALTO), width="stretch", height=ALTO + 110)
-    if mismo_resultado and {"historical", "model"} <= set(claves):
-        st.caption(f"Las líneas de {datos.POLITICAS['historical']} y {datos.POLITICAS['model']} se enciman: "
-                   "su resultado es casi el mismo.")
+    frase = datos.frase_de_la_curva() if {"historical", "model"} <= set(claves) else ""
+    if frase:
+        st.caption(frase)
 
 
 # --------------------------------------------------------------------------- #
@@ -183,7 +203,11 @@ if comparacion["filas"]:
                for f in comparacion["filas"]]
     st.markdown("\n".join(lineas))
     notas = []
-    if comparacion["presupuesto"] is not None:
+    por_periodo = comparacion["presupuestos"]
+    if por_periodo.get("validacion") is not None and por_periodo.get("prueba") is not None:
+        notas.append(f"Presupuesto de referencia: {datos.num(por_periodo['validacion'])} bicis movidas al día en "
+                     f"validación y {datos.num(por_periodo['prueba'])} en la prueba final.")
+    elif comparacion["presupuesto"] is not None:
         notas.append(f"Con {datos.num(comparacion['presupuesto'])} bicis movidas al día.")
     if any("(" in f["validacion"] or "(" in f["prueba"] for f in comparacion["filas"]):
         notas.append("Entre paréntesis, el intervalo.")

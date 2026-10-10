@@ -190,6 +190,12 @@ def test_formato_de_numeros_y_sin_dato(datos):
     assert datos.accion(5, 6) == "Llevar 5 bicis antes de las 06:00"
     assert datos.accion(-1, 15) == "Retirar 1 bici antes de las 15:00"
     assert datos.accion(0, 6) == "Sin traslado"
+    # Con la ronda (su hora sale de las tablas), la tarjeta dice en cuál y a qué hora queda lista.
+    assert datos.accion(5, 6, {"nombre": "ronda nocturna", "hora": 5}) == \
+        "Llevar 5 bicis en la ronda nocturna (lista a las 05:00)"
+    assert datos.accion(-2, 14, {"nombre": "ronda de mediodía", "hora": 14}) == \
+        "Retirar 2 bicis en la ronda de mediodía (lista a las 14:00)"
+    assert datos.accion(0, 6, {"nombre": "ronda nocturna", "hora": 5}) == "Sin traslado"
     assert datos.fecha("2026-09-02") == "miércoles 2 de septiembre de 2026"
 
 
@@ -253,6 +259,61 @@ def test_los_hallazgos_se_arman_con_las_cifras(datos, monkeypatch):
     assert all("Sin dato" in f for f in datos.hallazgos())
 
 
+def test_los_hallazgos_hablan_de_los_dos_periodos_cuando_hay_prueba_final(datos, monkeypatch):
+    ind = datos.indicadores()
+
+    def fila(clave, validacion, prueba, validacion_ic=None, prueba_ic=None):
+        return {"clave": clave, "afirmacion": clave, "unidad": "pct", "validacion": validacion, "prueba": prueba,
+                "validacion_ic": validacion_ic, "prueba_ic": prueba_ic}
+
+    filas = [fila("pct_evitado_historica", 0.57, 0.64), fila("pct_evitado_azar", 0.08, 0.09),
+             fila("ganancia_pct_al_duplicar_historica", 0.034, 0.009),
+             fila("ganancia_pct_al_duplicar_modelo", 0.023, 0.007),
+             fila("diferencia_modelo_menos_historica_referencia", -7.5, 86.4, [-195, 129], [40, 128]),
+             fila("diferencia_modelo_menos_historica_500", -377, -428, [-489, -275], [-649, -213])]
+    base = {**ind,
+            "referencia": {"presupuesto": 1000, "politicas": {"historical": {"pct_evitado": 0.57},
+                                                             "model": {"pct_evitado": 0.57}},
+                           "siguiente": {"presupuesto": 1900, "factor": 1.9,
+                                         "puntos": {"historical": 0.034, "model": 0.023}}},
+            "piso_de_azar": {"pct_evitado": 0.08, "presupuesto": 1000, "riesgo": 90.0},
+            "comparacion": {"modelo_pronostica_mejor": True, "modelo_evita": "igual",
+                            "mitad": {"presupuesto": 500, "modelo_evita": "igual"}},
+            "validacion_y_prueba": {"presupuesto_de_referencia": 1000, "filas": filas}}
+    monkeypatch.setattr(datos, "indicadores", lambda: base)
+    uno, dos, tres, _ = datos.hallazgos()
+    assert "más de la mitad del riesgo simulado en los dos periodos" in uno
+    assert "57.0 % en validación y 64.0 % en la prueba final" in uno
+    assert "unas 7 veces" in uno and "entre 7 y 8 veces" not in uno  # 0.57 / 0.08 y 0.64 / 0.09
+    assert dos.startswith("Casi duplicar el presupuesto (de 1,000 a 1,900 bicis")
+    assert "menos de 4 puntos" in dos and "en los dos periodos" in dos
+    assert "basta la regla histórica" in tres and "en ninguno de los dos periodos" in tres
+    assert "con la mitad del presupuesto, el modelo sí evita más en los dos periodos" in tres
+    assert datos.frase_de_la_curva() == ("Con el presupuesto de referencia, Regla histórica y Modelo dan casi lo "
+                                         "mismo; con la mitad, el modelo evita más riesgo simulado.")
+    assert datos.linea_discreta("inicio").startswith("Resultados de simulación: validación y prueba final")
+    assert datos.linea_discreta().startswith(LINE)
+
+    # Si cambian las cifras, cambian las frases: la prueba final ya no pasa de la mitad ni gana el modelo.
+    otras = [fila("pct_evitado_historica", 0.57, 0.45), fila("pct_evitado_azar", 0.08, 0.15),
+             fila("diferencia_modelo_menos_historica_referencia", -7.5, 86.4, [-195, 129], [40, 128]),
+             fila("diferencia_modelo_menos_historica_500", -377, 10, [-489, -275], [-50, 70])]
+    monkeypatch.setattr(datos, "indicadores", lambda: {**base, "validacion_y_prueba": {"filas": otras}})
+    uno, dos, tres, _ = datos.hallazgos()
+    assert "más de la mitad" not in uno and "45.0 % en la prueba final" in uno and "entre 3 y 7 veces" in uno
+    assert "en validación" in dos and "dos periodos" not in dos  # la ganancia de la prueba final no está
+    assert "el modelo evita más en validación, pero no en la prueba final" in tres
+
+    # Sin el archivo de la prueba final solo se habla de validación, con lo que dice la curva.
+    monkeypatch.setattr(datos, "indicadores", lambda: {**base, "validacion_y_prueba": None})
+    uno, dos, tres, _ = datos.hallazgos()
+    assert "prueba final" not in uno + dos + tres and "dos periodos" not in uno + dos + tres
+    assert "más de la mitad del riesgo simulado en validación (57.0 %)" in uno and "unas 7 veces" in uno
+    assert "no evita más riesgo simulado en validación" in tres and "tampoco evita más en validación" in tres
+    assert "se enciman" in datos.frase_de_la_curva()
+    assert datos.linea_discreta("inicio").startswith(LINE)
+
+
 # --------------------------------------------------------------------------- #
 # Reglas de la carpeta app/
 # --------------------------------------------------------------------------- #
@@ -266,6 +327,8 @@ def test_la_configuracion_de_streamlit_esta_junto_a_inicio():
     assert config["server"]["fileWatcherType"] == "none"
     assert config["server"]["runOnSave"] is False
     assert config["browser"]["gatherUsageStats"] is False
+    # Sin el botón "Deploy" ni el menú de desarrollo.
+    assert config["client"]["toolbarMode"] == "viewer"
 
 
 def test_la_app_no_importa_nada_de_src_ni_lee_las_tablas_grandes():

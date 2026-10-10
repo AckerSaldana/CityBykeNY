@@ -14,6 +14,7 @@ import datos  # app/datos.py: el único archivo que sabe dónde están los datos
 
 TODO_EL_DIA = "Todo el día"
 HORA_INICIAL = 8  # la página abre en la hora pico de la mañana de un día laborable
+ZOOM = 10.8  # acercamiento con que abre el mapa
 COLOR_EQUILIBRIO = "#8A8F98"
 # Con menos de esto el flujo neto se escribe 0.0: la estación está en equilibrio.
 UMBRAL_EQUILIBRIO = 0.05
@@ -77,6 +78,15 @@ def _puntos(mapa: pd.DataFrame) -> pd.DataFrame:
     return puntos.sort_values("radio", ascending=False).reset_index(drop=True)
 
 
+def _vista() -> pdk.ViewState:
+    """Vista fija sobre la ciudad: el centro de todas las estaciones, no solo las de la selección,
+    así el mapa no se mueve al cambiar de hora o de tipo de día."""
+    todas = datos.estaciones()
+    todas = todas[todas["lat"].notna() & todas["lon"].notna()]
+    return pdk.ViewState(latitude=float(todas["lat"].median()), longitude=float(todas["lon"].median()),
+                         zoom=ZOOM, min_zoom=ZOOM - 2, max_zoom=ZOOM + 5, pitch=0, bearing=0)
+
+
 def _mapa(puntos: pd.DataFrame, unidad: str) -> pdk.Deck:
     capa = pdk.Layer(
         "ScatterplotLayer",
@@ -92,8 +102,9 @@ def _mapa(puntos: pd.DataFrame, unidad: str) -> pdk.Deck:
         pickable=True,
         auto_highlight=True,
     )
-    vista = pdk.ViewState(latitude=float(puntos["lat"].median()), longitude=float(puntos["lon"].median()),
-                          zoom=10.8, pitch=0)
+    # La rueda del ratón no acerca el mapa (así la página se puede recorrer); se acerca con los
+    # botones o con doble clic, y se arrastra para moverlo.
+    control = pdk.View(type="MapView", controller={"scrollZoom": False, "dragRotate": False, "touchRotate": False})
     globo = {
         "html": ("<b>{nombre}</b><br/>"
                  f"Salidas {unidad}: " "{salidas}<br/>"
@@ -104,7 +115,8 @@ def _mapa(puntos: pd.DataFrame, unidad: str) -> pdk.Deck:
         "style": {"backgroundColor": "#FFFFFF", "color": "#222222", "fontSize": "13px",
                   "border": "1px solid #D0D4DA", "borderRadius": "6px"},
     }
-    return pdk.Deck(layers=[capa], initial_view_state=vista, map_style=MAPAS_BASE[_tema()], tooltip=globo)
+    return pdk.Deck(layers=[capa], views=[control], initial_view_state=_vista(), map_style=MAPAS_BASE[_tema()],
+                    tooltip=globo)
 
 
 def _demanda_por_hora(usuario: str, hora_elegida: int | None) -> alt.Chart:
@@ -174,11 +186,11 @@ with c_mapa:
                 "el color usa a todos los usuarios.</small>", unsafe_allow_html=True)
 
 with c_lado:
-    m1, m2, m3 = st.columns([3, 2, 2])
-    m1.metric(f"Salidas {unidad}", datos.num(mapa["salidas"].sum()))
-    m2.metric("Se vacían", datos.num((estados == "se_vacia").sum()))
-    m3.metric("Se llenan", datos.num((estados == "se_llena").sum()))
-    st.caption(f"Promedios de {datos.num(len(mapa))} estaciones; las dos últimas cifras cuentan estaciones.")
+    st.metric(f"Salidas {unidad}", datos.num(mapa["salidas"].sum()))
+    se_vacian, se_llenan = int((estados == "se_vacia").sum()), int((estados == "se_llena").sum())
+    st.markdown(f"**{datos.num(se_vacian)} {'estación tiende' if se_vacian == 1 else 'estaciones tienden'} a "
+                f"vaciarse y {datos.num(se_llenan)} a llenarse.**")
+    st.caption(f"Promedios de {datos.num(len(mapa))} estaciones, {datos.TIPOS_DIA[tipo_dia].lower()}, {momento}.")
 
     st.subheader("Demanda por hora del día")
     st.altair_chart(_demanda_por_hora(usuario, hora_elegida), width="stretch")

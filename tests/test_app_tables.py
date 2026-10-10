@@ -238,11 +238,57 @@ def test_la_estacion_de_ejemplo_sigue_la_regla():
         + filas("D", "2026-09-08", (5, -5)))                                # demanda media
     dias = rec[["estacion_id", "fecha"]].drop_duplicates()
 
-    assert app_tables._estacion_de_ejemplo(rec, est, dias) == {
-        "estacion_id": "C", "fecha": "2026-09-10", "cumple_la_regla": True}
+    def elegido(dias):
+        e = app_tables._estacion_de_ejemplo(rec, est, dias)
+        return {k: e[k] for k in ("estacion_id", "fecha", "cumple_la_regla")}
+
+    # Sin error de pronóstico por día: el día con más franjas que bajan el riesgo.
+    assert elegido(dias) == {"estacion_id": "C", "fecha": "2026-09-10", "cumple_la_regla": True}
+    # Con error: de los días que cumplen, el más cercano a la mediana de la estación (un día típico).
+    mas = pd.DataFrame(filas("C", "2026-09-09", (3, 0)) + filas("C", "2026-09-11", (4, -4)))  # el 9 no cumple
+    rec = pd.concat([rec, mas], ignore_index=True)
+    dias = rec[["estacion_id", "fecha"]].drop_duplicates()
+    errores = {"2026-09-08": 0.31, "2026-09-09": 0.30, "2026-09-10": 0.90, "2026-09-11": 0.10}  # mediana: 0.305
+    con_error = dias.assign(error=dias["fecha"].dt.strftime("%Y-%m-%d").map(errores))
+    tipico = app_tables._estacion_de_ejemplo(rec, est, con_error)
+    assert (tipico["estacion_id"], tipico["fecha"]) == ("C", "2026-09-08")
+    assert tipico["error_del_dia"] == pytest.approx(0.31) and tipico["error_mediano"] == pytest.approx(0.305)
+    assert tipico["dias_laborables_simulados"] == 4
     # Si ninguna cumple: la de más salidas.
     solo_a = app_tables._estacion_de_ejemplo(rec[rec["estacion_id"] == "A"], est, dias)
     assert solo_a == {"estacion_id": "A", "fecha": None, "cumple_la_regla": False}
+
+
+def test_rondas_siguiente_presupuesto_mitad_y_distancia_de_rutas(construido):
+    _, ind = construido
+    # Rondas: la intervención más temprana es la nocturna; las demás, de mediodía.
+    franjas = app_tables._franjas({"franjas": [
+        {"nombre": "tarde", "momento_intervencion": "14:00", "inicio": "14:00", "fin": "22:00"},
+        {"nombre": "manana", "momento_intervencion": "05:00", "inicio": "06:00", "fin": "14:00"},
+        {"nombre": "rara", "inicio": "22:00", "fin": "23:00"}]})
+    assert [(f["nombre"], f["ronda"], f["hora_intervencion"]) for f in franjas] == [
+        ("tarde", "mediodia", 14), ("manana", "nocturna", 5), ("rara", None, None)]
+
+    curva = pd.DataFrame({
+        "politica": ["historical"] * 4 + ["model"] * 4, "presupuesto": [0, 50, 100, 190] * 2,
+        "riesgo": [100, 70, 50, 46, 100, 55, 49, 47], "ic_bajo": [95, 66, 45, 42, 95, 50, 44, 43],
+        "ic_alto": [105, 74, 55, 50, 105, 60, 54, 51], "pct_evitado": [0, .30, .50, .54, 0, .45, .51, .53]})
+    siguiente = app_tables._siguiente_presupuesto(curva, 100, [0, 50, 100, 190])
+    assert siguiente["presupuesto"] == 190 and siguiente["factor"] == pytest.approx(1.9)
+    assert siguiente["puntos"] == pytest.approx({"historical": 0.04, "model": 0.02})
+    assert app_tables._siguiente_presupuesto(curva, 190, [0, 50, 100, 190])["presupuesto"] is None
+    assert app_tables._mitad(curva, 100) == {"presupuesto": 50, "modelo_evita": "mas", "diferencia_de_riesgo": -15.0}
+    assert app_tables._mitad(curva, 190)["modelo_evita"] == "igual"  # 100 queda entre 40 % y 60 % de 190
+    assert app_tables._mitad(curva, 50)["presupuesto"] is None
+
+    # Distancia de las rutas más usadas entre estaciones distintas, en línea recta.
+    rutas = pd.read_parquet(construido[0] / "top_rutas.parquet")
+    r = rutas[~rutas["misma_estacion"]].head(app_tables.RUTAS_EN_PANTALLA)
+    km = app_tables._km(r["origen_lat"], r["origen_lon"], r["destino_lat"], r["destino_lon"])
+    assert ind["rutas_mas_usadas"] == {"rutas": len(r), "distancia_mediana_km": pytest.approx(km.median()),
+                                       "distancia_maxima_km": pytest.approx(km.max())}
+    un_grado = app_tables._km(pd.Series([0.0]), pd.Series([0.0]), pd.Series([1.0]), pd.Series([0.0]))
+    assert un_grado[0] == pytest.approx(111.2, abs=0.1)
 
 
 def test_copia_la_validacion_y_la_prueba_final_solo_si_existe(tmp_path):
@@ -259,6 +305,7 @@ def test_copia_la_validacion_y_la_prueba_final_solo_si_existe(tmp_path):
     (datos / "reports" / "validacion_y_prueba.json").write_text(json.dumps(falso), encoding="utf-8")
     copia = app_tables.build(datos, tmp_path / "app")["validacion_y_prueba"]
     assert copia["presupuesto_de_referencia"] == 172
+    assert copia["presupuestos"] == {"validacion": None, "prueba": None}
     assert [f["clave"] for f in copia["filas"]] == ["evitado", "raro"]
     assert copia["filas"][0]["validacion_ic"] == [0.4, 0.6] and copia["filas"][0]["prueba_ic"] is None
     assert copia["filas"][1]["unidad"] == "numero" and copia["filas"][1]["prueba"] is None

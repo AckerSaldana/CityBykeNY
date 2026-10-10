@@ -77,6 +77,15 @@ def test_abre_con_dos_graficas_y_el_interruptor_vuelve_a_dibujar(datos):
     assert len(at.toggle) == 1 and at.toggle[0].value is False  # por defecto, sin viajes a la misma estación
     assert datos.fecha(datos.indicadores()["periodo"]["inicio"], con_dia=False) in at.markdown[0].value
 
+    # Sin mapa de arcos: en su lugar, una frase con la distancia mediana que calculó el constructor.
+    assert len(at.get("deck_gl_json_chart")) == 0
+    resumen = datos.indicadores()["rutas_mas_usadas"]
+    mediana = resumen["distancia_mediana_km"]
+    escrita = f"{datos.num(mediana * 1000)} metros" if mediana < 1 else f"{datos.num(mediana, 1)} km"
+    frases = [m.value for m in at.markdown if "distancia mediana" in m.value]
+    assert len(frases) == 1 and escrita in frases[0] and f"Las {resumen['rutas']} rutas" in frases[0]
+    assert ("tramos cortos entre estaciones vecinas" in frases[0]) == (mediana < 1)
+
     at.toggle[0].set_value(True).run()
     revisar(at)
     at.toggle[0].set_value(False).run()

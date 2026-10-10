@@ -85,6 +85,32 @@ def test_abre_con_el_mapa_y_los_tres_selectores(datos):
     notas = " ".join(c.value for c in at.caption)
     assert "demanda atendida" in notas and "no separan las llegadas" in notas
 
+    # Una frase en lugar de dos cifras sueltas, con las cuentas de la selección.
+    flujo = datos.demanda_mapa(8, "laborable", "todos")["flujo_neto"]
+    se_vacian, se_llenan = int((flujo <= -0.05).sum()), int((flujo >= 0.05).sum())
+    frase = next(m.value for m in at.markdown if "a llenarse" in m.value)
+    assert f"{datos.num(se_vacian)} estaciones tienden a vaciarse y {datos.num(se_llenan)} a llenarse" in frase
+    assert [m.label for m in at.metric] == ["Salidas en esa hora"]
+
+
+def test_el_mapa_no_se_acerca_con_la_rueda_y_la_vista_es_fija(datos):
+    def mapa(at):
+        (m,) = at.get("deck_gl_json_chart")
+        return json.loads(m.proto.json)
+
+    at = abrir()
+    deck = mapa(at)
+    (vista,) = deck["views"]
+    assert vista["@@type"] == "MapView" and vista["controller"]["scrollZoom"] is False
+    # La vista sale de todas las estaciones: no cambia con la hora ni con el tipo de día.
+    est = datos.estaciones()
+    inicial = deck["initialViewState"]
+    assert inicial["latitude"] == pytest.approx(est["lat"].median())
+    assert inicial["longitude"] == pytest.approx(est["lon"].median())
+    at = at.selectbox(key="mapa_hora").set_value(3).run()
+    at = at.radio(key="mapa_tipo_dia").set_value("fin_de_semana").run()
+    assert mapa(at)["initialViewState"] == inicial
+
 
 def test_cada_selector_vuelve_a_dibujar_sin_errores(datos):
     at = abrir()

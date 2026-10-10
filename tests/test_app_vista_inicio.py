@@ -1,4 +1,4 @@
-"""La página Inicio: cuatro indicadores, la curva de riesgo contra presupuesto y tres hallazgos.
+"""La página Inicio: cuatro indicadores, la curva de riesgo contra presupuesto y cuatro hallazgos.
 
 Se abre igual que en tests/test_app_smoke.py, con las tablas hechas de
 data/sample en una carpeta temporal y, si existen, con las reales de
@@ -75,7 +75,16 @@ def test_inicio_muestra_indicadores_curva_y_hallazgos(datos):
     assert "Regla histórica, con" in notas
     if ind["comparacion"]["modelo_evita"] == "igual":
         assert "El modelo da prácticamente el mismo resultado" in notas
-        assert any("se enciman" in c.value for c in at.caption)  # la frase bajo la curva
+    # La frase bajo la curva es la que arman los datos (solo dice lo que las cifras sostienen).
+    frase = datos.frase_de_la_curva()
+    assert frase and sum(c.value == frase for c in at.caption) == 1
+    veredictos = datos.modelo_contra_regla()
+    assert ("con la mitad, el modelo evita más" in frase) == (
+        veredictos["referencia"].get("validacion") == "igual" and veredictos["mitad"].get("validacion") == "mas")
+    # La línea discreta de Inicio nombra la prueba final solo cuando ya está.
+    lineas = [c.value for c in at.caption if c.value.startswith("Resultados de simulación")]
+    assert len(lineas) == 1
+    assert lineas[0].startswith("Resultados de simulación: validación y prueba final") == datos.hay_prueba_final()
     if ind["piso_de_azar"]["pct_evitado"] is not None:
         assert f"Mover las mismas bicis al azar evita {datos.pct(ind['piso_de_azar']['pct_evitado'])}." in notas
     # El error es el del modelo, con el del promedio histórico y el de una sola media como contexto.
@@ -94,6 +103,12 @@ def test_inicio_muestra_indicadores_curva_y_hallazgos(datos):
                    "Bicis movidas por día", "Horas de estación en riesgo por día"):
         assert nombre in texto_spec
     assert f"Presupuesto de referencia: {datos.num(ind['referencia']['presupuesto'])} bicis" in texto_spec
+    # Mover al azar: un punto con su nombre, solo si la simulación lo reportó.
+    azar = ind["piso_de_azar"]
+    assert ("Mover al azar" in texto_spec) == (azar["riesgo"] is not None)
+    if azar["riesgo"] is not None:
+        assert azar["presupuesto"] == ind["referencia"]["presupuesto"]
+        assert f'"riesgo": {float(azar["riesgo"])}' in texto_spec
 
     # Cuatro hallazgos, los mismos que arma datos.hallazgos().
     frases = datos.hallazgos()
@@ -109,28 +124,39 @@ def test_inicio_muestra_indicadores_curva_y_hallazgos(datos):
 
 def test_validacion_y_prueba_final_lado_a_lado(datos, monkeypatch):
     ind = datos.indicadores()
+    # El archivo trae más filas y en otro orden; la página muestra solo las suyas, con su propio texto.
     falso = {"presupuesto_de_referencia": 3241, "filas": [
-        {"clave": "a", "afirmacion": "Riesgo simulado evitado", "unidad": "pct", "validacion": 0.5692,
-         "prueba": 0.6401, "validacion_ic": [0.52, 0.61], "prueba_ic": None},
-        {"clave": "b", "afirmacion": "Horas de estación en riesgo por día", "unidad": "horas",
-         "validacion": 5374.89, "prueba": None, "validacion_ic": None, "prueba_ic": None},
-        {"clave": "c", "afirmacion": "Viajes bloqueados por día", "unidad": "viajes", "validacion": 3424.9,
+        {"clave": "mae_modelo", "afirmacion": "MAE de salidas", "unidad": "numero", "validacion": 1.5177, "prueba": 2.0},
+        {"clave": "bloqueados_historica", "afirmacion": "Viajes bloqueados", "unidad": "viajes", "validacion": 3424.9,
          "prueba": 2698.2, "validacion_ic": None, "prueba_ic": [2084.0, 3267.4]},
-        {"clave": "d", "afirmacion": "Error medio", "unidad": "numero", "validacion": 1.5177, "prueba": 2.0}]}
+        {"clave": "pct_evitado_historica", "afirmacion": "Riesgo simulado evitado", "unidad": "pct",
+         "validacion": 0.5692, "prueba": 0.6401, "validacion_ic": [0.52, 0.61], "prueba_ic": None},
+        {"clave": "ganancia_pct_al_duplicar_historica", "afirmacion": "Ganancia", "unidad": "pct",
+         "validacion": 0.0341, "prueba": None, "validacion_ic": [0.0133, 0.0634], "prueba_ic": None},
+        {"clave": "wape_modelo", "afirmacion": "WAPE de salidas, modelo (LightGBM)", "unidad": "pct",
+         "validacion": 0.4577, "prueba": 0.495},
+        {"clave": "diferencia_modelo_menos_historica_referencia", "afirmacion": "Diferencia", "unidad": "horas",
+         "validacion": -7.5, "prueba": 86.4}]}
     monkeypatch.setattr(datos, "indicadores", lambda: {**ind, "validacion_y_prueba": falso})
 
+    subir = datos._subir_el_presupuesto(ind)
+    assert subir in ("al casi duplicar el presupuesto", "al pasar al siguiente presupuesto")
     assert datos.validacion_y_prueba()["filas"] == [
-        {"afirmacion": "Riesgo simulado evitado", "validacion": "56.9 % (52.0 % a 61.0 %)", "prueba": "64.0 %"},
-        {"afirmacion": "Horas de estación en riesgo por día", "validacion": "5,375 horas", "prueba": "Sin dato"},
-        {"afirmacion": "Viajes bloqueados por día", "validacion": "3,425 viajes",
-         "prueba": "2,698 viajes (2,084 a 3,267)"},
-        {"afirmacion": "Error medio", "validacion": "1.5", "prueba": "2"}]
+        {"afirmacion": "Riesgo simulado evitado con la regla histórica", "validacion": "56.9 % (52.0 % a 61.0 %)",
+         "prueba": "64.0 %"},
+        {"afirmacion": f"Puntos extra de riesgo simulado evitado {subir}, regla histórica",
+         "validacion": "3.4 puntos (1.3 a 6.3)", "prueba": "Sin dato"},
+        {"afirmacion": "Viajes bloqueados por día en la simulación, con la regla histórica",
+         "validacion": "3,425 viajes", "prueba": "2,698 viajes (2,084 a 3,267)"},
+        {"afirmacion": "Error del pronóstico de salidas, modelo (LightGBM)", "validacion": "45.8 %", "prueba": "49.5 %"}]
+    assert len(datos.FILAS_DE_COMPARACION) == 8
     at = abrir()
     assert [str(e.value) for e in at.exception] == []
     tabla = next(m.value for m in at.markdown if "| Validación | Prueba final |" in m.value)
     assert len(tabla.splitlines()) == 2 + 4
-    assert "56.9&nbsp;%" in tabla and "None" not in tabla and "nan" not in tabla
+    assert "56.9&nbsp;%" in tabla and "None" not in tabla and "nan" not in tabla and "WAPE" not in tabla
     assert any("3,241 bicis movidas al día" in c.value for c in at.caption)
+    assert any(c.value.startswith("Resultados de simulación: validación y prueba final") for c in at.caption)
 
     # Sin el archivo de la prueba final no hay ni título ni tabla vacía.
     monkeypatch.setattr(datos, "indicadores", lambda: {**ind, "validacion_y_prueba": None})

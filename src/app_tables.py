@@ -41,9 +41,19 @@ Definiciones que fija este módulo (y que el dashboard solo muestra):
 - Estación de ejemplo (la que abre "Pronóstico por estación"): entre las
   estaciones de oficinas con demanda alta, la de más salidas que tenga algún día
   laborable en que la regla histórica movió bicis en todas las franjas y todas
-  tuvieron solución; de esos días, el que tiene más franjas con menos riesgo
-  que sin intervenir y, si empatan, el de más bicis movidas (ver
+  tuvieron solución. De esos días se abre el de error de pronóstico más típico:
+  el más cercano a la mediana del error diario de esa estación en sus días
+  laborables simulados (error diario: suma de |observado - pronóstico| entre la
+  suma de lo observado, salidas, modelo). Si empatan, el que tiene más franjas
+  con menos riesgo que sin intervenir y luego el de más bicis movidas (ver
   `_estacion_de_ejemplo`). Si ninguna cumple, la estación con más salidas.
+- Rondas: la franja cuyo momento de intervención es el más temprano del día es
+  la "ronda nocturna"; las demás, la "ronda de mediodía". La hora sale del
+  reporte de simulación.
+- Mitad del presupuesto: el presupuesto de la curva más cercano a la mitad del
+  de referencia, si queda entre 40 % y 60 % de él.
+- Rutas más usadas: las `RUTAS_EN_PANTALLA` rutas con más viajes entre
+  estaciones distintas; su distancia es en línea recta entre las dos estaciones.
 - Inventario antes del traslado: el inventario justo después del traslado
   menos las bicis movidas (positivo es llevar).
 """
@@ -55,6 +65,7 @@ import re
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -66,6 +77,7 @@ SALIDA = DATOS / "app"
 ZONA = "America/New_York"
 UMBRAL_GANANCIA = 0.10  # fracción de la ganancia por bici del primer escalón
 TOP = 100  # filas que se guardan en los rankings (la página muestra 15)
+RUTAS_EN_PANTALLA = 15  # rutas entre estaciones distintas que resume `rutas_mas_usadas`
 BLOQUES = [("madrugada", 0, 5), ("manana", 6, 11), ("tarde", 12, 17), ("noche", 18, 23)]
 POLITICAS = ["none", "historical", "model"]
 
@@ -96,6 +108,14 @@ def _leer_json(ruta: Path) -> dict:
         return json.loads(ruta.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def _km(lat1, lon1, lat2, lon2):
+    """Distancia en línea recta, en kilómetros (fórmula del haversine)."""
+    lat1, lon1, lat2, lon2 = (np.radians(pd.to_numeric(x, errors="coerce").astype(float))
+                              for x in (lat1, lon1, lat2, lon2))
+    a = np.sin((lat2 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
+    return 6371.0088 * 2 * np.arcsin(np.sqrt(a))
 
 
 def _hora(texto) -> int | None:
@@ -179,6 +199,13 @@ def _demanda(con, datos: Path, salida: Path) -> dict:
     rutas["misma_estacion"] = rutas["origen_id"] == rutas["destino_id"]
     rutas["ruta"] = rutas["origen"] + " → " + rutas["destino"]
     _escribir(rutas, salida / "top_rutas.parquet")
+    # Qué tan largas son las rutas más usadas entre estaciones distintas.
+    distintas = rutas[~rutas["misma_estacion"]].dropna(
+        subset=["origen_lat", "origen_lon", "destino_lat", "destino_lon"]).head(RUTAS_EN_PANTALLA)
+    km = _km(distintas["origen_lat"], distintas["origen_lon"], distintas["destino_lat"], distintas["destino_lon"])
+    rutas_mas_usadas = {"rutas": int(len(distintas)),
+                        "distancia_mediana_km": _f(km.median()) if len(distintas) else None,
+                        "distancia_maxima_km": _f(km.max()) if len(distintas) else None}
 
     pares, viajes_rutas = con.execute(
         f"SELECT count(*), sum(trips) FROM read_parquet('{datos / 'routes.parquet'}')").fetchone()
@@ -194,6 +221,7 @@ def _demanda(con, datos: Path, salida: Path) -> dict:
             "pares_de_estaciones": int(pares or 0),
             "viajes_en_rutas": int(viajes_rutas or 0),
             "periodo": {"inicio": str(ini), "fin": str(fin), "dias": int(dias)},
+            "rutas_mas_usadas": rutas_mas_usadas,
         },
     }
 
@@ -282,7 +310,13 @@ def _pronostico(con, datos: Path, salida: Path, estaciones: pd.DataFrame) -> dic
         general.setdefault(fila.modelo, {})[fila.objetivo] = {
             "n": int(fila.n), "mae": _f(fila.mae), "rmse": _f(fila.rmse), "wape": _f(fila.wape),
             "cobertura": _f(fila.cobertura), "ancho": _f(fila.ancho)}
-    dias = tabla[["estacion_id", "fecha"]].drop_duplicates()
+    # Días con pronóstico de cada estación y su error diario (salidas, modelo): sirve para abrir
+    # "Pronóstico por estación" en un día típico.
+    dias = (tabla.assign(_e=(tabla["sal_obs"] - tabla["modelo_sal_q50"]).abs().where(tabla["modelo_sal_q50"].notna()),
+                         _o=tabla["sal_obs"].where(tabla["modelo_sal_q50"].notna()))
+            .groupby(["estacion_id", "fecha"], as_index=False)[["_e", "_o"]].sum(min_count=1))
+    dias["error"] = (dias["_e"] / dias["_o"].where(dias["_o"] > 0)).astype(float)
+    dias = dias[["estacion_id", "fecha", "error"]]
     return {"estaciones_df": estaciones, "validacion": val, "pronostico": general, "dias_df": dias}
 
 
@@ -353,6 +387,61 @@ def _curva(datos: Path, salida: Path) -> pd.DataFrame:
     return curva
 
 
+def _franjas(reglas: dict) -> list[dict]:
+    """Las franjas del reporte con su ronda: la intervención más temprana del día es la
+    "nocturna"; las demás, la de "mediodia". Sin momento de intervención, sin ronda."""
+    franjas = [{"nombre": f.get("nombre"), "inicio": f.get("inicio"), "fin": f.get("fin"),
+                "momento_intervencion": f.get("momento_intervencion"),
+                "hora_intervencion": _hora(f.get("momento_intervencion")), "ronda": None}
+               for f in reglas.get("franjas") or []]
+    horas = [f["hora_intervencion"] for f in franjas if f["hora_intervencion"] is not None]
+    for f in franjas:
+        if f["hora_intervencion"] is not None:
+            f["ronda"] = "nocturna" if f["hora_intervencion"] == min(horas) else "mediodia"
+    return franjas
+
+
+def _siguiente_presupuesto(curva: pd.DataFrame, ref, presupuestos: list) -> dict:
+    """El presupuesto que sigue al de referencia en la curva y cuánto riesgo evitado agrega
+    (fracción del riesgo sin intervención), por política."""
+    mayores = [b for b in presupuestos if ref is not None and b > ref]
+    dato = {"presupuesto": None, "factor": None, "puntos": {}}
+    if not mayores or not ref:
+        return dato
+    dato["presupuesto"], dato["factor"] = int(mayores[0]), mayores[0] / ref
+    for politica in ("historical", "model"):
+        c = curva[curva["politica"] == politica].set_index("presupuesto")["pct_evitado"]
+        if ref in c.index and mayores[0] in c.index and not pd.isna(c[mayores[0]] - c[ref]):
+            dato["puntos"][politica] = float(c[mayores[0]] - c[ref])
+    return dato
+
+
+def _evita(curva: pd.DataFrame, presupuesto) -> tuple[str | None, float | None]:
+    """El modelo contra la regla histórica con un presupuesto de la curva: "mas", "menos" o
+    "igual" (las bandas se traslapan), y la diferencia de riesgo (modelo menos regla)."""
+    c = curva[curva["presupuesto"] == presupuesto].set_index("politica")
+    if presupuesto is None or not {"historical", "model"} <= set(c.index):
+        return None, None
+    h, m = c.loc["historical"], c.loc["model"]
+    if any(pd.isna(x) for x in (h["riesgo"], m["riesgo"], h["ic_bajo"], h["ic_alto"], m["ic_bajo"], m["ic_alto"])):
+        return None, None
+    evita = "mas" if m["ic_alto"] < h["ic_bajo"] else "menos" if m["ic_bajo"] > h["ic_alto"] else "igual"
+    return evita, float(m["riesgo"] - h["riesgo"])
+
+
+def _mitad(curva: pd.DataFrame, ref) -> dict:
+    """La comparación con la mitad del presupuesto de referencia (ver el encabezado)."""
+    dato = {"presupuesto": None, "modelo_evita": None, "diferencia_de_riesgo": None}
+    if not ref:
+        return dato
+    cerca = [b for b in sorted(curva["presupuesto"].unique().tolist()) if 0.4 * ref <= b <= 0.6 * ref]
+    if not cerca:
+        return dato
+    b = min(cerca, key=lambda x: (abs(x - ref / 2), x))
+    evita, diferencia = _evita(curva, b)
+    return {"presupuesto": int(b), "modelo_evita": evita, "diferencia_de_riesgo": diferencia}
+
+
 def _umbral(curva: pd.DataFrame) -> dict:
     """Presupuesto desde el cual cada bici extra evita muy poco (ver el encabezado)."""
     por_politica = {}
@@ -406,6 +495,7 @@ def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: P
                   for r in reporte.get("resultados") or []}
     referencia = {"presupuesto": ref, "bicis_por_estacion": _f(reglas.get("presupuesto_de_referencia")),
                   "riesgo_sin_intervencion": None, "politicas": {}}
+    referencia["siguiente"] = _siguiente_presupuesto(curva, ref, presupuestos)
     horas = []
     if ref is not None:
         en_ref = curva[curva["presupuesto"] == ref].set_index("politica")
@@ -492,9 +582,7 @@ def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: P
             "nivel_del_intervalo": (reporte.get("intervalo") or {}).get("nivel"),
             "presupuestos": [int(b) for b in presupuestos],
             "politicas": [p for p in POLITICAS if p in set(curva["politica"])],
-            "franjas": [{"nombre": f.get("nombre"), "inicio": f.get("inicio"), "fin": f.get("fin"),
-                         "momento_intervencion": f.get("momento_intervencion")}
-                        for f in reglas.get("franjas") or []],
+            "franjas": _franjas(reglas),
         },
         "referencia": referencia,
         "sensibilidad": {"filas": filas, "rango": rango},
@@ -504,7 +592,7 @@ def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: P
     }
 
 
-def _comparacion(pronostico: dict, referencia: dict) -> dict:
+def _comparacion(pronostico: dict, referencia: dict, curva: pd.DataFrame) -> dict:
     """El modelo contra la regla histórica: error de pronóstico y riesgo, lado a lado."""
     base = (pronostico.get("baseline") or {}).get("salidas") or {}
     lgbm = (pronostico.get("lgbm") or {}).get("salidas") or {}
@@ -522,7 +610,8 @@ def _comparacion(pronostico: dict, referencia: dict) -> dict:
         else:
             evita = "igual"
     return {"modelo_pronostica_mejor": mejor, "modelo_evita": evita,
-            "diferencia_de_riesgo": (modelo["riesgo"] - hist["riesgo"]) if evita else None}
+            "diferencia_de_riesgo": (modelo["riesgo"] - hist["riesgo"]) if evita else None,
+            "mitad": _mitad(curva, referencia.get("presupuesto"))}
 
 
 def _piso_del_pronostico(datos: Path) -> dict:
@@ -568,6 +657,8 @@ def _estacion_de_ejemplo(rec: pd.DataFrame, estaciones: pd.DataFrame, dias_con_p
     r = rec[rec["estacion_id"].isin(set(candidatas["estacion_id"]))]
     # Solo días en que la estación también tiene pronóstico: la página dibuja las dos cosas.
     con = dias_con_pronostico.assign(fecha=pd.to_datetime(dias_con_pronostico["fecha"]))
+    if "error" not in con.columns:
+        con["error"] = float("nan")
     r = r.assign(fecha=pd.to_datetime(r["fecha"])).merge(con, on=["estacion_id", "fecha"])
     if r.empty:
         return respaldo
@@ -586,10 +677,19 @@ def _estacion_de_ejemplo(rec: pd.DataFrame, estaciones: pd.DataFrame, dias_con_p
         return respaldo
     buenas = set(dias.index.get_level_values("estacion_id"))
     estacion_id = next(e for e in candidatas["estacion_id"] if e in buenas)  # la de más salidas
-    del_dia = dias.loc[estacion_id].reset_index().sort_values(
-        ["mejoras", "movidas", "fecha"], ascending=[False, False, True])
-    return {"estacion_id": estacion_id, "fecha": str(pd.Timestamp(del_dia["fecha"].iloc[0]).date()),
-            "cumple_la_regla": True}
+    # De los días que cumplen, el de error de pronóstico más cercano a la mediana de la estación
+    # en sus días laborables simulados: un día típico, no uno raro.
+    errores = (r[laborable & (r["estacion_id"] == estacion_id)].drop_duplicates("fecha")
+               .set_index("fecha")["error"].astype(float))
+    mediana = errores.median()
+    del_dia = dias.loc[estacion_id].reset_index()
+    del_dia["error"] = del_dia["fecha"].map(errores)
+    del_dia["lejos"] = (del_dia["error"] - mediana).abs().fillna(float("inf")) if pd.notna(mediana) else 0.0
+    del_dia = del_dia.sort_values(["lejos", "mejoras", "movidas", "fecha"], ascending=[True, False, False, True])
+    elegido = del_dia.iloc[0]
+    return {"estacion_id": estacion_id, "fecha": str(pd.Timestamp(elegido["fecha"]).date()),
+            "cumple_la_regla": True, "error_del_dia": _f(elegido["error"]), "error_mediano": _f(mediana),
+            "dias_laborables_simulados": int(errores.notna().sum())}
 
 
 UNIDADES = ("pct", "horas", "viajes", "numero")
@@ -627,8 +727,11 @@ def _validacion_y_prueba(datos: Path) -> dict | None:
     if not filas:
         return None
     presupuesto = crudo.get("presupuesto_de_referencia")
-    return {"presupuesto_de_referencia": int(presupuesto) if isinstance(presupuesto, (int, float)) else None,
-            "filas": filas}
+    entero = lambda x: int(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None  # noqa: E731
+    detalle = crudo.get("detalle") if isinstance(crudo.get("detalle"), dict) else {}
+    por_periodo = {periodo: entero((detalle.get(periodo) or {}).get("presupuesto_de_referencia_en_bicis"))
+                   for periodo in ("validacion", "prueba")}
+    return {"presupuesto_de_referencia": entero(presupuesto), "presupuestos": por_periodo, "filas": filas}
 
 
 # --------------------------------------------------------------------------- #
@@ -663,7 +766,7 @@ def build(datos: Path | str = DATOS, salida: Path | str = SALIDA) -> dict:
         "validacion": pron["validacion"],
         "pronostico": pron["pronostico"],
         **sim,
-        "comparacion": _comparacion(pron["pronostico"], sim["referencia"]),
+        "comparacion": _comparacion(pron["pronostico"], sim["referencia"], curva),
         "pronostico_piso": _piso_del_pronostico(datos),
         "contexto": _contexto(datos, estaciones),
         "estacion_de_ejemplo": _estacion_de_ejemplo(rec, estaciones, pron["dias_df"]),

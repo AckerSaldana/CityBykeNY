@@ -4,22 +4,16 @@ Todo es descriptivo y de todo el periodo analizado. Son viajes de usuarios
 entre estaciones (demanda atendida), no recorridos de camiones.
 """
 
-import math
-
 import altair as alt
 import pandas as pd
-import pydeck as pdk
 import streamlit as st
 
 import datos  # app/datos.py: el único archivo que sabe dónde están los datos
 
 CUANTAS = 15
 COLOR_BARRA = datos.COLOR_SE_LLENA
-COLOR_ORIGEN = [230, 159, 0]    # naranja: donde empieza el viaje
-COLOR_DESTINO = [0, 114, 178]   # azul: donde termina
 ALTO_FILA = 28
-ALTO_MAPA = 520
-ANCHO_MAPA = 900  # ancho aproximado del mapa en pantalla, en pixeles, para calcular el acercamiento
+CORTA_KM = 1.0  # con una mediana menor, las rutas más usadas se describen como tramos cortos
 
 
 def _nombres_unicos(nombres: pd.Series, claves: pd.Series) -> pd.Series:
@@ -55,58 +49,17 @@ def _barras(tabla: pd.DataFrame, valor: str, titulo_valor: str, titulo_eje: str,
     return (barras + cifras).properties(height=ALTO_FILA * len(tabla) + 50, padding={"top": 22})
 
 
-def _vista(extremos: pd.DataFrame) -> pdk.ViewState:
-    """Centro y acercamiento para que quepan justo las rutas que se muestran (su caja, con margen)."""
-    oeste, este = float(extremos["lon"].min()), float(extremos["lon"].max())
-    sur, norte = float(extremos["lat"].min()), float(extremos["lat"].max())
-
-    def mercator(lat: float) -> float:
-        return math.degrees(math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)))
-
-    margen = 0.75  # las rutas ocupan tres cuartos del mapa
-    # A nivel 0 el mundo (360 grados) mide 512 pixeles; cada nivel lo duplica.
-    por_ancho = math.log2(ANCHO_MAPA * margen * 360 / (512 * max(este - oeste, 1e-4)))
-    por_alto = math.log2(ALTO_MAPA * margen * 360 / (512 * max(mercator(norte) - mercator(sur), 1e-4)))
-    return pdk.ViewState(latitude=(sur + norte) / 2, longitude=(oeste + este) / 2,
-                         zoom=min(por_ancho, por_alto, 15), pitch=30)
-
-
-def _mapa(rutas: pd.DataFrame) -> pdk.Deck | None:
-    """Arcos de las rutas (del origen, naranja, al destino, azul). Los viajes que
-    vuelven a la misma estación se dibujan como un punto. Sin coordenadas, no hay mapa."""
-    columnas = ["origen_lat", "origen_lon", "destino_lat", "destino_lon"]
-    r = rutas.dropna(subset=columnas)
-    if r.empty:
-        return None
-    r = r.assign(ancho=6 + 10 * r["viajes"] / r["viajes"].max(),
-                 radio=60 + 140 * r["viajes"] / r["viajes"].max())
-    campos = ["nombre", "cifra", "ancho", "radio", "misma_estacion", *columnas]
-    arcos = r.loc[~r["misma_estacion"], campos]
-    puntos = r.loc[r["misma_estacion"], campos]
-    capas = []
-    if not arcos.empty:
-        capas.append(pdk.Layer(
-            "ArcLayer", data=arcos, get_source_position=["origen_lon", "origen_lat"],
-            get_target_position=["destino_lon", "destino_lat"], get_source_color=COLOR_ORIGEN,
-            get_target_color=COLOR_DESTINO, get_width="ancho", get_height=0.6, pickable=True,
-            auto_highlight=True))
-        # Un punto en cada extremo: el arco de una ruta corta se ve aunque el mapa abarque toda la ciudad.
-        for lado, color in (("origen", COLOR_ORIGEN), ("destino", COLOR_DESTINO)):
-            capas.append(pdk.Layer(
-                "ScatterplotLayer", data=arcos, get_position=[f"{lado}_lon", f"{lado}_lat"], get_radius=40,
-                radius_min_pixels=5, radius_max_pixels=9, get_fill_color=color + [230], stroked=True,
-                get_line_color=[255, 255, 255, 200], line_width_min_pixels=1, pickable=True))
-    if not puntos.empty:
-        capas.append(pdk.Layer(
-            "ScatterplotLayer", data=puntos, get_position=["origen_lon", "origen_lat"],
-            get_radius="radio", radius_min_pixels=4, get_fill_color=COLOR_ORIGEN + [200],
-            pickable=True, auto_highlight=True))
-    extremos = pd.DataFrame({"lon": pd.concat([r["origen_lon"], r["destino_lon"]]),
-                             "lat": pd.concat([r["origen_lat"], r["destino_lat"]])})
-    vista = _vista(extremos)
-    # Sin estilo fijo, el mapa base (CARTO, no pide llave) sigue el tema claro u oscuro de la app.
-    return pdk.Deck(layers=capas, initial_view_state=vista, map_provider="carto", map_style=None,
-                    tooltip={"html": "<b>{nombre}</b><br/>{cifra} viajes"})
+def _distancia(resumen: dict) -> str:
+    """Qué tan largas son las rutas más usadas entre estaciones distintas (lo calcula el constructor)."""
+    mediana, cuantas = resumen.get("distancia_mediana_km"), resumen.get("rutas")
+    if datos._falta(mediana) or not cuantas:
+        return f"Distancia de las rutas más usadas: {datos.SIN_DATO}."
+    escrita = f"{datos.num(mediana * 1000)} metros" if mediana < 1 else f"{datos.num(mediana, 1)} km"
+    cuales = f"Las {datos.num(cuantas)} rutas más usadas entre estaciones distintas"
+    if mediana < CORTA_KM:
+        return (f"{cuales} son tramos cortos entre estaciones vecinas: su distancia mediana es de {escrita} "
+                "en línea recta.")
+    return f"{cuales} tienen una distancia mediana de {escrita} en línea recta."
 
 
 datos.encabezado("Estaciones y rutas", "viajes")
@@ -176,13 +129,7 @@ else:
         _barras(rutas, "viajes", "Viajes en el periodo", "Ruta (origen → destino)",
                 [("origen_txt", "Origen"), ("destino_txt", "Destino")]),
         width="stretch")
-    deck = _mapa(rutas)
-    if deck is not None:
-        st.pydeck_chart(deck, height=ALTO_MAPA)
-        st.caption("Dónde están estas rutas. Cada arco va del origen (naranja) al destino (azul); es más "
-                   "grueso cuanto más viajes tiene la ruta. Son rutas cortas: acerca el mapa para verlas una por una."
-                   + (" Los puntos naranjas sin arco son viajes que vuelven a la misma estación."
-                      if con_vueltas else ""))
+    st.markdown(_distancia(ind.get("rutas_mas_usadas") or {}))
 
     total = ind.get("viajes_en_rutas")
     if total:

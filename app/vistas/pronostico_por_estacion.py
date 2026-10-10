@@ -90,13 +90,13 @@ def grafica(modelo: pd.DataFrame, promedio: pd.DataFrame, titulo_y: str) -> alt.
     return alt.layer(*capas).properties(height=380)
 
 
-def tarjeta(fila: pd.Series, riesgo_sin_mover) -> None:
+def tarjeta(fila: pd.Series, riesgo_sin_mover, ronda: dict | None = None) -> None:
     """Lo que hizo una política en una franja: acción, nivel de riesgo e inventario simulado."""
     nivel = fila["nivel_riesgo"]
     with st.container(border=True):
         st.caption(f"{datos.etiqueta(datos.FRANJAS, fila['franja'])} · "
                    f"{datos.hora(fila['hora_inicio'])} a {datos.hora(fila['hora_fin'])}")
-        st.markdown(f"#### {datos.accion(fila['bicis'], fila['hora_inicio'])}")
+        st.markdown(f"#### {datos.accion(fila['bicis'], fila['hora_inicio'], ronda)}")
         fondo = datos.COLORES_RIESGO.get(nivel, "#8A8F98")
         letra = COLOR_TEXTO_RIESGO.get(nivel, "#FFFFFF")
         st.markdown(
@@ -123,7 +123,8 @@ if not opciones:
     st.stop()
 
 # Al abrir: la estación y el día de ejemplo (una de oficinas con mucha demanda, traslado en todas
-# las franjas y con solución, en día laborable). Si no existe, la primera de la lista (la de más salidas).
+# las franjas y con solución, en día laborable; de esos días, el de error de pronóstico más típico
+# de la estación). Si no existe, la primera de la lista (la de más salidas).
 ejemplo = datos.estacion_de_ejemplo()
 if "pron_estacion" not in st.session_state and ejemplo.get("estacion_id") in opciones:
     st.session_state["pron_estacion"] = ejemplo["estacion_id"]
@@ -200,9 +201,10 @@ else:
     politica = por_texto[st.radio("Política", list(por_texto), horizontal=True, key="pron_politica")]
     sin_mover = rec_dia[rec_dia["politica"] == "none"].set_index("franja")["nivel_riesgo"]
     filas = rec_dia[rec_dia["politica"] == politica].sort_values("hora_inicio")
+    rondas = datos.rondas()  # en qué ronda (y a qué hora queda lista) se hace el traslado de cada franja
     if filas.empty:
         st.caption(datos.SIN_DATO)
     else:
         for columna, (_, fila) in zip(st.columns(len(filas)), filas.iterrows()):
             with columna:
-                tarjeta(fila, sin_mover.get(fila["franja"]))
+                tarjeta(fila, sin_mover.get(fila["franja"]), rondas.get(fila["franja"]))

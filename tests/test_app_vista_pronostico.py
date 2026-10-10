@@ -21,7 +21,9 @@ APP = ROOT / "app"
 SAMPLE = ROOT / "data" / "sample"
 REALES = ROOT / "data" / "processed" / "app"
 PAGINA = "vistas/pronostico_por_estacion.py"
-ACCION = re.compile(r"Llevar [\d,]+ bicis? antes de las \d\d:00|Retirar [\d,]+ bicis? antes de las \d\d:00|Sin traslado")
+# Con la ronda que reportó la simulación; sin ese dato (datos de muestra), con la hora de inicio de la franja.
+CUANDO = r"(?:en la ronda (?:nocturna|de mediodía) \(lista a las \d\d:00\)|antes de las \d\d:00)"
+ACCION = re.compile(rf"Llevar [\d,]+ bicis? {CUANDO}|Retirar [\d,]+ bicis? {CUANDO}|Sin traslado")
 
 
 @pytest.fixture(scope="module")
@@ -100,6 +102,27 @@ def test_abre_con_selectores_grafica_y_acciones(datos):
         assert len(del_dia) == rec["franja"].nunique() and (del_dia["bicis"] != 0).all() and del_dia["factible"].all()
         for fila in del_dia.itertuples():
             assert datos.inventario(fila.inventario_antes, fila.inventario) in textos(at)
+        # La tarjeta dice la ronda y la hora en que queda lista, con el momento de intervención de las tablas:
+        # la primera intervención del día es la ronda nocturna y la otra, la de mediodía.
+        franjas = datos.indicadores()["simulacion"]["franjas"]
+        rondas = datos.rondas()
+        if franjas:
+            primera = min(franjas, key=lambda f: f["hora_intervencion"])
+            assert rondas[primera["nombre"]] == {"nombre": "ronda nocturna", "hora": primera["hora_intervencion"]}
+            assert all(rondas[f["nombre"]]["nombre"] == "ronda de mediodía" for f in franjas if f is not primera)
+            for fila in del_dia.itertuples():
+                assert datos.accion(fila.bicis, fila.hora_inicio, rondas[fila.franja]) in textos(at)
+                assert f"(lista a las {datos.hora(rondas[fila.franja]['hora'])})" in textos(at)
+            assert "antes de las" not in textos(at)
+        # El día de ejemplo es un día típico: el que cumple la regla con el error más cercano a la mediana.
+        if ejemplo.get("error_mediano") is not None:
+            pron = datos.pronostico_estacion(ejemplo["estacion_id"])
+            m = pron[pron["modelo"] == "lgbm"].assign(e=lambda d: (d["observado"] - d["q50"]).abs())
+            por_dia = m.groupby(pd.to_datetime(m["fecha"]))[["e", "observado"]].sum()
+            por_dia = por_dia[por_dia.index.isin(pd.to_datetime(rec["fecha"])) & (por_dia.index.weekday < 5)]
+            errores = por_dia["e"] / por_dia["observado"]
+            assert errores.median() == pytest.approx(ejemplo["error_mediano"], rel=1e-4)
+            assert errores[pd.Timestamp(ejemplo["fecha"])] == pytest.approx(ejemplo["error_del_dia"], rel=1e-4)
     else:
         assert ejemplo["estacion_id"] == next(iter(datos.opciones_de_estacion()))
 

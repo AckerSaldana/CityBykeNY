@@ -39,7 +39,9 @@ Para comprobar que todo abre después de un cambio:
 
 - Cada página empieza con `datos.encabezado("Título")`: pone el título y una
   sola línea discreta, "Resultados de simulación con datos de validación"
-  (Inicio, Pronóstico por estación y Confiabilidad). Las páginas que solo
+  (Pronóstico por estación y Confiabilidad). Inicio usa
+  `datos.encabezado("Título", "inicio")`: cuando ya existe la prueba final dice
+  "Resultados de simulación: validación y prueba final". Las páginas que solo
   describen viajes (Mapa de demanda, Estaciones y rutas, Contexto) usan
   `datos.encabezado("Título", "viajes")`: "Viajes reales de julio a septiembre
   de 2026", con los meses calculados del periodo de los datos.
@@ -64,7 +66,15 @@ Para comprobar que todo abre después de un cambio:
   simulación (positivo es llevar, negativo es retirar). La tarjeta muestra las
   bicis simuladas en la estación justo antes y justo después del traslado. No
   es el inventario ideal. La página muestra una política a la vez y abre con
-  la estación de ejemplo que elige el constructor (regla en `src/app_tables.py`).
+  la estación y el día de ejemplo que elige el constructor (regla en
+  `src/app_tables.py`): un día con simulación y con un error de pronóstico
+  típico de esa estación. La tarjeta dice en qué ronda se hace el traslado y a
+  qué hora queda lista ("ronda nocturna", "ronda de mediodía"); la hora es el
+  momento de intervención que reportó la simulación.
+- La tabla de validación contra prueba final de Inicio muestra ocho filas
+  fijas (`FILAS_DE_COMPARACION` en `app/datos.py`); el archivo trae más.
+- El mapa no se acerca con la rueda del ratón (para poder recorrer la página):
+  se acerca con los botones o con doble clic.
 - Si en una franja ningún inventario inicial evita los dos riesgos, la tarjeta
   lo dice y sugiere una segunda visita durante la franja.
 - Si una franja queda en riesgo alto y no se movió ninguna bici,

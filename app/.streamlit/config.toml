@@ -19,3 +19,6 @@ showEmailPrompt = false
 fileWatcherType = "none"
 runOnSave = false
 
+[client]
+# Para la demostración: sin el botón "Deploy" ni el menú de desarrollo arriba a la derecha.
+toolbarMode = "viewer"
