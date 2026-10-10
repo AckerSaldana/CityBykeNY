@@ -28,3 +28,9 @@ Thumbs.db
 *.tmp
 *.part
 *.log
+
+# --- Otros entornos y cachés ---
+env/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
