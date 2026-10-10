@@ -16,6 +16,9 @@ DATA_SAMPLE = DATA / "sample"        # Datos SINTÉTICOS pequeños. Sí va en Gi
 
 CONFIG = ROOT / "config"
 OPERACION_YAML = CONFIG / "operacion.yaml"
+DATOS_YAML = CONFIG / "datos.yaml"
+
+REPORTS = DATA_PROCESSED / "reports"  # Reportes de la limpieza y métricas. NO va en Git.
 
 # Zona horaria de todo el análisis (decisión 1: hora local de Nueva York).
 TZ = "America/New_York"

@@ -1,0 +1,51 @@
+# =============================================================================
+#  PERIODO DE DATOS, TRAMOS DE VALIDACIÓN Y REGLAS DE LIMPIEZA
+# =============================================================================
+#  Lo ajusta programación. Lo leen la limpieza (scripts/build_tables.py) y los
+#  modelos, con src.data.datos_config.load_datos().
+#
+#  Si cambias algo aquí hay que volver a correr, en este orden:
+#      python scripts/build_tables.py
+#      python scripts/run_baseline.py
+#
+#  Fechas en formato AAAA-MM-DD, hora local de Nueva York. El día de "fin"
+#  está incluido.
+# =============================================================================
+
+# Meses de viajes que se leen de data/raw/trips (se bajan con
+# scripts/download_trips.py).
+meses_crudos: [202607, 202608, 202609]
+
+# Periodo de análisis.
+# Termina el 29 de septiembre y no el 30 a propósito: los archivos traen los
+# viajes que TERMINAN en cada mes, y el de octubre todavía no existe. Los
+# viajes que salieron el 30 por la noche y terminaron el 1 de octubre faltan
+# (cerca de 1 de cada 6 salidas de las 23:00, estimado con los miércoles
+# anteriores). Hasta el 29 las salidas y las llegadas están completas.
+periodo:
+  inicio: 2026-07-01
+  fin: 2026-09-29
+
+# Tres tramos ordenados en el tiempo, sin huecos ni traslapes (decisión 4).
+# Las decisiones se toman con validación. La prueba final se usa una sola vez.
+tramos:
+  entrenamiento: {inicio: 2026-07-01, fin: 2026-08-31}
+  validacion:    {inicio: 2026-09-01, fin: 2026-09-14}
+  prueba:        {inicio: 2026-09-15, fin: 2026-09-29}
+
+# Unión de variantes de un mismo id de estación (decisión 15).
+# Dos escrituras como 2231.1 y 2231.10, o 5308.04 y 5308.04_, se unen solo si
+# tienen el mismo nombre y sus coordenadas están a esta distancia o menos.
+# Con 1 metro se exige, en la práctica, la misma coordenada.
+union_de_ids:
+  distancia_maxima_m: 1.0
+
+# Estaciones que no entran a las tablas. Un viaje que sale de una estación
+# normal hacia una de estas sigue contando como salida; solo no hay llegada.
+estaciones_excluidas:
+  # HB y JC: Nueva Jersey. Aquí solo aparecen como destino; sus salidas están
+  #   en otros archivos (JC-...), así que su flujo quedaría incompleto.
+  # SYS: talleres y bodegas, no son estaciones públicas.
+  prefijos: [HB, JC, SYS]
+  # Talleres con id de otra forma ("Morgan HCT Charging" y "Shop Morgan").
+  ids: ["1234.56", "Shop Morgan"]
