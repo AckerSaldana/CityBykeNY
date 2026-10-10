@@ -21,7 +21,12 @@ st.write(
 # La lista dice qué tablas lee esta vista. Si son todas reales, en lugar del
 # aviso sale una nota corta que lo dice.
 # OJO: si la vista empieza a leer otra tabla, agrégala a esta lista.
-datos.show_synthetic_warning(["stations", "station_hour"])
+tables_used = ["stations", "station_hour"]
+datos.show_synthetic_warning(tables_used)
+# Nota de simulación. Va en todas las páginas, con la misma lista; no la
+# quites. Esta vista no lee tablas simuladas: aquí no muestra nada. Si algún
+# día lee recommendations o policy_curve, la nota sale sola.
+datos.show_simulation_note(tables_used)
 
 # --- Datos de esta vista ---
 # stations: una fila por estación, con su ubicación (lat, lon).

@@ -1,4 +1,5 @@
-"""Prueba de humo del dashboard: abre sin errores y avisa de los datos sintéticos.
+"""Prueba de humo del dashboard: abre sin errores, avisa de los datos sintéticos
+y dice qué tablas son resultados de una simulación.
 
 Usa AppTest de Streamlit, que ejecuta las páginas sin navegador. Comprueba que
 el código corre y qué textos produce. No comprueba cómo se ve en pantalla.
@@ -10,6 +11,7 @@ apuntan las carpetas de app/datos.py a carpetas temporales.
 """
 
 import ast
+import json
 import shutil
 import tomllib
 from pathlib import Path
@@ -41,6 +43,9 @@ WARNING = "DATOS SINTÉTICOS DE MUESTRA: no son resultados reales"
 # Nota de una vista cuyas tablas son todas reales mientras otras siguen sintéticas.
 REAL_ONLY = "Esta vista usa solo tablas reales"
 MAKE_SAMPLE = "python scripts/make_sample_data.py"
+# Las dos tablas que salen de la simulación de inventario, y su nota.
+SIM_TABLES = ["recommendations", "policy_curve"]
+SIM_NOTE = "RESULTADOS DE UNA SIMULACIÓN: no son mediciones"
 
 
 @pytest.fixture()
@@ -122,6 +127,18 @@ def copy_sample(folder: Path, *, skip: str | None = None) -> None:
             shutil.copy(SAMPLE / f"{table}.parquet", folder / f"{table}.parquet")
 
 
+def write_report(folder: Path, rules: str = "provisional", forecast: str = "baseline") -> None:
+    """Escribe en `folder` un reporte de simulación con solo los dos datos que lee la app."""
+    (folder / "reports").mkdir(exist_ok=True)
+    report = {"reglas": {"estado": rules}, "pronostico": {"modelo_que_alimenta_model": forecast}}
+    (folder / "reports" / "simulacion.json").write_text(json.dumps(report), encoding="utf-8")
+
+
+def sim_notes_of(at: AppTest) -> list[str]:
+    """Notas de simulación que hay en el cuerpo de la página (lista vacía = ninguna)."""
+    return [element.value for element in at.main.info if SIM_NOTE in element.value]
+
+
 def data_check_of(at: AppTest) -> dict[str, str]:
     """Sección "Datos leídos": nombre de la tabla -> su renglón, con filas y origen."""
     text = next(element.value for element in at.markdown if "filas leídas" in element.value)
@@ -179,6 +196,11 @@ def test_abre_con_lo_que_hay_hoy_en_el_repositorio(datos, loaded):
         # vistas, lo dice con la nota corta. Si todo es real, no dice nada.
         note = any(REAL_ONLY in element.value for element in at.main.info)
         assert note == (bool(synthetic) and not reads_synthetic), page
+        # La nota de simulación se ve exactamente cuando la página lee una
+        # tabla simulada que ya es real.
+        reads_simulated = bool((set(SIM_TABLES) & set(loaded)) - synthetic)
+        assert bool(sim_notes_of(at)) == reads_simulated, page
+        assert any(SIM_NOTE in element.value for element in at.sidebar.info) == reads_simulated, page
 
 
 @pytest.mark.parametrize("page", ALL_PAGES, ids=lambda page: Path(page).stem if page else "inicio")
@@ -230,8 +252,12 @@ def test_la_vista_que_lee_una_tabla_sintetica_muestra_el_aviso_completo(datos, p
 
 
 @pytest.mark.parametrize("page", PAGES, ids=PAGE_IDS)
-def test_con_la_mezcla_de_hoy_solo_la_vista_del_mapa_dice_que_usa_tablas_reales(datos, processed, loaded, page):
-    """Hoy son reales stations, station_hour, predictions y routes; siguen sintéticas las otras dos."""
+def test_sin_las_tablas_simuladas_solo_la_vista_del_mapa_dice_que_usa_tablas_reales(datos, processed, loaded, page):
+    """Reales stations, station_hour, predictions y routes; de la muestra las dos tablas simuladas.
+
+    Es lo que hay en una máquina donde ya se corrió la limpieza y la línea
+    base, pero todavía no la simulación (python scripts/run_simulation.py).
+    """
     pending = ["recommendations", "policy_curve"]
     for table in TABLES:
         if table not in pending:
@@ -261,6 +287,10 @@ def test_con_la_mezcla_de_hoy_solo_la_vista_del_mapa_dice_que_usa_tablas_reales(
                 assert f"`{table}`" in text
         assert "mezcladas" in at.main.warning[0].value
         assert not any(REAL_ONLY in element.value for element in at.info)
+    # Las tablas simuladas vienen de la muestra: manda el aviso de datos
+    # sintéticos y la nota de simulación no sale en ninguna vista.
+    assert sim_notes_of(at) == []
+    assert not any(SIM_NOTE in element.value for element in at.sidebar.info)
 
 
 @pytest.mark.parametrize(
@@ -322,6 +352,7 @@ def test_la_vista_de_pronostico_dice_que_lo_observado_solo_se_compara_en_validac
     assert "decisión 4" in text
     assert "solo en los días de validación" in text
     assert "sin lo observado al lado y sin calcular su error" in text
+    assert "la simulación de inventario tampoco se corre sobre la prueba final" in text
     # La prueba de lectura cuenta aparte las filas de validación de la estación elegida.
     predictions = datos.load_predictions()
     station = predictions["station_id"] == at.selectbox[0].value
@@ -483,6 +514,326 @@ def test_sin_aviso_cuando_todas_las_tablas_son_reales(datos, processed, page):
 
 
 # --------------------------------------------------------------------------- #
+# Tablas que salen de la simulación: reales, pero no son mediciones
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        (None, ["recommendations", "policy_curve"]),
+        ("pages/1_Mapa_de_demanda.py", []),
+        ("pages/2_Ranking_de_estaciones_y_rutas.py", ["recommendations", "policy_curve"]),
+        ("pages/3_Pronostico_por_estacion.py", ["recommendations"]),
+    ],
+    ids=PAGE_IDS,
+)
+def test_con_las_seis_tablas_reales_la_nota_de_simulacion_sale_donde_se_leen_tablas_simuladas(
+    datos, processed, page, expected
+):
+    """Sin tablas sintéticas ya no hay aviso. Las tablas simuladas siguen sin ser mediciones: se dice."""
+    # Copias de la muestra en la carpeta temporal: solo para simular datos reales.
+    copy_sample(processed)
+    write_report(processed, rules="provisional", forecast="baseline")
+
+    at = open_page(page)
+
+    assert errors_of(at) == []
+    assert not at.error
+    assert not at.warning  # el aviso de datos sintéticos no sale: nada viene de la muestra
+    notes = sim_notes_of(at)
+    side = [element.value for element in at.sidebar.info if SIM_NOTE in element.value]
+    if not expected:
+        assert notes == [] and side == []  # la vista no lee tablas simuladas
+        return
+    assert len(notes) == 1 and len(side) == 1
+    for text in (notes[0], side[0]):
+        for table in SIM_TABLES:
+            assert (f"`{table}`" in text) == (table in expected), table
+    text = " ".join(notes[0].lower().split())
+    assert "días de validación" in text
+    assert "la prueba final no se simula (decisión 4)" in text
+    assert "son **provisionales**" in text  # reglas de operación, según el reporte
+    assert "línea base" in text  # lo que alimentó a la política "model", según el reporte
+    # Lenguaje honesto (decisión 9).
+    assert "*riesgo simulado*" in text
+    assert "*riesgo simulado evitado*" in text
+    assert "viajes bloqueados de la simulación son simulados: no son demanda insatisfecha medida" in text
+
+
+@pytest.mark.parametrize("page", ALL_PAGES, ids=lambda page: Path(page).stem if page else "inicio")
+def test_toda_vista_que_lee_una_tabla_simulada_real_muestra_la_nota(datos, processed, loaded, page):
+    """Regla para cualquier vista, también las nuevas. Cuenta lo que la vista lee de verdad."""
+    copy_sample(processed)
+    at = open_page(page, loaded)
+    name = page or "Inicio.py"
+
+    assert errors_of(at) == [], name
+    read = [table for table in SIM_TABLES if table in loaded]
+    notes = sim_notes_of(at)
+    if not read:
+        assert notes == [], f"{name} muestra la nota de simulación sin leer ninguna tabla simulada"
+        return
+    assert len(notes) == 1, (
+        f"{name} lee tablas simuladas ({', '.join(read)}) y no muestra la nota. Agrega "
+        "datos.show_simulation_note(tables_used) después de datos.show_synthetic_warning(tables_used)."
+    )
+    for table in read:
+        assert f"`{table}`" in notes[0], (
+            f"{name} lee la tabla simulada `{table}` y la nota no la nombra. "
+            f"Agrega \"{table}\" a la lista de tablas de esa vista."
+        )
+    assert any(SIM_NOTE in element.value for element in at.sidebar.info), (
+        f"{name}: falta la nota en el menú de la izquierda"
+    )
+
+
+@pytest.mark.parametrize("page", PAGES, ids=PAGE_IDS)
+def test_con_las_tablas_simuladas_en_la_muestra_manda_el_aviso_de_datos_sinteticos(datos, processed, page):
+    """Todo sale de data/sample: aviso de datos sintéticos y ninguna nota de simulación."""
+    at = open_page(page)
+
+    assert errors_of(at) == []
+    assert WARNING in at.main.warning[0].value
+    assert sim_notes_of(at) == []
+    assert not any(SIM_NOTE in element.value for element in at.sidebar.info)
+
+
+@pytest.mark.parametrize("only", SIM_TABLES)
+def test_la_nota_de_simulacion_no_nombra_la_tabla_que_sigue_en_la_muestra(datos, processed, only):
+    """Una tabla simulada real y la otra sintética: la nota es de la real y el aviso de la sintética."""
+    copy_sample(processed, skip=only)  # la única sintética: `only`
+    other = next(table for table in SIM_TABLES if table != only)
+
+    # La vista 2 lee las dos: aviso por la sintética, nota por la real.
+    at = open_page(RANKING)
+    assert errors_of(at) == []
+    assert f"`{only}`" in at.main.warning[0].value
+    notes = sim_notes_of(at)
+    assert len(notes) == 1
+    assert f"`{other}`" in notes[0]
+    assert f"`{only}`" not in notes[0]
+
+    # La vista 3 solo lee recommendations.
+    at = open_page(FORECAST)
+    assert errors_of(at) == []
+    if only == "recommendations":
+        # Es sintética: aviso completo y ninguna nota de simulación.
+        assert f"`{only}`" in at.main.warning[0].value
+        assert sim_notes_of(at) == []
+        assert not any(SIM_NOTE in element.value for element in at.sidebar.info)
+    else:
+        # Es real: nota de simulación, sin aviso. Además dice que usa solo tablas reales.
+        assert not at.warning
+        assert len(sim_notes_of(at)) == 1
+        assert "`recommendations`" in sim_notes_of(at)[0]
+        assert any(REAL_ONLY in element.value for element in at.main.info)
+
+
+@pytest.mark.parametrize(
+    ("used", "named"),
+    [
+        ('["stations", "station_hour"]', []),  # no lee tablas simuladas: sin nota
+        ('["stations", "recommendations"]', ["recommendations"]),
+        ('["policy_curve"]', ["policy_curve"]),
+        ("", SIM_TABLES),  # sin lista: se supone que lee las seis tablas
+        ("[]", SIM_TABLES),  # lista vacía: igual que sin lista
+        ('["recomendaciones"]', SIM_TABLES),  # nombre mal escrito: ante la duda, la nota completa
+    ],
+    ids=["sin_simuladas", "recommendations", "policy_curve", "sin_lista", "lista_vacia", "nombre_mal_escrito"],
+)
+def test_ante_la_duda_la_nota_de_simulacion(datos, processed, used, named):
+    """show_simulation_note(lista): nombra las tablas simuladas reales de la lista."""
+    copy_sample(processed)
+
+    at = AppTest.from_string(f"import datos\ndatos.show_simulation_note({used})\n", default_timeout=30).run()
+
+    assert errors_of(at) == []
+    assert not at.warning
+    notes = sim_notes_of(at)
+    side = [element.value for element in at.sidebar.info if SIM_NOTE in element.value]
+    assert len(notes) == len(side) == (1 if named else 0)
+    for text in notes + side:
+        for table in SIM_TABLES:
+            assert (f"`{table}`" in text) == (table in named), table
+
+
+@pytest.mark.parametrize(
+    ("report", "present", "absent"),
+    [
+        (("provisional", "baseline"), ["son **provisionales**", "línea base", "no es un modelo entrenado"], ["LightGBM"]),
+        (("confirmado", "lgbm"), ["ya estaban confirmadas", "LightGBM"], ["provisionales", "línea base"]),
+        (("otro_estado", "otro_modelo"), ["`otro_estado`", "`otro_modelo`"], ["son **provisionales**", "línea base"]),
+        (None, ["No se pudo leer el reporte", "no se sabe"], ["son **provisionales**", "línea base", "LightGBM"]),
+        ("roto", ["No se pudo leer el reporte", "no se sabe"], ["son **provisionales**", "línea base", "LightGBM"]),
+    ],
+    ids=["provisional_y_linea_base", "confirmado_y_lgbm", "valores_desconocidos", "sin_reporte", "reporte_roto"],
+)
+def test_la_nota_dice_lo_que_trae_el_reporte_de_la_corrida(datos, processed, report, present, absent):
+    """El estado de las reglas y el pronóstico de "model" no vienen en las tablas: salen del reporte.
+
+    Si alguien confirma las reglas o llega LightGBM y vuelve a simular, la
+    nota cambia sola. Si no hay reporte, dice que no se sabe: no lo supone.
+    """
+    copy_sample(processed)
+    if report == "roto":
+        (processed / "reports").mkdir()
+        (processed / "reports" / "simulacion.json").write_text("{ esto no es JSON", encoding="utf-8")
+    elif report is not None:
+        write_report(processed, rules=report[0], forecast=report[1])
+
+    at = AppTest.from_string("import datos\ndatos.show_simulation_note()\n", default_timeout=30).run()
+
+    assert errors_of(at) == []
+    text = sim_notes_of(at)[0]
+    for phrase in present:
+        assert phrase in text, phrase
+    for phrase in absent:
+        assert phrase not in text, phrase
+    # Lo que no depende del reporte está siempre.
+    assert "*riesgo simulado evitado*" in text
+    assert "no son demanda insatisfecha medida" in text
+
+
+def test_la_nota_cuenta_los_dias_de_la_tabla_no_los_trae_escritos(datos, processed):
+    """Si alguien vuelve a simular con otros días, la nota cambia sola."""
+    copy_sample(processed)
+    full = pd.read_parquet(SAMPLE / "recommendations.parquet")
+    days = full["window_start"].dt.normalize()
+    script = "import datos\ndatos.show_simulation_note()\n"
+
+    text = sim_notes_of(AppTest.from_string(script, default_timeout=30).run())[0]
+    assert days.nunique() > 2
+    assert f"`recommendations` cubre {days.nunique()} días: {datos.periodo_en_texto(days.min(), days.max())}." in text
+
+    # Otra corrida "real": solo los dos primeros días.
+    first_two = sorted(days.unique())[:2]
+    full[days.isin(first_two)].to_parquet(processed / "recommendations.parquet")
+    text = sim_notes_of(AppTest.from_string(script, default_timeout=30).run())[0]
+    assert f"`recommendations` cubre 2 días: {datos.periodo_en_texto(first_two[0], first_two[1])}." in text
+
+
+def test_las_fechas_se_escriben_en_espanol(datos):
+    first, last = pd.Timestamp("2026-09-02", tz="America/New_York"), pd.Timestamp("2026-09-14", tz="America/New_York")
+
+    assert datos.fecha_en_texto(first) == "2 de septiembre de 2026"
+    assert datos.periodo_en_texto(first, last) == "del 2 al 14 de septiembre de 2026"
+    # Si el periodo cruza de mes, cada fecha lleva su mes.
+    other = pd.Timestamp("2026-10-01", tz="America/New_York")
+    assert datos.periodo_en_texto(last, other) == "del 14 de septiembre de 2026 al 1 de octubre de 2026"
+    assert datos.periodo_en_texto(first, first) == "el 2 de septiembre de 2026"  # un solo día
+
+
+def test_la_prueba_de_lectura_cuenta_lo_que_traen_las_tablas_simuladas(datos, processed):
+    """Estaciones, días, franjas, políticas y presupuestos salen de la tabla, no del código."""
+    recommendations = datos.load_recommendations()
+    policy_curve = datos.load_policy_curve()
+    days = recommendations["window_start"].dt.normalize()
+
+    check = data_check_of(open_page(RANKING))
+
+    line = check["recommendations"]
+    assert "Una fila por estación, día, franja horaria y política" in line
+    assert f"{recommendations['station_id'].nunique()} estaciones" in line
+    assert f"{days.nunique()} días ({datos.periodo_en_texto(days.min(), days.max())})" in line
+    assert f"{recommendations['window_start'].dt.hour.nunique()} franjas por día" in line
+    assert "3 políticas" in line
+    line = check["policy_curve"]
+    assert "Una fila por política y presupuesto diario" in line
+    budgets = ", ".join(str(budget) for budget in sorted(policy_curve["budget"].unique()))
+    assert f"{policy_curve['budget'].nunique()} presupuestos ({budgets} bicis al día" in line
+    # Las tablas que no son simuladas siguen con su renglón de siempre.
+    assert check["stations"].endswith("(SINTÉTICA, de `data/sample`).")
+
+    # Con otra tabla, la frase cambia: no hay cifras escritas a mano.
+    fewer = recommendations[recommendations["policy"] != "model"]
+    assert "2 políticas" in datos.describe_simulated("recommendations", fewer)
+    assert "1 presupuestos (0 bicis al día" in datos.describe_simulated(
+        "policy_curve", policy_curve[policy_curve["budget"] == 0]
+    )
+    # Una tabla sin filas no rompe la página, y las otras tablas no llevan frase.
+    assert datos.describe_simulated("recommendations", recommendations.head(0)) == ""
+    assert datos.describe_simulated("stations", datos.load_stations()) == ""
+
+
+def test_las_paginas_abren_aunque_las_recomendaciones_reales_no_traigan_filas(datos, processed):
+    copy_sample(processed)
+    pd.read_parquet(SAMPLE / "recommendations.parquet").head(0).to_parquet(processed / "recommendations.parquet")
+
+    for page in (None, RANKING, FORECAST):
+        at = open_page(page)
+        assert errors_of(at) == [], page
+        assert not at.error, page
+        assert len(sim_notes_of(at)) == 1, page
+
+
+def test_la_vista_de_pronostico_dice_cuando_una_estacion_no_se_simulo(datos, processed):
+    """Con tablas reales, "0 de recomendaciones" quiere decir que la estación quedó fuera de la simulación."""
+    copy_sample(processed)
+    stations = pd.read_parquet(SAMPLE / "stations.parquet")
+    full = pd.read_parquet(SAMPLE / "recommendations.parquet")
+    # Dos estaciones quedan fuera de la "simulación": una sin capacidad y una con capacidad.
+    without = stations.loc[stations["capacity"].isna(), "station_id"].iloc[0]
+    with_capacity = stations.loc[stations["capacity"].notna(), "station_id"].iloc[0]
+    out = [without, with_capacity]
+    full[~full["station_id"].isin(out)].to_parquet(processed / "recommendations.parquet")
+    simulated = next(station for station in stations["station_id"] if station not in out)
+    not_simulated = "no se simuló"
+
+    at = open_page(FORECAST)
+
+    # Una estación simulada: se cuentan sus días y políticas, y no sale el mensaje.
+    at.selectbox[0].select(simulated).run()
+    assert errors_of(at) == []
+    rows = full[full["station_id"] == simulated]
+    days = rows["window_start"].dt.normalize().nunique()
+    text = visible_text_of(at)
+    assert f"cubren {days} días y 3 políticas" in text
+    assert "hay que elegir un día y una política" in text
+    assert not_simulated not in text
+
+    # Una estación que quedó fuera: se dice, con cuántas están así.
+    for station in out:
+        at.selectbox[0].select(station).run()
+        assert errors_of(at) == []
+        text = visible_text_of(at)
+        assert "0 de recomendaciones" in text
+        assert "esta estación no se simuló: por eso no tiene recomendaciones" in text
+        assert "las estaciones sin capacidad registrada" in text
+        assert "las que no tuvieron viajes en los días simulados" in text
+        # Las cuentas salen de las tablas: 2 estaciones fuera, 1 de ellas sin capacidad.
+        assert f"no se simularon 2 de las {len(stations)} estaciones (1 sin capacidad registrada)" in text
+
+
+def test_con_tablas_mezcladas_la_vista_de_pronostico_no_dice_que_la_estacion_no_se_simulo(datos, processed):
+    """Con estaciones de la muestra y recomendaciones "reales", el cero viene de la mezcla: lo explica el aviso."""
+    full = pd.read_parquet(SAMPLE / "recommendations.parquet")
+    station = datos.load_stations()["station_id"].iloc[0]
+    full[full["station_id"] != station].to_parquet(processed / "recommendations.parquet")
+
+    at = open_page(FORECAST)
+    at.selectbox[0].select(station).run()
+
+    assert errors_of(at) == []
+    assert datos.synthetic_tables() == [table for table in TABLES if table != "recommendations"]
+    text = visible_text_of(at)
+    assert "0 de recomendaciones" in text
+    assert "no se simuló" not in text
+    assert "mezcladas" in at.main.warning[0].value
+
+
+def test_el_reporte_real_de_la_simulacion_trae_lo_que_lee_la_app(datos):
+    """Si la simulación cambia el nombre de esos dos datos en su reporte, la nota diría "no se sabe"."""
+    report = ROOT / "data" / "processed" / "reports" / "simulacion.json"
+    if not report.is_file():
+        pytest.skip("no hay reporte real de la simulación en data/processed/reports")
+
+    run = datos.simulation_run()
+
+    assert run["rules"] in ("provisional", "confirmado"), run
+    assert run["forecast"] in ("baseline", "lgbm"), run
+
+
+# --------------------------------------------------------------------------- #
 # Si falta un archivo: mensaje amable, no un error de Python
 # --------------------------------------------------------------------------- #
 
@@ -595,6 +946,29 @@ def test_la_app_no_importa_nada_de_src():
                 continue
             for module in modules:
                 assert module.split(".")[0] != "src", f"{path.name} importa {module}"
+
+
+def test_los_textos_de_la_app_ya_no_describen_las_tablas_simuladas_como_antes():
+    """Frases que eran ciertas antes de que existiera la simulación y hoy confunden."""
+    stale = [
+        "por estación, franja horaria y política",  # falta el día: hay una fila por día
+        "conviene que la estación empiece la franja",  # start_inventory_target no es un inventario ideal
+        "sintéticas todavía",  # recommendations y policy_curve ya salen de la simulación
+        "hasta que exista el simulador",
+        "cuando existan datos reales",
+        "qué convenía hacer",  # bikes_to_move es lo que la política movió, no lo que convenía
+    ]
+    for path in sorted(APP.rglob("*")):
+        if path.suffix in (".py", ".md"):
+            text = " ".join(path.read_text(encoding="utf-8").lower().split())
+            for phrase in stale:
+                assert phrase not in text, f"{path.name}: {phrase}"
+    # El documento de la carpeta dice qué son las dos columnas que más se malinterpretan.
+    leeme = " ".join((APP / "LEEME.md").read_text(encoding="utf-8").split())
+    assert "Una fila por estación, día, franja horaria y política" in leeme
+    assert "No es el inventario ideal" in leeme
+    assert "el presupuesto no alcanzó" in leeme
+    assert "no se simul" in leeme
 
 
 def test_la_app_no_habla_de_viajes_que_los_datos_no_registran():

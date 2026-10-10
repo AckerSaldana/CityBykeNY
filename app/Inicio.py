@@ -32,6 +32,11 @@ st.write(
 # mientras quede alguna tabla sintética.
 datos.show_synthetic_warning()
 
+# Nota de simulación. También va en todas las páginas y tampoco se quita a
+# mano. Sale cuando recommendations o policy_curve ya son reales: dice que son
+# resultados de una simulación, no mediciones. Sin lista, igual que el aviso.
+datos.show_simulation_note()
+
 # --- Vistas ---
 # Enlaces a las tres vistas. Son las mismas que salen en el menú de la izquierda.
 # OJO: si cambias el nombre de un archivo de pages/, cambia también su enlace
@@ -47,9 +52,11 @@ st.caption(
 )
 datos.page_link("pages/3_Pronostico_por_estacion.py", label="Pronóstico por estación")
 # El pronóstico cubre periodos de evaluación que ya pasaron, no horas futuras.
+# Las recomendaciones salen de la simulación: solo existen en los días simulados.
 st.caption(
     "Para una estación y un día del periodo evaluado: ¿qué se esperaba hora por "
-    "hora y qué convenía hacer?"
+    "hora? En los días simulados: ¿cuántas bicis llevó o retiró cada política "
+    "en la simulación?"
 )
 
 # Lenguaje honesto (decisión 9 del equipo). Los datos solo registran viajes que
@@ -82,10 +89,13 @@ st.markdown(
     """
 - Explicar en dos o tres frases cómo se lee el tablero y en qué orden conviene
   ver las vistas.
-- Poner aquí los indicadores principales cuando existan datos reales. Con datos
-  sintéticos no se presenta ninguna cifra como resultado.
+- Poner aquí los indicadores principales. Los que salgan de `recommendations` o
+  de `policy_curve` son resultados de una simulación: se presentan como riesgo
+  simulado y riesgo simulado evitado, con su intervalo, nunca como mediciones.
+  Con datos sintéticos no se presenta ninguna cifra como resultado.
 - Decidir dónde va la curva de riesgo contra presupuesto (tabla `policy_curve`):
-  aquí o en la vista de ranking.
+  aquí o en la vista de ranking. Su valor son horas de estación en riesgo
+  simulado por día (promedio de los días evaluados).
 - Quitar la sección "Datos leídos" cuando ya no haga falta.
 """
 )
