@@ -67,9 +67,9 @@ COLORES_RIESGO = {"alto": "#D55E00", "medio": "#E69F00", "bajo": "#009E73"}
 COLORES_MODELO = {"baseline": "#E69F00", "lgbm": "#0072B2"}
 COLOR_AZAR = "#CC79A7"
 COLOR_OBSERVADO = "#222222"
-# Mapa de demanda: par propio, distinto de los colores de las políticas.
-COLOR_SE_VACIA = "#7B3294"  # morado. Flujo neto negativo: salen más bicis de las que llegan
-COLOR_SE_LLENA = "#008837"  # verde. Flujo neto positivo: llegan más de las que salen
+# Mapa de demanda: naranja para las que se vacían y azul para las que se llenan.
+COLOR_SE_VACIA = "#D55E00"  # naranja. Flujo neto negativo: salen más bicis de las que llegan
+COLOR_SE_LLENA = "#0072B2"  # azul. Flujo neto positivo: llegan más de las que salen
 # Plan de la ronda: otro par propio.
 COLOR_LLEVAR = "#44AA99"    # verde azulado: bicis que se llevan a la estación
 COLOR_RETIRAR = "#882255"   # vino: bicis que se retiran
