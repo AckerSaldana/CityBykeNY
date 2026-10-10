@@ -31,7 +31,7 @@ Para comprobar que la app sigue abriendo después de un cambio:
 |---|---|
 | `app/Inicio.py` | Página de inicio. Es la que se abre con `streamlit run`. |
 | `app/pages/1_Mapa_de_demanda.py` | Vista 1: dónde y a qué hora salen y llegan más bicis. |
-| `app/pages/2_Ranking_de_estaciones_y_rutas.py` | Vista 2: qué estaciones se atienden primero y cuántas bicis se mueven. |
+| `app/pages/2_Ranking_de_estaciones_y_rutas.py` | Vista 2: qué estaciones se atienden primero, cuántas bicis se mueven y entre qué pares de estaciones viajan más los usuarios. |
 | `app/pages/3_Pronostico_por_estacion.py` | Vista 3: qué se esperaba en una estación en un día ya evaluado y qué convenía hacer. |
 | `app/datos.py` | Lee las tablas. Es el único archivo que sabe dónde están los datos. |
 | `app/LEEME.md` | Este documento. |
@@ -55,7 +55,7 @@ en rojo que dice cuál vista no encuentra.
 
 ## De dónde salen los datos
 
-Para cada tabla, `app/datos.py` busca así:
+Son seis tablas. Para cada una, `app/datos.py` busca así:
 
 1. Si el archivo está en `data/processed`, usa ese. Son los datos reales.
 2. Si no, usa el de `data/sample`. Son **datos sintéticos**, inventados por un
@@ -93,11 +93,15 @@ Una fila por estación.
 | `name` | Nombre de la estación. |
 | `lat`, `lon` | Ubicación: latitud y longitud. |
 | `capacity` | Cuántas bicis caben. **Puede venir vacío.** |
-| `station_type` | Tipo: `oficinas`, `residencial`, `recreativa` o `mixta`. **Puede venir vacío.** |
+| `station_type` | Tipo: `oficinas`, `residencial`, `recreativa` o `mixta`. **Puede venir vacío**, incluso en todas las estaciones, mientras no exista la regla que lo asigna. |
 
 ### `station_hour` — `datos.load_station_hour()`
 
 Una fila por estación y hora. Es lo que se observó.
+
+**Cada estación tiene filas solo entre su primer y su último viaje.** Dentro de
+ese tramo están todas las horas; las que no tuvieron viajes valen cero. Fuera de
+ese tramo no hay filas.
 
 | Columna | Qué es |
 |---|---|
@@ -148,12 +152,41 @@ Una fila por política y presupuesto diario.
 | `risk_station_hours` | Horas de estación en riesgo (vacía o llena en la simulación). |
 | `ci_low`, `ci_high` | Límite bajo y alto del intervalo de confianza de ese valor. |
 
+### `routes` — `datos.load_routes()`
+
+Una fila por par de estaciones: la de inicio y la de fin del viaje. Son viajes
+de usuarios. **No son rutas de camiones de rebalanceo.**
+
+| Columna | Qué es |
+|---|---|
+| `start_station_id` | Identificador de la estación donde empezó el viaje. Es texto. |
+| `end_station_id` | Identificador de la estación donde terminó. Es texto. Puede ser la misma del inicio. |
+| `trips` | Cuántos viajes hubo de la estación de inicio a la de fin en todo el periodo. Siempre es 1 o más. |
+
 ## Lo que hay que saber de los datos
 
-- **No hay datos de rutas.** `recommendations` dice cuántas bicis recibe o
-  entrega cada estación. No dice de cuál estación salen ni a cuál van. Ningún
-  archivo lo dice todavía. Es una decisión pendiente del equipo. No se inventa
-  un archivo de rutas en la app.
+- **Rutas: hay viajes entre estaciones, no rutas de camiones.** `routes` dice
+  cuántos viajes de usuarios hubo de una estación a otra. Las rutas de
+  rebalanceo quedan fuera por ahora: `recommendations` dice cuántas bicis
+  recibe o entrega cada estación, pero ningún archivo dice de cuál estación
+  salen ni a cuál van. No se inventa ese dato en la app.
+- En `routes`, el viaje de A a B y el de B a A son dos filas distintas. Los
+  pares sin ningún viaje no tienen fila. Hay filas con la misma estación de
+  inicio y de fin: el usuario devolvió la bici donde la tomó.
+- `trips` es un total de todo el periodo. `routes` no trae día, hora ni tipo de
+  usuario, así que las rutas no se pueden filtrar por fecha ni por hora.
+- Para mostrar nombres en lugar de identificadores, `routes` se une dos veces
+  con `stations`: una por `start_station_id` y otra por `end_station_id`.
+- **`station_hour` no trae todas las horas de todas las estaciones.** Cada
+  estación tiene filas solo entre su primer y su último viaje. Por eso no
+  todas empiezan ni terminan el mismo día. En la muestra hay estaciones que
+  cubren menos días; `data/sample/LEEME.md` dice cuáles. Una estación así
+  también puede tener menos filas de pronóstico y de recomendaciones.
+- Si una estación no tiene fila en una hora, esa hora queda fuera de lo
+  observado para esa estación. No se dibuja como cero: se deja sin dato.
+- Un cero en `departures` o en `arrivals` dice que no se registró ningún viaje
+  en esa hora. No dice que nadie buscó una bici: si la estación estaba vacía,
+  ahí puede haber posible demanda insatisfecha.
 - `capacity` y `station_type` pueden venir vacíos. La app debe mostrar esas
   estaciones con "Sin dato", no esconderlas ni fallar.
 - `ts_hour`, `window_start` y `window_end` ya vienen en hora local de Nueva
@@ -204,15 +237,23 @@ Di en qué vista, con qué tabla y qué quieres ver. Ejemplos:
 5. "En la vista 2 dibuja la curva de riesgo contra presupuesto, con una línea
    por política y una banda entre `ci_low` y `ci_high`. Debajo explica en una
    frase que la diferencia contra no intervenir es riesgo simulado evitado."
-6. "En la vista 3, para la estación elegida, dibuja las salidas esperadas por
+6. "En la vista 2 muestra una tabla con los pares de estaciones con más viajes
+   (tabla `routes`), de mayor a menor, con el nombre de la estación de inicio y
+   el de la estación de fin. Agrega un selector de cuántos pares mostrar.
+   Escribe debajo que son viajes de usuarios que sí ocurrieron, no rutas de
+   camiones."
+7. "En la vista 2 dibuja en un mapa una línea por cada uno de los pares con más
+   viajes, más gruesa mientras más viajes tenga. Deja fuera los viajes que
+   empiezan y terminan en la misma estación y di cuántos son."
+8. "En la vista 3, para la estación elegida, dibuja las salidas esperadas por
    hora con una banda entre `dep_q10` y `dep_q90`, y encima las salidas
    observadas. Agrega un selector de modelo y otro de fechas."
-7. "En la vista 3 escribe la acción sugerida en una frase por cada franja del
+9. "En la vista 3 escribe la acción sugerida en una frase por cada franja del
    día elegido: llevar bicis si `bikes_to_move` es positivo, retirar bicis si
    es negativo y no mover si es cero. Si `feasible` es falso, agrega una
    advertencia."
-8. "En todas las vistas, cuando falte la capacidad o el tipo de una estación,
-   muestra 'Sin dato' en lugar de dejar el espacio vacío."
+10. "En todas las vistas, cuando falte la capacidad o el tipo de una estación,
+    muestra 'Sin dato' en lugar de dejar el espacio vacío."
 
 Al final de cada instrucción conviene agregar: "Deja los comentarios en
 español, no quites el aviso de datos sintéticos y corre

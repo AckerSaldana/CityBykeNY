@@ -39,7 +39,10 @@ st.subheader("Vistas")
 datos.page_link("pages/1_Mapa_de_demanda.py", label="Mapa de demanda")
 st.caption("¿En qué zonas y a qué horas salen y llegan más bicis?")
 datos.page_link("pages/2_Ranking_de_estaciones_y_rutas.py", label="Ranking de estaciones y rutas")
-st.caption("¿Qué estaciones se atienden primero y cuántas bicis se llevan o se retiran?")
+st.caption(
+    "¿Qué estaciones se atienden primero, cuántas bicis se llevan o se retiran "
+    "y entre qué estaciones viajan más los usuarios?"
+)
 datos.page_link("pages/3_Pronostico_por_estacion.py", label="Pronóstico por estación")
 # El pronóstico cubre periodos de evaluación que ya pasaron, no horas futuras.
 st.caption(
@@ -57,8 +60,9 @@ st.info(
 )
 
 # --- Prueba de lectura ---
-# Se leen las cinco tablas y se muestra cuántas filas trae cada una. Si falta
+# Se leen las seis tablas y se muestra cuántas filas trae cada una. Si falta
 # un archivo, aquí aparece un mensaje que dice cómo generarlo.
+# OJO: routes son viajes de usuarios entre estaciones, no rutas de camiones.
 st.subheader("Datos leídos")
 tables = {
     "stations": datos.load_stations(),
@@ -66,6 +70,7 @@ tables = {
     "predictions": datos.load_predictions(),
     "recommendations": datos.load_recommendations(),
     "policy_curve": datos.load_policy_curve(),
+    "routes": datos.load_routes(),
 }
 datos.show_data_check(tables)
 

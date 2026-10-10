@@ -27,13 +27,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# Las rutas se arman desde la ubicación de este archivo, no desde la carpeta en
-# la que se abrió la terminal. Así la app funciona igual desde cualquier lugar.
+# Las carpetas se ubican a partir de este archivo, no desde la carpeta en la
+# que se abrió la terminal. Así la app funciona igual desde cualquier lugar.
 ROOT = Path(__file__).resolve().parents[1]    # carpeta raíz del repositorio
 DATA_PROCESSED = ROOT / "data" / "processed"  # datos reales
 DATA_SAMPLE = ROOT / "data" / "sample"        # datos SINTÉTICOS de muestra
 
-# Las cinco tablas del proyecto: nombre -> qué contiene.
+# Las seis tablas del proyecto: nombre -> qué contiene.
 # El archivo de cada una se llama <nombre>.parquet.
 TABLES = {
     "stations": "Estaciones: nombre, ubicación, capacidad y tipo",
@@ -41,6 +41,7 @@ TABLES = {
     "predictions": "Pronóstico de salidas y llegadas, por estación y hora",
     "recommendations": "Bicis a mover, por estación y franja horaria",
     "policy_curve": "Estaciones-hora en riesgo según el presupuesto diario, por política",
+    "routes": "Viajes de usuarios entre pares de estaciones, sumados sobre el periodo",
 }
 
 SYNTHETIC_WARNING = "DATOS SINTÉTICOS DE MUESTRA: no son resultados reales"
@@ -180,6 +181,11 @@ def load_station_hour() -> pd.DataFrame:
     `ts_hour` es el inicio de la hora, en hora local de Nueva York, con zona
     horaria. Son viajes que sí ocurrieron: solo demanda atendida.
     Para el eje de una gráfica, mira hora_para_grafica() más abajo.
+
+    OJO: cada estación tiene filas solo entre su primer y su último viaje.
+    Dentro de ese tramo están todas las horas; las que no tuvieron viajes
+    valen cero. Fuera de ese tramo no hay filas. Por eso no todas las
+    estaciones empiezan ni terminan el mismo día.
     """
     return _load("station_hour")
 
@@ -207,6 +213,20 @@ def load_recommendations() -> pd.DataFrame:
 def load_policy_curve() -> pd.DataFrame:
     """Curva de riesgo contra presupuesto: una fila por política y presupuesto diario."""
     return _load("policy_curve")
+
+
+def load_routes() -> pd.DataFrame:
+    """Viajes entre pares de estaciones: una fila por estación de inicio y estación de fin.
+
+    `trips` es cuántos viajes hubo de la primera a la segunda en todo el
+    periodo. De A a B y de B a A son dos filas distintas.
+    OJO: son viajes de usuarios, NO rutas de camiones de rebalanceo. Ningún
+    archivo dice de qué estación a cuál conviene mover bicis.
+    El inicio y el fin pueden ser la misma estación (el usuario devolvió la
+    bici donde la tomó). Los pares sin ningún viaje no tienen fila.
+    Son viajes que sí ocurrieron: solo demanda atendida.
+    """
+    return _load("routes")
 
 
 # --------------------------------------------------------------------------- #
