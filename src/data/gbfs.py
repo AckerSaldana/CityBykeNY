@@ -2,9 +2,11 @@
 
 ES URGENTE dejarlo corriendo. El feed no guarda historia: solo publica cuántas
 bicis y lugares libres hay en este minuto. Lo que no se captura se pierde.
-Sirve para ver cuándo una estación estuvo vacía o llena (posible demanda
-insatisfecha), algo que los viajes no muestran porque solo registran la demanda
-atendida.
+
+Para qué se usa (decisión del equipo): capacidad de las estaciones, modo en
+vivo y perfil de ocupación por hora. La captura empezó después de los meses de
+viajes que usamos, así que NO se traslapa con ellos y NO sirve para validar
+posible demanda insatisfecha en esos meses.
 
 Qué guarda
 ----------

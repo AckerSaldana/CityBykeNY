@@ -45,7 +45,7 @@ Si en macOS LightGBM falla al importarse por `libomp`, se instala con
 pytest
 ```
 
-Valida los cinco contratos de datos sobre `data/sample`, la revisión contra
+Valida los seis contratos de datos sobre `data/sample`, la revisión contra
 fuga de información, `config/operacion.yaml`, los scripts y que el dashboard
 abra. Las pruebas no usan la red.
 
@@ -146,7 +146,7 @@ tests/          Pruebas
 
 - Dos integrantes en paralelo, cada quien en su rama y en sus carpetas (ver el
   reparto en `CLAUDE.md`). Commits pequeños.
-- Los cinco archivos de `data/processed` son el punto de encuentro. Se escriben
+- Los seis archivos de `data/processed` son el punto de encuentro. Se escriben
   con `src.contracts.write_contract`, que valida nombres y tipos.
 - Las reglas de operación viven en `config/operacion.yaml`, no en el código. Se
   responden en lenguaje normal en `docs/reglas_operacion.md`.

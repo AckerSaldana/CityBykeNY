@@ -54,10 +54,30 @@ a punta**, aunque sea con la línea base, y mejorar desde ahí.
     validación: clima y festivos, capacidad de GBFS, empleos y residentes
     (LODES), uso de predios (PLUTO), lugares frecuentados (OpenStreetMap con
     OSMnx), afluencia del metro (MTA).
+11. **Rutas:** contrato `routes.parquet` con los viajes entre pares de
+    estaciones, sumados sobre el periodo. Es para la vista de ranking de
+    estaciones y rutas. Las rutas de rebalanceo (camiones) quedan fuera por
+    ahora.
+12. **`station_hour` es densa:** una fila por estación y hora, con ceros, solo
+    entre el primer y el último viaje observado de cada estación.
+13. **`station_type`** se asigna con una regla de comportamiento calculada solo
+    con el tramo de entrenamiento: flujo neto de la mañana entre semana,
+    proporción de fin de semana y proporción de usuarios ocasionales. Puede ser
+    nulo mientras no exista la regla.
+14. **`ocupacion_respaldo`** (antes `ocupacion_objetivo`) es el inventario
+    inicial común de las tres políticas y el valor que se usa cuando no hay
+    solución factible. La regla histórica no lo usa.
+15. **Ids de estación:** son texto. Las variantes como `2231.1` y `2231.10` se
+    unen solo si coinciden nombre y coordenadas. Se reporta cuántas se unieron
+    y cuántas no.
+16. **GBFS:** la captura no se traslapa con los meses de viajes. Se usa solo
+    para capacidad, modo en vivo y perfil de ocupación por hora. No se usa para
+    validar demanda insatisfecha.
 
 ## Contratos de datos
 
-Conectan el trabajo de los dos integrantes. **Nombres y tipos exactos.** La
+Son seis archivos que conectan el trabajo de los dos integrantes. **Nombres y
+tipos exactos.** La
 definición ejecutable está en `src/contracts.py`; si un contrato cambia, se
 cambia ahí, aquí y en el diccionario `SPEC` de `tests/test_contracts.py`,
 avisando al otro integrante.
@@ -83,6 +103,10 @@ cuando ningún inventario inicial evita a la vez vaciarse y llenarse)
 
 `data/processed/policy_curve.parquet`
 policy, budget (int), risk_station_hours (float), ci_low (float), ci_high (float)
+
+`data/processed/routes.parquet`
+start_station_id (str), end_station_id (str), trips (int, viajes de la estación
+de inicio a la de fin en todo el periodo; al menos 1)
 
 Cómo se cumplen en la práctica:
 
@@ -119,7 +143,13 @@ Cómo se cumplen en la práctica:
   número, porque ya perdió los ceros.
 - `station_type` usa las categorías de la estrategia de operación: oficinas,
   residencial, recreativa, mixta. No es el `station_type` de GBFS ("classic").
-  *Interpretación del equipo de programación, pendiente de confirmar.*
+  Queda nulo hasta que exista la regla de la decisión 13.
+- `station_hour` densa (decisión 12): el validador exige una fila por hora
+  entre la primera y la última de cada estación, que esas dos tengan al menos
+  un viaje y que no haya estaciones sin viajes. Se cuenta en instantes: el día
+  de 25 horas lleva 25 filas.
+- `routes` son viajes de usuarios entre estaciones, no rutas de camión. Inicio
+  y fin pueden ser la misma estación.
 
 ## Reparto del equipo
 
@@ -180,8 +210,8 @@ python scripts/capture_gbfs.py --una-vez  # una sola captura (para cron)
 app/            Dashboard de Streamlit (Inicio.py, pages/, datos.py, LEEME.md)
 config/         operacion.yaml: reglas de operación
 data/raw/       Descargas pesadas: trips/, zips/, gbfs/      (no va en Git)
-data/processed/ Salidas reales del flujo, los cinco contratos (no va en Git)
-data/sample/    Datos SINTÉTICOS pequeños con los cinco contratos (sí va en Git)
+data/processed/ Salidas reales del flujo, los seis contratos (no va en Git)
+data/sample/    Datos SINTÉTICOS pequeños con los seis contratos (sí va en Git)
 docs/           reglas_operacion.md
 notebooks/a/    Notebooks de Acker
 notebooks/b/    Notebooks del compañero
@@ -248,6 +278,9 @@ GBFS (`https://gbfs.citibikenyc.com/gbfs/gbfs.json`):
 
 - No guarda historial: lo que no se captura se pierde. Por eso corre
   `scripts/capture_gbfs.py`.
+- La captura empezó el 10 de octubre de 2026: no se traslapa con los meses de
+  viajes. Sirve para capacidad, modo en vivo y perfil de ocupación por hora.
+  No sirve para validar demanda insatisfecha (decisión 16).
 - `station_information` trae `capacity` y `short_name`. Es el puente entre el
   id de GBFS y el `station_id` de los viajes. Hoy son 2,519 estaciones, todas
   con `short_name` único.
@@ -318,16 +351,10 @@ el pronóstico de clima emitido antes de decidir).
 ## Pendientes y decisiones abiertas
 
 - Confirmar los valores de `config/operacion.yaml` (logística).
-- Definir cómo se asigna `station_type` a cada estación (logística).
-- Decidir qué significa `ocupacion_objetivo` en `config/operacion.yaml`: el
-  inventario de respaldo cuando ningún inventario evita a la vez vaciarse y
-  llenarse, o el objetivo de la política de regla histórica. Hoy solo lo usan
-  los datos de muestra.
-- **Rutas:** `recommendations` dice cuántas bicis recibe o entrega cada
-  estación, no de cuál a cuál. La vista "ranking de estaciones y rutas" no tiene
-  todavía un contrato para rutas. Hay que acordarlo.
-- **Tabla densa o no:** el contrato de `station_hour` no dice si las horas sin
-  viajes llevan fila con ceros. La muestra sí las lleva. Hay que decidirlo antes
-  de la línea base, porque cambia las métricas.
+- Fijar los umbrales de la regla de `station_type` (decisión 13). Hasta
+  entonces la columna queda nula.
+- `ocupacion_respaldo` tiene un valor por franja y la decisión 14 no dice cuál
+  da el inventario inicial de la simulación. Programación usará el de la
+  primera franja del día salvo que logística diga otra cosa.
 - Aún no existen: limpieza y tabla por estación y hora, línea base, LightGBM,
   simulador y variables externas.
