@@ -1,0 +1,101 @@
+# =============================================================================
+#  REGLAS DE OPERACIÓN DEL REBALANCEO
+# =============================================================================
+#
+#  ⚠️  TODOS LOS VALORES DE ESTE ARCHIVO SON PROVISIONALES.
+#
+#  Son números de arranque puestos por programación para que el flujo corra.
+#  NO son criterio de logística ni vienen de datos. No se deben citar en el
+#  pitch hasta que el responsable de logística los revise y confirme.
+#
+#  Cómo confirmarlos: responde las cinco preguntas de docs/reglas_operacion.md,
+#  cambia aquí los valores y al final pon  estado: confirmado  con tu nombre
+#  y la fecha.
+#
+#  El simulador leerá TODO de este archivo (todavía no existe; hoy solo lo usan
+#  los datos de muestra): no habrá números de operación escritos en el código.
+#  Cambiar un valor aquí cambiará el resultado de la simulación.
+#
+#  Después de editar, comprueba que el archivo sigue siendo válido con:
+#      pytest tests/test_operacion_config.py
+# =============================================================================
+
+estado: provisional        # provisional | confirmado
+confirmado_por: null       # nombre de quien confirma
+fecha_confirmacion: null   # AAAA-MM-DD
+
+# -----------------------------------------------------------------------------
+# Pregunta 1. Franjas horarias de rebalanceo y momento de intervención
+# -----------------------------------------------------------------------------
+# Cada franja es un periodo del día que queremos proteger. La intervención es
+# la hora a la que los camiones ya dejaron las estaciones listas para esa
+# franja. Horas en formato "HH:MM", hora local de Nueva York.
+# Reglas: momento_intervencion <= inicio < fin, y las franjas no se enciman.
+franjas:
+  - nombre: manana                 # PROVISIONAL
+    momento_intervencion: "05:00"  # PROVISIONAL
+    inicio: "06:00"                # PROVISIONAL
+    fin: "12:00"                   # PROVISIONAL
+  - nombre: tarde                  # PROVISIONAL
+    momento_intervencion: "14:00"  # PROVISIONAL
+    inicio: "15:00"                # PROVISIONAL
+    fin: "21:00"                   # PROVISIONAL
+
+# -----------------------------------------------------------------------------
+# Pregunta 2. Umbral de riesgo
+# -----------------------------------------------------------------------------
+# Una estación está "en riesgo" en una hora si le quedan MENOS bicis que
+# bicis_minimas (riesgo de vaciarse) o MENOS lugares libres que
+# lugares_libres_minimos (riesgo de llenarse).
+umbral_riesgo:
+  bicis_minimas: 2                 # PROVISIONAL
+  lugares_libres_minimos: 2        # PROVISIONAL
+
+# -----------------------------------------------------------------------------
+# Pregunta 3. Presupuestos diarios para la curva
+# -----------------------------------------------------------------------------
+# Total de bicis que la operación puede trasladar en un día. Se simulará cada
+# valor de la lista para dibujar la curva "riesgo contra presupuesto".
+# El 0 sirve de referencia (equivale a no intervenir).
+presupuestos_diarios: [0, 50, 100, 200, 400, 800]   # PROVISIONAL
+
+# -----------------------------------------------------------------------------
+# Pregunta 4. Distancia máxima entre la estación que dona y la que recibe
+# -----------------------------------------------------------------------------
+# En kilómetros, en línea recta. Un traslado entre dos estaciones más lejanas
+# que esto no se permite.
+distancia_maxima_km: 3.0           # PROVISIONAL
+
+# -----------------------------------------------------------------------------
+# Pregunta 5. Estrategia por tipo de estación
+# -----------------------------------------------------------------------------
+# prioridad: a quién se atiende primero cuando el presupuesto no alcanza
+#   (3 = alta, 2 = media, 1 = baja).
+# ocupacion_objetivo: qué tan llena conviene dejar la estación al iniciar cada
+#   franja, como fracción de su capacidad (0.0 = vacía, 1.0 = llena).
+#   Interpretación de programación, pendiente de confirmar: se usaría como
+#   respaldo cuando ningún inventario inicial evite a la vez que la estación
+#   se vacíe y se llene; falta decidir si es eso o la meta de la regla
+#   histórica.
+#   Debe haber un valor por cada franja definida arriba.
+estrategia_por_tipo:
+  oficinas:
+    prioridad: 3                   # PROVISIONAL
+    ocupacion_objetivo:
+      manana: 0.30                 # PROVISIONAL (llegan muchas bicis: dejar lugares libres)
+      tarde: 0.70                  # PROVISIONAL (salen muchas bicis: dejar bicis)
+  residencial:
+    prioridad: 3                   # PROVISIONAL
+    ocupacion_objetivo:
+      manana: 0.70                 # PROVISIONAL
+      tarde: 0.30                  # PROVISIONAL
+  recreativa:
+    prioridad: 1                   # PROVISIONAL
+    ocupacion_objetivo:
+      manana: 0.50                 # PROVISIONAL
+      tarde: 0.50                  # PROVISIONAL
+  mixta:
+    prioridad: 2                   # PROVISIONAL
+    ocupacion_objetivo:
+      manana: 0.50                 # PROVISIONAL
+      tarde: 0.50                  # PROVISIONAL
