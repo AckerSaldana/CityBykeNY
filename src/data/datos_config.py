@@ -1,8 +1,13 @@
-"""Lectura y validación de config/datos.yaml: periodo, tramos y reglas de limpieza.
+"""Lectura y validación de config/datos.yaml: periodo, tramos, reglas de limpieza y ajustes de la simulación.
 
 La limpieza y los modelos leen de aquí las fechas. Así el periodo y los tres
 tramos (entrenamiento, validación y prueba) están en un solo lugar y no
 escritos en el código.
+
+El bloque `simulacion` trae los ajustes del simulador que no son reglas de
+operación (calentamiento y remuestreo). Solo lo usa el simulador: un archivo
+sin ese bloque es válido para la limpieza y la línea base, y entonces
+`datos.simulacion` es None.
 """
 
 from __future__ import annotations
@@ -47,6 +52,16 @@ class Tramo:
 
 
 @dataclass(frozen=True)
+class Simulacion:
+    """Bloque `simulacion`: ajustes del simulador que no son reglas de operación."""
+
+    dias_de_calentamiento: int   # primeros días simulados; se simulan pero no cuentan en las métricas
+    remuestreos: int             # veces que se sortean los días para calcular el intervalo
+    nivel_del_intervalo: float   # 0.90 es un intervalo del 90 %
+    semilla: int                 # semilla del sorteo: misma semilla, mismo intervalo
+
+
+@dataclass(frozen=True)
 class Datos:
     meses_crudos: tuple[str, ...]
     periodo: Tramo
@@ -54,6 +69,8 @@ class Datos:
     distancia_maxima_m: float
     prefijos_excluidos: tuple[str, ...]
     ids_excluidos: tuple[str, ...]
+    # None si el archivo no trae el bloque `simulacion` (la limpieza y la línea base no lo usan).
+    simulacion: Simulacion | None = None
 
 
 def _tramo(nombre: str, raw, problems: list[str], donde: str = "") -> Tramo | None:
@@ -66,6 +83,57 @@ def _tramo(nombre: str, raw, problems: list[str], donde: str = "") -> Tramo | No
         problems.append(f"{etiqueta}: inicio no puede ser posterior a fin")
         return None
     return Tramo(nombre, raw["inicio"], raw["fin"])
+
+
+def _es_entero(valor) -> bool:
+    """Entero de verdad: ni 1.0, ni "1", ni true (que en Python también es un entero)."""
+    return type(valor) is int
+
+
+def _simulacion(raw, validacion: Tramo | None, problems: list[str]) -> Simulacion | None:
+    """Valida el bloque `simulacion`. `validacion` es None si los tramos ya traen algún problema."""
+    if not isinstance(raw, dict):
+        problems.append(
+            "simulacion: debe ser un bloque con dias_de_calentamiento, remuestreos, nivel_del_intervalo y semilla"
+        )
+        return None
+    antes = len(problems)
+
+    # El calentamiento no cuenta en las métricas: debe quedar al menos un día de validación que sí cuente.
+    calentamiento = raw.get("dias_de_calentamiento")
+    dias_de_validacion = None if validacion is None else (validacion.fin - validacion.inicio).days + 1
+    tope = "" if validacion is None else f" y menor que los {dias_de_validacion} días del tramo de validación"
+    if (
+        not _es_entero(calentamiento)
+        or calentamiento < 0
+        or (dias_de_validacion is not None and calentamiento >= dias_de_validacion)
+    ):
+        problems.append(f"simulacion.dias_de_calentamiento: debe ser un número entero mayor o igual a 0{tope}")
+
+    remuestreos = raw.get("remuestreos")
+    if not _es_entero(remuestreos) or remuestreos < 100:
+        problems.append("simulacion.remuestreos: debe ser un número entero mayor o igual a 100")
+
+    nivel = raw.get("nivel_del_intervalo")
+    if not isinstance(nivel, (int, float)) or isinstance(nivel, bool) or not 0.5 < nivel < 1:
+        problems.append(
+            "simulacion.nivel_del_intervalo: debe ser un número mayor que 0.5 y menor que 1 "
+            "(0.90 es un intervalo del 90 %)"
+        )
+
+    # Sin negativos: el generador de números al azar de numpy no los acepta como semilla.
+    semilla = raw.get("semilla")
+    if not _es_entero(semilla) or semilla < 0:
+        problems.append("simulacion.semilla: debe ser un número entero mayor o igual a 0")
+
+    if len(problems) > antes:
+        return None
+    return Simulacion(
+        dias_de_calentamiento=calentamiento,
+        remuestreos=remuestreos,
+        nivel_del_intervalo=float(nivel),
+        semilla=semilla,
+    )
 
 
 def load_datos(path: str | Path = DATOS_YAML) -> Datos:
@@ -132,6 +200,12 @@ def load_datos(path: str | Path = DATOS_YAML) -> Datos:
         if not isinstance(valor, list) or not all(isinstance(item, str) and item for item in valor):
             problems.append(f"estaciones_excluidas.{nombre}: debe ser una lista de textos entre comillas (puede ir vacía)")
 
+    # El bloque `simulacion` solo lo usa el simulador. Si no está, no es un error aquí.
+    simulacion = None
+    if "simulacion" in cfg:
+        validacion = tramos.get("validacion") if len(tramos) == len(TRAMOS) else None
+        simulacion = _simulacion(cfg["simulacion"], validacion, problems)
+
     if problems:
         raise DatosError(f"{path} no es válido:\n- " + "\n- ".join(problems))
     return Datos(
@@ -141,4 +215,5 @@ def load_datos(path: str | Path = DATOS_YAML) -> Datos:
         distancia_maxima_m=float(distancia),
         prefijos_excluidos=tuple(prefijos),
         ids_excluidos=tuple(ids),
+        simulacion=simulacion,
     )

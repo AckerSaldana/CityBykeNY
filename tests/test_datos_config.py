@@ -2,17 +2,19 @@
 
 Córrela después de editar el archivo:  pytest tests/test_datos_config.py
 
-Solo las tres primeras pruebas leen el archivo del repositorio, y no revisan
-fechas concretas: cambiar el periodo por otro válido no rompe ninguna. Las
-demás prueban el lector con una configuración fija escrita aquí (TEXTO_BASE).
+Solo las cuatro primeras pruebas leen el archivo del repositorio, y no revisan
+fechas ni valores concretos: cambiar el periodo o un ajuste por otro válido no
+rompe ninguna. Las demás prueban el lector con una configuración fija escrita
+aquí (TEXTO_BASE).
 """
 
+import dataclasses
 from datetime import date
 
 import pandas as pd
 import pytest
 
-from src.data.datos_config import SPLIT_NAMES, TRAMOS, Datos, DatosError, Tramo, load_datos
+from src.data.datos_config import SPLIT_NAMES, TRAMOS, Datos, DatosError, Simulacion, Tramo, load_datos
 from src.paths import TZ
 
 # Configuración fija para probar el lector. NO es el archivo del repositorio.
@@ -30,7 +32,15 @@ union_de_ids:
 estaciones_excluidas:
   prefijos: [HB, JC]
   ids: ["1234.56", "Shop Morgan"]
+simulacion:
+  dias_de_calentamiento: 2
+  remuestreos: 500
+  nivel_del_intervalo: 0.80
+  semilla: 7
 """
+
+# El bloque de simulación de TEXTO_BASE, para las pruebas que lo quitan o lo cambian entero.
+BLOQUE_SIMULACION = TEXTO_BASE[TEXTO_BASE.index("simulacion:"):]
 
 
 def _archivo(tmp_path, texto):
@@ -81,6 +91,18 @@ def test_los_meses_crudos_del_repositorio_cubren_el_periodo(datos):
     assert not faltan, f"config/datos.yaml: el periodo toca meses que no están en meses_crudos: {faltan}"
 
 
+def test_el_archivo_del_repositorio_trae_los_ajustes_de_la_simulacion(datos):
+    """El lector admite un archivo sin el bloque `simulacion`, pero el del repositorio lo necesita.
+
+    Lo lee el simulador: sin ese bloque no hay calentamiento ni remuestreo que usar.
+    """
+    assert isinstance(datos.simulacion, Simulacion), "config/datos.yaml no trae el bloque simulacion"
+    validacion = datos.tramos["validacion"]
+    dias_de_validacion = (validacion.fin - validacion.inicio).days + 1
+    # Tiene que quedar al menos un día de validación que sí cuente.
+    assert 0 <= datos.simulacion.dias_de_calentamiento < dias_de_validacion
+
+
 # --- De aquí en adelante ninguna prueba lee config/datos.yaml ---
 
 
@@ -97,6 +119,8 @@ def test_un_archivo_valido_se_carga_con_sus_valores(tmp_path):
     assert datos.distancia_maxima_m == 1.0 and isinstance(datos.distancia_maxima_m, float)
     assert datos.prefijos_excluidos == ("HB", "JC")
     assert datos.ids_excluidos == ("1234.56", "Shop Morgan")  # texto: un id nunca es un número
+    assert datos.simulacion == Simulacion(dias_de_calentamiento=2, remuestreos=500, nivel_del_intervalo=0.8, semilla=7)
+    assert isinstance(datos.simulacion.nivel_del_intervalo, float)
 
 
 def test_el_fin_de_un_tramo_esta_incluido(tmp_path):
@@ -139,6 +163,119 @@ def test_un_mes_de_en_medio_que_falta_se_rechaza(tmp_path):
     # Con agosto en la lista, el mismo archivo es válido.
     datos = load_datos(_archivo(tmp_path, texto.replace("[202607, 202609]", "[202607, 202608, 202609]")))
     assert datos.periodo.fin == date(2026, 9, 29)
+
+
+# --------------------------------------------------------------------------- #
+# Bloque de simulación
+# --------------------------------------------------------------------------- #
+
+def test_sin_bloque_de_simulacion_el_archivo_es_valido_y_el_ajuste_queda_vacio(tmp_path):
+    """La limpieza y la línea base no usan ese bloque: un archivo sin él sigue sirviendo para ellas."""
+    datos = load_datos(_archivo(tmp_path, _editado(BLOQUE_SIMULACION, "")))
+    assert datos.simulacion is None
+    assert datos.tramos["validacion"].inicio == date(2026, 8, 11)
+
+
+def test_los_ajustes_de_la_simulacion_no_se_pueden_cambiar_ya_cargados(tmp_path):
+    simulacion = load_datos(_archivo(tmp_path, TEXTO_BASE)).simulacion
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        simulacion.remuestreos = 10
+
+
+@pytest.mark.parametrize(
+    "viejo, nuevo",
+    [
+        # (texto de TEXTO_BASE, otro valor que también es válido)
+        ("dias_de_calentamiento: 2", "dias_de_calentamiento: 0"),   # sin calentamiento
+        ("dias_de_calentamiento: 2", "dias_de_calentamiento: 9"),   # validación tiene 10 días: queda 1 que cuenta
+        ("remuestreos: 500", "remuestreos: 100"),                   # el mínimo
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: 0.51"),
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: 0.999"),
+        ("semilla: 7", "semilla: 0"),
+    ],
+)
+def test_valores_de_la_simulacion_en_el_borde_que_si_se_admiten(tmp_path, viejo, nuevo):
+    clave, valor = nuevo.split(": ")
+    simulacion = load_datos(_archivo(tmp_path, _editado(viejo, nuevo))).simulacion
+    assert getattr(simulacion, clave) == float(valor)
+
+
+@pytest.mark.parametrize(
+    "viejo, nuevo, mensaje",
+    [
+        # El tramo de validación de TEXTO_BASE tiene 10 días (11 a 20 de agosto).
+        ("dias_de_calentamiento: 2", "dias_de_calentamiento: 10",
+         "simulacion.dias_de_calentamiento: debe ser un número entero mayor o igual a 0 y menor que los 10 días "
+         "del tramo de validación"),
+        ("dias_de_calentamiento: 2", "dias_de_calentamiento: -1", "simulacion.dias_de_calentamiento: debe ser"),
+        ("dias_de_calentamiento: 2", "dias_de_calentamiento: 1.0", "simulacion.dias_de_calentamiento: debe ser"),
+        ("dias_de_calentamiento: 2", "dias_de_calentamiento: true", "simulacion.dias_de_calentamiento: debe ser"),
+        ("dias_de_calentamiento: 2", 'dias_de_calentamiento: "2"', "simulacion.dias_de_calentamiento: debe ser"),
+        ("dias_de_calentamiento: 2", "dias_de_calentamiento: uno", "simulacion.dias_de_calentamiento: debe ser"),
+        ("  dias_de_calentamiento: 2\n", "", "simulacion.dias_de_calentamiento: debe ser"),
+        ("remuestreos: 500", "remuestreos: 99",
+         "simulacion.remuestreos: debe ser un número entero mayor o igual a 100"),
+        ("remuestreos: 500", "remuestreos: 0", "simulacion.remuestreos: debe ser"),
+        ("remuestreos: 500", "remuestreos: 2000.0", "simulacion.remuestreos: debe ser"),
+        ("remuestreos: 500", "remuestreos: 2,000", "simulacion.remuestreos: debe ser"),
+        ("remuestreos: 500", "remuestros: 500", "simulacion.remuestreos: debe ser"),  # clave mal escrita
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: 0.5",
+         "simulacion.nivel_del_intervalo: debe ser un número mayor que 0.5 y menor que 1"),
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: 1", "simulacion.nivel_del_intervalo: debe ser"),
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: 1.0", "simulacion.nivel_del_intervalo: debe ser"),
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: 90", "(0.90 es un intervalo del 90 %)"),
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: 0,90", "simulacion.nivel_del_intervalo: debe ser"),
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: .nan", "simulacion.nivel_del_intervalo: debe ser"),
+        ("nivel_del_intervalo: 0.80", "nivel_del_intervalo: true", "simulacion.nivel_del_intervalo: debe ser"),
+        ("semilla: 7", "semilla: -1", "simulacion.semilla: debe ser un número entero mayor o igual a 0"),
+        ("semilla: 7", "semilla: 1.5", "simulacion.semilla: debe ser"),
+        ("semilla: 7", "semilla: false", "simulacion.semilla: debe ser"),
+        ("  semilla: 7\n", "", "simulacion.semilla: debe ser"),
+        # El bloque está, pero vacío o con otra forma (por ejemplo, con todas sus líneas comentadas).
+        (BLOQUE_SIMULACION, "simulacion:\n", "simulacion: debe ser un bloque con dias_de_calentamiento"),
+        (BLOQUE_SIMULACION, "simulacion: [1, 2000, 0.9, 7]\n", "simulacion: debe ser un bloque con"),
+        (BLOQUE_SIMULACION, "simulacion: 2000\n", "simulacion: debe ser un bloque con"),
+    ],
+)
+def test_un_bloque_de_simulacion_mal_escrito_se_rechaza_con_un_mensaje_claro(tmp_path, viejo, nuevo, mensaje):
+    archivo = _archivo(tmp_path, _editado(viejo, nuevo))
+    with pytest.raises(DatosError) as error:
+        load_datos(archivo)
+    assert mensaje in str(error.value), str(error.value)
+    assert str(archivo) in str(error.value)
+
+
+def test_el_calentamiento_se_compara_con_los_dias_del_tramo_de_validacion(tmp_path):
+    """Con un tramo de validación más corto, el mismo calentamiento deja de caber."""
+    # Entrenamiento hasta el 18 de agosto: validación queda en dos días (19 y 20).
+    corto = (
+        TEXTO_BASE
+        .replace("fin: 2026-08-10}", "fin: 2026-08-18}")
+        .replace("validacion:    {inicio: 2026-08-11", "validacion:    {inicio: 2026-08-19")
+    )
+    assert corto.count("2026-08-18") == 1 and corto.count("2026-08-19") == 1
+    with pytest.raises(DatosError, match="menor que los 2 días del tramo de validación"):
+        load_datos(_archivo(tmp_path, corto))
+    datos = load_datos(_archivo(tmp_path, corto.replace("dias_de_calentamiento: 2", "dias_de_calentamiento: 1")))
+    assert datos.simulacion.dias_de_calentamiento == 1
+
+
+def test_con_los_tramos_mal_escritos_el_mensaje_del_calentamiento_no_inventa_un_tope(tmp_path):
+    """Si los tramos no se pudieron leer, no se sabe cuántos días tiene validación: se dice solo lo que se sabe."""
+    texto = _editado("  prueba:  ", "  test:    ").replace("dias_de_calentamiento: 2", "dias_de_calentamiento: -3")
+    with pytest.raises(DatosError) as error:
+        load_datos(_archivo(tmp_path, texto))
+    assert "tramos: deben ser exactamente" in str(error.value)
+    assert "simulacion.dias_de_calentamiento: debe ser un número entero mayor o igual a 0\n" in str(error.value) + "\n"
+    assert "días del tramo de validación" not in str(error.value)
+
+
+def test_el_mensaje_junta_todos_los_problemas_de_la_simulacion(tmp_path):
+    texto = _editado(BLOQUE_SIMULACION, "simulacion: {dias_de_calentamiento: 99, remuestreos: 5}\n")
+    with pytest.raises(DatosError) as error:
+        load_datos(_archivo(tmp_path, texto))
+    for clave in ("dias_de_calentamiento", "remuestreos", "nivel_del_intervalo", "semilla"):
+        assert f"simulacion.{clave}: debe ser" in str(error.value), clave
 
 
 # --------------------------------------------------------------------------- #

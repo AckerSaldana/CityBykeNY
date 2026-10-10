@@ -1,11 +1,30 @@
 """Limpieza de los viajes y tablas reales: stations, station_hour y routes.
 
 Lee los meses crudos de data/raw/trips que indica config/datos.yaml y escribe
-en data/processed las tres tablas de contrato y un reporte de la limpieza:
+en data/processed las tres tablas de contrato, una tabla interna de viajes y
+un reporte de la limpieza:
 
     stations.parquet, station_hour.parquet, routes.parquet
+    trips.parquet           (interna, para el simulador; NO es un contrato)
     reports/limpieza.json   (para programas)
     reports/limpieza.md     (para personas)
+
+trips.parquet trae una fila por viaje limpio que sale o llega dentro del
+periodo, ordenadas por started_at. Sus columnas están en TRIPS_SCHEMA:
+
+    ride_id            texto
+    started_at         instante con zona America/New_York
+    ended_at           instante con zona America/New_York
+    start_station_id   texto, el id que quedó después de la limpieza
+    end_station_id     texto, el id que quedó después de la limpieza
+
+Una punta va vacía (nula) si el viaje no trae estación, si la estación está
+excluida o si es un id sin ningún viaje dentro del periodo (no es estación de
+las tablas). Una punta cuya fecha cae fuera del periodo conserva su fecha y su
+estación: quien la lee decide qué hacer con ella. Sale de la misma tabla
+intermedia que station_hour y routes, así que contar sus viajes por estación y
+hora, o por par de estaciones, reproduce esas dos tablas. Eso se comprueba en
+cada corrida leyendo de vuelta el archivo ya escrito.
 
 Reglas, en orden. Cada una deja su conteo en el reporte.
 
@@ -30,8 +49,9 @@ Reglas, en orden. Cada una deja su conteo en el reporte.
 8. routes cuenta los viajes entre pares de estaciones.
 
 Antes de escribir se hacen comprobaciones (las sumas cuadran con los viajes,
-toda fila cruda queda explicada y la hora de tres viajes reales coincide con
-un cálculo aparte en Python). Si una falla, no se escribe nada.
+toda fila cruda queda explicada, la hora de tres viajes reales coincide con
+un cálculo aparte en Python y trips.parquet reproduce station_hour y routes).
+Si una falla, no se escribe nada.
 
 Los datos solo registran demanda ATENDIDA: un cero en station_hour no siempre
 es demanda cero (decisión 9).
@@ -60,14 +80,31 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from src.contracts import ContractError, to_contract_table, write_contract
+from src.contracts import TS, ContractError, to_contract_table, write_contract
 from src.data.datos_config import Datos, DatosError, load_datos
 from src.paths import DATA_PROCESSED, DATA_RAW, DATA_SAMPLE, DATOS_YAML, REPORTS, ROOT, TZ
 
-TABLES = ("stations", "station_hour", "routes")
+TABLES = ("stations", "station_hour", "routes")      # las tres tablas de contrato que salen de aquí
 REPORT_FOLDER = REPORTS.relative_to(DATA_PROCESSED)  # "reports", dentro de la carpeta de salida
 REPORT_NAME = "limpieza"
 WORK_FOLDER = "_tmp_build_tables"                    # temporal dentro de la salida; se borra al terminar
+
+# Tabla interna de viajes para el simulador (trips.parquet). NO es uno de los
+# seis contratos de src/contracts.py: solo la escribe este módulo y solo la lee
+# el simulador. Quien la lea puede comparar su esquema contra TRIPS_SCHEMA.
+TRIPS_NAME = "trips"
+TRIPS_SCHEMA = pa.schema(
+    [
+        ("ride_id", pa.string()),
+        ("started_at", TS),                 # instante de salida, hora local de NY
+        ("ended_at", TS),                   # instante de llegada, hora local de NY
+        ("start_station_id", pa.string()),  # nulo: sin estación, excluida o sin viajes en el periodo
+        ("end_station_id", pa.string()),    # nulo: sin estación, excluida o sin viajes en el periodo
+    ]
+)
+# Filas por grupo del Parquet. Como va ordenado por started_at, leer unos
+# pocos días con un filtro sobre esa columna solo abre los grupos que tocan.
+TRIPS_ROWS_PER_GROUP = 500_000
 
 # Para el reporte: racha de horas seguidas sin ningún viaje a partir de la cual
 # un cero es sospechoso (estación cerrada o fuera de servicio, no demanda cero).
@@ -113,17 +150,44 @@ def hour_sql(column: str) -> str:
     return f"date_trunc('hour', {column}) AT TIME ZONE '{TZ}'"
 
 
-def local_hour_instant(naive: datetime) -> datetime:
-    """Inicio de la hora de un momento local de Nueva York, como instante en UTC.
+def instant_sql(column: str) -> str:
+    """SQL de una fecha local sin zona como instante, sin recortarla a la hora.
+
+    Es la única forma que se usa para started_at y ended_at de trips.parquet.
+    Igual que en `hour_sql`: nunca un CAST a TIMESTAMPTZ a secas.
+    """
+    return f"{column} AT TIME ZONE '{TZ}'"
+
+
+def local_instant(naive: datetime) -> datetime:
+    """Un momento local de Nueva York (sin zona) como instante en UTC.
 
     Python puro (zoneinfo), sin DuckDB: sirve para comprobar lo que hace el SQL.
     En un cambio de horario hay dos lecturas posibles y se toma la más tardía,
-    igual que DuckDB: la 01:xx repetida de otoño cae en la segunda 01:00
-    (-05:00) y la 02:xx que no existe en primavera cae en las 03:00 (-04:00).
+    igual que DuckDB: la 01:xx repetida de otoño es la segunda (-05:00) y la
+    02:xx que no existe en primavera se lee como 03:xx (-04:00).
     """
-    hour = naive.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    naive = naive.replace(tzinfo=None)
     zone = ZoneInfo(TZ)
-    return max(hour.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc) for fold in (0, 1))
+    return max(naive.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc) for fold in (0, 1))
+
+
+def local_hour_instant(naive: datetime) -> datetime:
+    """Inicio de la hora de un momento local de Nueva York, como instante en UTC.
+
+    Es `local_instant` de la hora en punto: la 01:xx repetida de otoño cae en
+    la segunda 01:00 (-05:00) y la 02:xx que no existe en primavera cae en las
+    03:00 (-04:00).
+    """
+    return local_instant(naive.replace(minute=0, second=0, microsecond=0))
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def epoch_us(instant: datetime) -> int:
+    """Microsegundos desde 1970 de un instante con zona. Entero exacto, sin pasar por decimales."""
+    return (instant - _EPOCH) // timedelta(microseconds=1)
 
 
 def normalise_name(name: str | None) -> str | None:
@@ -712,6 +776,248 @@ def _routes_table(con: duckdb.DuckDBPyConnection) -> pa.Table:
     ).to_arrow_table()
 
 
+def _write_trips(con: duckdb.DuckDBPyConnection, path: Path) -> int:
+    """Escribe la tabla interna de viajes en `path` y devuelve su tamaño en bytes.
+
+    Sale de `resolved`, la misma tabla de la que salen station_hour y routes:
+    un viaje entra si su salida o su llegada cae dentro del periodo, con la
+    estación final de cada punta (nula si no entra a las tablas). Va ordenada
+    por el instante de salida; el resto del orden solo sirve para que dos
+    corridas den el mismo archivo.
+
+    Se escribe por partes, sin armar la tabla completa en memoria (son millones
+    de filas). Lo escribe pyarrow y no DuckDB para que el archivo guarde la
+    zona de las fechas: DuckDB las dejaría en UTC.
+    """
+    reader = con.execute(
+        f"""
+        SELECT r.ride_id,
+               {instant_sql('r.started_at')} AS started_at,
+               {instant_sql('r.ended_at')} AS ended_at,
+               r.start_station AS start_station_id,
+               r.end_station AS end_station_id
+        FROM resolved r
+        WHERE r.start_in OR r.end_in
+        ORDER BY 2, 3, 1, 4, 5  -- por posición: el instante de salida ya con zona, no la fecha local
+        """
+    ).to_arrow_reader(TRIPS_ROWS_PER_GROUP)
+    with pq.ParquetWriter(
+        path, TRIPS_SCHEMA, compression="zstd", use_dictionary=["start_station_id", "end_station_id"]
+    ) as writer:
+        for batch in reader:
+            # DuckDB entrega las fechas con la zona de su sesión; el instante es
+            # el mismo y aquí solo se le pone la etiqueta de Nueva York.
+            writer.write_batch(batch.cast(TRIPS_SCHEMA), row_group_size=TRIPS_ROWS_PER_GROUP)
+    return path.stat().st_size
+
+
+def _trips_sides(con: duckdb.DuckDBPyConnection) -> dict:
+    """Para el reporte: qué trae cada punta de los viajes que van a trips.parquet."""
+    sides = {}
+    for side, label in (("start", "inicio"), ("end", "fin")):
+        found = dict(
+            con.execute(
+                f"SELECT {side}_state, count(*) FROM resolved WHERE start_in OR end_in GROUP BY 1"
+            ).fetchall()
+        )
+        sides[label] = {
+            "con_estacion": found.pop("ok", 0),
+            "sin_estacion": found.pop("sin_estacion", 0),
+            "estacion_excluida": found.pop("excluida", 0),
+            "estacion_sin_viajes_en_el_periodo": found.pop("inactiva", 0),
+            "sin_clasificar": sum(found.values()),  # debe ser cero
+        }
+    return sides
+
+
+def _read_back_trips(
+    con: duckdb.DuckDBPyConnection,
+    path: Path,
+    period: dict,
+    stations: pa.Table,
+    station_hour: pa.Table,
+    routes: pa.Table,
+    tz_trips: list[dict],
+) -> dict:
+    """Lee de vuelta el archivo de viajes ya escrito y lo compara con las tres tablas.
+
+    Todo se cuenta sobre el archivo, no sobre la tabla de la que salió: si la
+    escritura cambiara una hora, un id o una fila, aquí se nota. Tres cosas se
+    calculan aparte, sin el SQL que armó el archivo:
+
+    - los bordes del periodo, como instantes, con zoneinfo en Python;
+    - la hora de cada viaje, dividiendo su instante entre una hora (sin
+      funciones de fecha, que dependen de la zona de la sesión);
+    - el instante de salida y de llegada de los viajes de la comprobación de
+      zona horaria, con `local_instant`.
+    """
+    schema = pq.read_schema(path)
+    wrong_columns = sum(
+        1
+        for position, expected in enumerate(TRIPS_SCHEMA)
+        if position >= len(schema) or schema.field(position).name != expected.name
+        or schema.field(position).type != expected.type
+    ) + max(0, len(schema) - len(TRIPS_SCHEMA))
+    if wrong_columns:
+        # Con otras columnas el resto de las comprobaciones no se puede ni leer.
+        raise BuildError(
+            f"{TRIPS_NAME}.parquet no quedó con las columnas acordadas. No se escribió nada.\n"
+            f"- esperado: {', '.join(f'{f.name} ({f.type})' for f in TRIPS_SCHEMA)}\n"
+            f"- obtenido: {', '.join(f'{f.name} ({f.type})' for f in schema)}"
+        )
+
+    edges = {"ini_us": epoch_us(local_instant(period["ini"])), "fin_us": epoch_us(local_instant(period["fin"]))}
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP VIEW written AS
+        SELECT ride_id, epoch_us(started_at) AS started_us, epoch_us(ended_at) AS ended_us,
+               start_station_id, end_station_id
+        FROM read_parquet({_sql_text(path)})
+        """
+    )
+    in_period = "({0} >= $ini_us AND {0} < $fin_us)"
+    rows, no_ride_id, repeated, with_start, with_end, no_station, start_in, end_in, first_us, last_us = con.execute(
+        f"""
+        SELECT count(*),
+               count(*) FILTER (WHERE ride_id IS NULL),
+               count(ride_id) - count(DISTINCT ride_id),
+               count(start_station_id),
+               count(end_station_id),
+               count(*) FILTER (WHERE start_station_id IS NULL AND end_station_id IS NULL),
+               count(*) FILTER (WHERE {in_period.format('started_us')}),
+               count(*) FILTER (WHERE {in_period.format('ended_us')}),
+               min(started_us), max(started_us)
+        FROM written
+        """,
+        edges,
+    ).fetchone()
+
+    con.register("stations_check", stations)
+    con.register("station_hour_check", station_hour)
+    con.register("routes_check", routes)
+    try:
+        unknown_ids = con.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT start_station_id AS id FROM written WHERE start_station_id IS NOT NULL
+                UNION
+                SELECT end_station_id FROM written WHERE end_station_id IS NOT NULL
+            )
+            WHERE id NOT IN (SELECT station_id FROM stations_check)
+            """
+        ).fetchone()[0]
+
+        def cells_that_differ(station: str, stamp: str, column: str) -> int:
+            """Horas de estación donde el conteo del archivo no es el de station_hour."""
+            return con.execute(
+                f"""
+                WITH in_file AS (
+                    SELECT {station} AS station_id, {stamp} // {HOUR_US} AS hour, count(*) AS n
+                    FROM written
+                    WHERE {station} IS NOT NULL AND {in_period.format(stamp)}
+                    GROUP BY 1, 2
+                ), in_table AS (
+                    SELECT station_id, epoch_us(ts_hour) // {HOUR_US} AS hour, {column} AS n
+                    FROM station_hour_check WHERE {column} > 0
+                )
+                SELECT count(*) FROM in_file f FULL JOIN in_table t USING (station_id, hour)
+                WHERE f.n IS DISTINCT FROM t.n
+                """,
+                edges,
+            ).fetchone()[0]
+
+        departures_differ = cells_that_differ("start_station_id", "started_us", "departures")
+        arrivals_differ = cells_that_differ("end_station_id", "ended_us", "arrivals")
+        routes_differ = con.execute(
+            f"""
+            WITH in_file AS (
+                SELECT start_station_id, end_station_id, count(*) AS n
+                FROM written
+                WHERE start_station_id IS NOT NULL AND end_station_id IS NOT NULL
+                  AND {in_period.format('started_us')}
+                GROUP BY 1, 2
+            )
+            SELECT count(*) FROM in_file f FULL JOIN routes_check r USING (start_station_id, end_station_id)
+            WHERE f.n IS DISTINCT FROM r.trips
+            """,
+            edges,
+        ).fetchone()[0]
+    finally:
+        for name in ("stations_check", "station_hour_check", "routes_check"):
+            con.unregister(name)
+
+    # Orden: se recorre el archivo en el orden en que quedó escrito.
+    out_of_order, previous = 0, None
+    with pq.ParquetFile(path) as file:
+        for batch in file.iter_batches(columns=["started_at"]):
+            stamps = batch.column(0).cast(pa.int64())
+            if not len(stamps):
+                continue
+            if previous is not None and stamps[0].as_py() < previous:
+                out_of_order += 1
+            out_of_order += int(pc.sum(pc.less(stamps.slice(1), stamps.slice(0, len(stamps) - 1))).as_py() or 0)
+            previous = stamps[-1].as_py()
+
+    def as_text(microseconds: int | None, zone: str = "UTC") -> str | None:
+        if microseconds is None:
+            return None
+        return (_EPOCH + timedelta(microseconds=microseconds)).astimezone(ZoneInfo(zone)).isoformat()
+
+    # Zona horaria: los mismos viajes de `_timezone_check`, ahora con el instante
+    # exacto de la salida y de la llegada tal como quedaron en el archivo.
+    ride_ids = [t["ride_id"] for t in tz_trips]
+    as_loaded, in_file = {}, defaultdict(list)
+    if ride_ids:  # sin viajes que revisar no hay consulta (y `_timezone_check` ya lo marcó como problema)
+        for ride_id, started_at, ended_at in con.execute(
+            "SELECT ride_id, started_at, ended_at FROM resolved WHERE ride_id IN (SELECT unnest($ids))",
+            {"ids": ride_ids},
+        ).fetchall():
+            as_loaded[ride_id] = (started_at, ended_at)
+        for ride_id, started_us, ended_us in con.execute(
+            "SELECT ride_id, started_us, ended_us FROM written WHERE ride_id IN (SELECT unnest($ids))",
+            {"ids": ride_ids},
+        ).fetchall():
+            in_file[ride_id].append((started_us, ended_us))
+    zone_trips = []
+    for ride_id in ride_ids:
+        started_at, ended_at = as_loaded[ride_id]
+        expected = (epoch_us(local_instant(started_at)), epoch_us(local_instant(ended_at)))
+        found = in_file.get(ride_id, [])
+        zone_trips.append(
+            {
+                "ride_id": ride_id,
+                "started_at": started_at.isoformat(sep=" ", timespec="milliseconds"),
+                "ended_at": ended_at.isoformat(sep=" ", timespec="milliseconds"),
+                "inicio_utc": as_text(expected[0]),
+                "fin_utc": as_text(expected[1]),
+                "inicio_en_el_archivo_utc": as_text(found[0][0]) if found else None,
+                "fin_en_el_archivo_utc": as_text(found[0][1]) if found else None,
+                "coincide": found == [expected],  # una sola fila en el archivo, con los dos instantes
+            }
+        )
+    con.execute("DROP VIEW written")
+
+    return {
+        "columnas_distintas": wrong_columns,
+        "filas": rows,
+        "sin_ride_id": no_ride_id,
+        "ride_id_repetidos": repeated,
+        "con_estacion_de_inicio": with_start,
+        "con_estacion_de_fin": with_end,
+        "sin_estacion_en_ninguna_punta": no_station,
+        "con_la_salida_dentro_del_periodo": start_in,
+        "con_la_llegada_dentro_del_periodo": end_in,
+        "primera_salida": as_text(first_us, TZ),
+        "ultima_salida": as_text(last_us, TZ),
+        "ids_que_no_estan_en_stations": unknown_ids,
+        "horas_donde_las_salidas_no_dan_station_hour": departures_differ,
+        "horas_donde_las_llegadas_no_dan_station_hour": arrivals_differ,
+        "pares_que_no_dan_routes": routes_differ,
+        "filas_fuera_de_orden": out_of_order,
+        "zona_horaria": zone_trips,
+    }
+
+
 def _stations_table(
     con: duckdb.DuckDBPyConnection, plan: IdPlan, raw_ids: list[RawId], capacity: dict[str, int | None]
 ) -> tuple[pa.Table, dict]:
@@ -839,7 +1145,35 @@ def _accounting(con: duckdb.DuckDBPyConnection, period: dict) -> dict:
         """,
         period,
     ).fetchone()[0]
+    # Lo que debe traer trips.parquet, contado también sobre `trips` e `id_map`.
+    either = f"({_in_period('t.started_at')} OR {_in_period('t.ended_at')})"
+    expected_trips, expected_start_in, expected_end_in = con.execute(
+        f"""
+        SELECT count(*) FILTER (WHERE {either}),
+               count(*) FILTER (WHERE {_in_period('t.started_at')}),
+               count(*) FILTER (WHERE {_in_period('t.ended_at')})
+        FROM trips t
+        """,
+        period,
+    ).fetchone()
+    expected_with_station = {
+        side: con.execute(
+            f"""
+            SELECT count(*) FROM trips t JOIN id_map m ON m.raw_id = t.{side}_id
+            WHERE m.station_id IS NOT NULL AND {either}
+            """,
+            period,
+        ).fetchone()[0]
+        for side in ("start", "end")
+    }
     return {
+        "trips_esperados": {
+            "filas": expected_trips,
+            "con_la_salida_dentro_del_periodo": expected_start_in,
+            "con_la_llegada_dentro_del_periodo": expected_end_in,
+            "con_estacion_de_inicio": expected_with_station["start"],
+            "con_estacion_de_fin": expected_with_station["end"],
+        },
         "puntas": sides,
         "filas_resueltas": con.execute("SELECT count(*) FROM resolved").fetchone()[0],
         "salidas_esperadas": expected_departures,
@@ -1041,6 +1375,65 @@ def run_checks(
     return checks
 
 
+def trips_checks(accounting: dict, found: dict) -> list[dict]:
+    """Comprobaciones de trips.parquet: lo que se leyó de vuelta del archivo contra lo esperado.
+
+    `found` es lo que devuelve `_read_back_trips`. Mismo formato que `run_checks`.
+    """
+    expected = accounting["trips_esperados"]
+    checks = []
+
+    def check(name: str, wanted, got) -> None:
+        checks.append({"nombre": f"trips: {name}", "esperado": wanted, "obtenido": got, "cumple": wanted == got})
+
+    check("columnas con nombre o tipo distinto al acordado", 0, found["columnas_distintas"])
+    check(
+        "filas del archivo = viajes conservados con la salida o la llegada dentro del periodo",
+        expected["filas"],
+        found["filas"],
+    )
+    check(
+        "filas con la salida dentro del periodo = viajes conservados que empiezan en el periodo",
+        expected["con_la_salida_dentro_del_periodo"],
+        found["con_la_salida_dentro_del_periodo"],
+    )
+    check(
+        "filas con la llegada dentro del periodo = viajes conservados que terminan en el periodo",
+        expected["con_la_llegada_dentro_del_periodo"],
+        found["con_la_llegada_dentro_del_periodo"],
+    )
+    check(
+        "filas con estación de inicio = conteo aparte sobre los viajes",
+        expected["con_estacion_de_inicio"],
+        found["con_estacion_de_inicio"],
+    )
+    check(
+        "filas con estación de fin = conteo aparte sobre los viajes",
+        expected["con_estacion_de_fin"],
+        found["con_estacion_de_fin"],
+    )
+    check("filas con un ride_id que ya salió en otra fila", 0, found["ride_id_repetidos"])
+    check("ids de estación que no están en stations", 0, found["ids_que_no_estan_en_stations"])
+    check(
+        "horas de estación donde las salidas del archivo no dan station_hour.departures",
+        0,
+        found["horas_donde_las_salidas_no_dan_station_hour"],
+    )
+    check(
+        "horas de estación donde las llegadas del archivo no dan station_hour.arrivals",
+        0,
+        found["horas_donde_las_llegadas_no_dan_station_hour"],
+    )
+    check("pares de estaciones donde el archivo no da routes.trips", 0, found["pares_que_no_dan_routes"])
+    check("filas fuera de orden por started_at", 0, found["filas_fuera_de_orden"])
+    check(
+        "viajes de la revisión de zona horaria cuya salida o llegada no cae en el instante calculado aparte",
+        0,
+        sum(1 for trip in found["zona_horaria"] if not trip["coincide"]),
+    )
+    return checks
+
+
 # --------------------------------------------------------------------------- #
 # Flujo completo
 # --------------------------------------------------------------------------- #
@@ -1099,7 +1492,7 @@ def build(
     config_path: Path | None = None,
     log=print,
 ) -> dict:
-    """Corre la limpieza completa y escribe las tres tablas y el reporte.
+    """Corre la limpieza completa y escribe las tres tablas, trips.parquet y el reporte.
 
     Devuelve el reporte (el mismo contenido de limpieza.json). Lanza
     BuildError o ContractError si algo no cuadra; en ese caso no cambia
@@ -1134,11 +1527,20 @@ def build(
         routes = to_contract_table(_routes_table(con), "routes")
         stations, capacity_report = _stations_table(con, plan, raw_ids, capacity)
         stations = to_contract_table(stations, "stations")
-        log(f"  Tablas armadas ({time.time() - started:.0f} s). Comprobando...")
+        log(f"  Tablas armadas ({time.time() - started:.0f} s).")
+
+        # trips.parquet se escribe ya, en la carpeta temporal, porque sus
+        # comprobaciones leen de vuelta el archivo. De ahí no sale si algo falla.
+        trips_path = work / f"{TRIPS_NAME}.parquet"
+        trips_bytes = _write_trips(con, trips_path)
+        log(f"  Viajes escritos en la carpeta temporal ({time.time() - started:.0f} s). Comprobando...")
 
         accounting = _accounting(con, period)
         checks = run_checks(rows, accounting, stations, station_hour, routes)
         tz_trips, tz_problems = _timezone_check(con, station_hour)
+        trips_found = _read_back_trips(con, trips_path, period, stations, station_hour, routes, tz_trips)
+        checks += trips_checks(accounting, trips_found)
+        trips_sides = _trips_sides(con)
         zero_runs = _zero_runs(con)
         failed = [
             f"{c['nombre']}: se esperaba {c['esperado']:,} y se obtuvo {c['obtenido']:,}"
@@ -1148,21 +1550,40 @@ def build(
         if failed:
             raise BuildError("Comprobaciones que fallaron. No se escribió nada:\n- " + "\n- ".join(failed))
 
-        # Las tres tablas se escriben primero en la carpeta temporal. Solo si
-        # las tres cumplen su contrato, y el reporte se pudo armar, pasan a la
-        # carpeta de salida. Así nunca quedan tablas de una corrida con el
-        # reporte de otra.
+        # Las tres tablas se escriben primero en la carpeta temporal, donde ya
+        # está trips.parquet. Solo si las tres cumplen su contrato, y el
+        # reporte se pudo armar, pasan las cuatro a la carpeta de salida. Así
+        # nunca quedan tablas de una corrida con el reporte de otra.
         tables = {"stations": stations, "station_hour": station_hour, "routes": routes}
         sizes = {}
         for name, table in tables.items():
             sizes[name] = write_contract(table, name, work / f"{name}.parquet").stat().st_size
+        trips_report = {
+            "archivo": _short(out_dir / f"{TRIPS_NAME}.parquet"),
+            "es_contrato": False,
+            "columnas": {f.name: str(f.type) for f in TRIPS_SCHEMA},
+            "filas": trips_found["filas"],
+            "bytes": trips_bytes,
+            "sin_ride_id": trips_found["sin_ride_id"],
+            "primera_salida": trips_found["primera_salida"],
+            "ultima_salida": trips_found["ultima_salida"],
+            "puntas": {
+                label: {
+                    **trips_sides[label],
+                    "fuera_del_periodo": trips_found["filas"] - trips_found[f"con_la_{within}_dentro_del_periodo"],
+                }
+                for label, within in (("inicio", "salida"), ("fin", "llegada"))
+            },
+            "sin_estacion_en_ninguna_punta": trips_found["sin_estacion_en_ninguna_punta"],
+            "zona_horaria": trips_found["zona_horaria"],
+        }
         report = _report(
             datos, config_path, raw_dir, out_dir, period, rows, accounting, plan, capacity_report, gbfs_info,
-            tables, sizes, zero_runs, tz_trips, checks, started,
+            tables, sizes, zero_runs, tz_trips, checks, started, trips_report,
         )
         report_json = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         report_md = render_markdown(report)
-        for name in TABLES:
+        for name in (*TABLES, TRIPS_NAME):
             os.replace(work / f"{name}.parquet", out_dir / f"{name}.parquet")
         reports = out_dir / REPORT_FOLDER
         reports.mkdir(parents=True, exist_ok=True)
@@ -1183,7 +1604,7 @@ def build(
 
 def _report(
     datos, config_path, raw_dir, out_dir, period, rows, accounting, plan, capacity_report, gbfs_info,
-    tables, sizes, zero_runs, tz_trips, checks, started,
+    tables, sizes, zero_runs, tz_trips, checks, started, trips_report,
 ) -> dict:
     """Junta todos los conteos de la corrida. Es el contenido de limpieza.json."""
     stations, station_hour, routes = (tables[name] for name in TABLES)
@@ -1234,6 +1655,8 @@ def _report(
             "pares_misma_estacion": loops.num_rows,
             "viajes_misma_estacion": _sum(loops, "trips"),
         },
+        # Tabla interna para el simulador. No es uno de los seis contratos.
+        "trips": trips_report,
         "zona_horaria": tz_trips,
         "comprobaciones": checks,
     }
@@ -1251,12 +1674,18 @@ def _percent(part: int, whole: int) -> str:
     return f"{100 * part / whole:.2f}%" if whole else "0%"
 
 
+def _size(size_bytes: int) -> str:
+    """Tamaño de un archivo en MB (o en KB si es pequeño)."""
+    return f"{size_bytes / 1e6:,.1f} MB" if size_bytes >= 1_000_000 else f"{size_bytes / 1e3:,.1f} KB"
+
+
 def render_markdown(report: dict) -> str:
     """El reporte en español llano, para alguien que no programa."""
     config, rows, sides = report["config"], report["filas"], report["puntas"]
     start, end = sides["inicio"], sides["fin"]
     merge, capacity, hours = report["union_de_ids"], report["capacidad"], report["station_hour"]
     routes, gbfs, after = report["routes"], report["entradas"]["gbfs"], report["salidas_segun_su_fin"]
+    trips, trip_start, trip_end = report["trips"], report["trips"]["puntas"]["inicio"], report["trips"]["puntas"]["fin"]
     runs = hours["ceros_en_rachas_largas"]
     excluded_ids = config["estaciones_excluidas"]
     lines = [
@@ -1373,6 +1802,42 @@ def render_markdown(report: dict) -> str:
         f"estación, aunque no haya viajes. Por eso {_n(hours['filas_en_cero'])} filas "
         f"({_percent(hours['filas_en_cero'], hours['filas'])}) están en cero.",
         "",
+        "### Tabla interna de viajes (`trips`)",
+        "",
+        "Además se escribió `trips.parquet`. Es una tabla de trabajo para el simulador y **no es uno de los seis",
+        "contratos**: el dashboard no la lee y su formato puede cambiar sin avisar.",
+        "",
+        f"- Una fila por viaje que sale o llega dentro del periodo: {_n(trips['filas'])} viajes, "
+        f"{_size(trips['bytes'])}, ordenados por la",
+        "  hora de salida.",
+        "- Columnas: `ride_id`, `started_at` y `ended_at` (salida y llegada, en hora de Nueva York),",
+        "  `start_station_id` y `end_station_id` (la estación de cada punta, con el id que quedó después de la",
+        "  limpieza: las escrituras unidas de la sección 3 ya llevan un solo id).",
+        f"- Ningún `ride_id` se repite. Filas sin `ride_id`: {_n(trips['sin_ride_id'])}.",
+        "- Una punta va vacía si el viaje no trae estación, si la estación está excluida (sección 4) o si es",
+        "  una estación sin ningún viaje dentro del periodo. No se adivina ni se rellena.",
+        "- Una punta cuya fecha cae fuera del periodo conserva su fecha y su estación. No cuenta en",
+        "  `station_hour`; el simulador decide qué hacer con ella.",
+        "",
+        "| Qué trae la punta | Salidas | Llegadas |",
+        "|---|---:|---:|",
+        f"| Una estación de las tablas | {_n(trip_start['con_estacion'])} | {_n(trip_end['con_estacion'])} |",
+        f"| Vacía: el viaje no trae estación | {_n(trip_start['sin_estacion'])} | {_n(trip_end['sin_estacion'])} |",
+        f"| Vacía: estación excluida | {_n(trip_start['estacion_excluida'])} | {_n(trip_end['estacion_excluida'])} |",
+        "| Vacía: estación sin viajes en el periodo | "
+        f"{_n(trip_start['estacion_sin_viajes_en_el_periodo'])} | "
+        f"{_n(trip_end['estacion_sin_viajes_en_el_periodo'])} |",
+        f"| Total (filas del archivo) | {_n(trips['filas'])} | {_n(trips['filas'])} |",
+        f"| De ese total, con la fecha fuera del periodo | {_n(trip_start['fuera_del_periodo'])} | "
+        f"{_n(trip_end['fuera_del_periodo'])} |",
+        "",
+        f"Viajes del archivo sin estación en ninguna de las dos puntas: {_n(trips['sin_estacion_en_ninguna_punta'])}.",
+        "",
+        "Contar los viajes de este archivo por estación y hora da exactamente `station_hour`, y contarlos por",
+        "par de estaciones da exactamente `routes`. Se comprueba en cada corrida leyendo de vuelta el archivo",
+        "(sección 7). Son viajes que sí ocurrieron: este archivo tampoco dice nada de la demanda que no se pudo",
+        "atender.",
+        "",
         "## 6. Capacidad de las estaciones",
         "",
     ]
@@ -1431,6 +1896,16 @@ def render_markdown(report: dict) -> str:
             for t in report["zona_horaria"]
         )
         + ".",
+        "",
+        "En `trips.parquet` se revisó la salida y la llegada de esos mismos viajes, con su minuto y su segundo:",
+        "",
+        "| Viaje | Salida (como viene) | Llegada (como viene) | Salida en UTC | Llegada en UTC | Coincide |",
+        "|---|---|---|---|---|---|",
+    ]
+    lines += [
+        f"| {t['ride_id']} | {t['started_at']} | {t['ended_at']} | {t['inicio_utc']} | {t['fin_utc']} | "
+        f"{'sí' if t['coincide'] else 'NO'} |"
+        for t in trips["zona_horaria"]
     ]
     lines += [
         "",
@@ -1499,6 +1974,8 @@ def format_summary(report: dict) -> str:
             f"station_hour: {hours['filas']:,} filas, {hours['salidas']:,} salidas y {hours['llegadas']:,} llegadas. "
             f"En cero: {100 * hours['proporcion_en_cero']:.2f}% de las filas.",
             f"routes: {report['routes']['pares']:,} pares con {report['routes']['viajes']:,} viajes.",
+            f"trips (tabla interna, no es contrato): {report['trips']['filas']:,} viajes, "
+            f"{_size(report['trips']['bytes'])}.",
             f"Comprobaciones: {len(report['comprobaciones'])} de {len(report['comprobaciones'])} cumplen. "
             f"Zona horaria revisada con {len(report['zona_horaria'])} viajes reales.",
             f"Listo en {report['segundos']:.0f} s.",
@@ -1514,6 +1991,7 @@ def build_parser() -> argparse.ArgumentParser:
         usage="python scripts/build_tables.py [opciones]",
         description=(
             "Limpia los viajes crudos y escribe stations, station_hour y routes, más el reporte de la limpieza.\n"
+            "También escribe trips.parquet, una tabla interna de viajes para el simulador (no es un contrato).\n"
             "El periodo, los meses y las reglas salen de config/datos.yaml."
         ),
         epilog="Ejemplo:\n  python scripts/build_tables.py",
@@ -1539,7 +2017,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Punto de entrada. Devuelve 0 si todo salió bien, 1 si algo falló, 130 si se interrumpió.
 
-    Un AVISO al final (sin foto de GBFS, o falta el mes siguiente al periodo) no cambia el 0.
+    Un AVISO al final (sin foto de GBFS, viajes sin ride_id, o falta el mes siguiente al periodo) no cambia el 0.
     """
     args = build_parser().parse_args(argv)
     config_path = Path(args.config).expanduser() if args.config else DATOS_YAML
@@ -1567,6 +2045,13 @@ def main(argv: list[str] | None = None) -> int:
             f"\nAVISO: no hay ninguna foto de GBFS en {gbfs_dir / 'station_information'}. La capacidad quedó "
             "vacía en TODAS las estaciones.\nCorre: python scripts/capture_gbfs.py --una-vez   y vuelve a "
             "correr este script.",
+            file=sys.stderr,
+        )
+    if report["trips"]["sin_ride_id"]:
+        print(
+            f"\nAVISO: {report['trips']['sin_ride_id']:,} viajes de trips.parquet no traen ride_id. El simulador "
+            "usa el ride_id para ordenar los viajes que ocurren en el mismo instante: revisa esos viajes en los "
+            "archivos crudos antes de simular.",
             file=sys.stderr,
         )
     siguiente = (datos.periodo.fin + timedelta(days=1)).strftime("%Y%m")

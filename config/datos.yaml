@@ -1,12 +1,14 @@
 # =============================================================================
-#  PERIODO DE DATOS, TRAMOS DE VALIDACIÓN Y REGLAS DE LIMPIEZA
+#  PERIODO DE DATOS, TRAMOS DE VALIDACIÓN, REGLAS DE LIMPIEZA Y SIMULACIÓN
 # =============================================================================
-#  Lo ajusta programación. Lo leen la limpieza (scripts/build_tables.py) y los
-#  modelos, con src.data.datos_config.load_datos().
+#  Lo ajusta programación. Lo leen la limpieza (scripts/build_tables.py), los
+#  modelos y el simulador, con src.data.datos_config.load_datos().
 #
 #  Si cambias algo aquí hay que volver a correr, en este orden:
 #      python scripts/build_tables.py
 #      python scripts/run_baseline.py
+#  y después la simulación. Si solo cambias el bloque `simulacion` (al final),
+#  basta con volver a correr la simulación.
 #
 #  Fechas en formato AAAA-MM-DD, hora local de Nueva York. El día de "fin"
 #  está incluido.
@@ -49,3 +51,37 @@ estaciones_excluidas:
   prefijos: [HB, JC, SYS]
   # Talleres con id de otra forma ("Morgan HCT Charging" y "Shop Morgan").
   ids: ["1234.56", "Shop Morgan"]
+
+# Ajustes de la simulación de inventario. Solo los lee el simulador.
+# Aquí va lo que NO es una regla de operación. Las reglas (franjas, umbrales,
+# presupuestos, distancia) están en config/operacion.yaml.
+simulacion:
+  # Días de calentamiento. La simulación empieza el primer día del tramo de
+  # validación con un inventario supuesto (ocupacion_respaldo, en
+  # operacion.yaml). Estos primeros días se simulan igual que los demás, pero
+  # NO cuentan en las métricas: sirven para que las estaciones dejen de estar
+  # todas igual de llenas, como en el arranque.
+  # OJO: el calentamiento NO quita la dependencia de ese supuesto.
+  # ocupacion_respaldo fija con cuántas bicis arranca la red. Los traslados no
+  # agregan ni quitan bicis, y un viaje solo cambia el total cuando entra o
+  # sale del conjunto simulado. Por eso el nivel de riesgo simulado y el
+  # riesgo simulado evitado cambian con ese valor, también en el último día.
+  # Entero, mayor o igual a 0 y menor que los días del tramo de validación
+  # (tiene que quedar al menos un día que sí cuente).
+  dias_de_calentamiento: 1
+
+  # Intervalo de la curva de políticas. Sale de remuestrear DÍAS COMPLETOS:
+  # se sortean, con repetición, los días que sí cuentan, se vuelve a sumar el
+  # riesgo, y eso se repite `remuestreos` veces (mínimo 100).
+  # OJO: los días NO son independientes. El inventario con que termina un día
+  # es el punto de partida del siguiente, y los días seguidos se parecen. Por
+  # eso el intervalo es INDICATIVO: puede salir más angosto de lo debido. No
+  # es una garantía estadística.
+  remuestreos: 2000
+
+  # Nivel del intervalo, mayor que 0.5 y menor que 1. 0.90 es un intervalo
+  # del 90 %.
+  nivel_del_intervalo: 0.90
+
+  # Semilla del sorteo: con la misma semilla sale el mismo intervalo.
+  semilla: 20260901

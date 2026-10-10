@@ -8,6 +8,9 @@ Se puede ejecutar desde cualquier carpeta:
 Escribe stations.parquet, station_hour.parquet y routes.parquet, y el reporte
 de la limpieza en data/processed/reports/limpieza.md y limpieza.json.
 
+También escribe trips.parquet: una fila por viaje limpio, para el simulador.
+Es una tabla interna, no uno de los seis contratos.
+
 El periodo, los meses y las reglas salen de config/datos.yaml. Los meses deben
 estar ya descargados (scripts/download_trips.py).
 
