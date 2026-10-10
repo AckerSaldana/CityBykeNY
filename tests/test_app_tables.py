@@ -31,7 +31,7 @@ COLUMNAS = {
     "top_rutas": ["puesto", "origen_id", "origen", "destino_id", "destino", "viajes", "origen_lat",
                   "origen_lon", "destino_lat", "destino_lon", "misma_estacion", "ruta"],
     "recomendaciones": ["estacion_id", "fecha", "franja", "hora_inicio", "hora_fin", "politica", "bicis",
-                        "nivel_riesgo", "factible", "inventario"],
+                        "nivel_riesgo", "factible", "inventario", "inventario_antes"],
     "curva": ["politica", "presupuesto", "riesgo", "ic_bajo", "ic_alto", "riesgo_sin_intervencion",
               "evitado", "pct_evitado"],
     "metricas": ["corte", "grupo", "orden", "modelo", "objetivo", "n", "mae", "rmse", "wape", "cobertura", "ancho"],
@@ -165,7 +165,10 @@ def test_con_reporte_toma_referencia_intervalo_sensibilidad_y_limitaciones(tmp_p
                    "franjas": [{"nombre": "manana", "inicio": "06:00", "fin": "12:00"}]},
         "resultados": [{"politica": "historical", "presupuesto_del_dia_en_bicis": ref,
                         "riesgo_simulado_evitado_por_dia": {"media": 1.0, "ic_bajo": sin * 0.1, "ic_alto": sin * 0.3},
-                        "riesgo_por_franja": {"manana": {"media": 5.0, "ic_bajo": 4.0, "ic_alto": 6.0}}}],
+                        "riesgo_por_franja": {"manana": {"media": 5.0, "ic_bajo": 4.0, "ic_alto": 6.0},
+                                              "resto": {"media": 0.0, "ic_bajo": 0.0, "ic_alto": 0.0}}}],
+        "piso_de_azar": {"corridas": 5, "presupuesto_del_dia_en_bicis": ref,
+                         "riesgo_por_dia": {"media": 92.0}, "riesgo_simulado_evitado_por_dia": {"media": 8.0}},
         "sensibilidad_al_inventario_inicial": {"filas": [
             {"inventario_inicial": "a", "riesgo_sin_intervencion_por_dia": 100.0,
              "por_politica": {"historical": {"riesgo_por_dia": 80.0, "riesgo_simulado_evitado_por_dia": 20.0}}},
@@ -175,6 +178,11 @@ def test_con_reporte_toma_referencia_intervalo_sensibilidad_y_limitaciones(tmp_p
     }
     (datos / "reports").mkdir()
     (datos / "reports" / "simulacion.json").write_text(json.dumps(reporte), encoding="utf-8")
+    piso = {"metricas": [{"model": "media global", "split": "val", "target": "dep", "group_by": "general",
+                          "group": "todas", "wape": 1.16, "mae": 3.5},
+                         {"model": "media global", "split": "val", "target": "dep", "group_by": "franja",
+                          "group": "noche", "wape": 2.8, "mae": 2.7}]}
+    (datos / "reports" / "piso_wape.json").write_text(json.dumps(piso), encoding="utf-8")
     ind = app_tables.build(datos, tmp_path / "app")
 
     assert ind["referencia"]["presupuesto"] == ref
@@ -187,6 +195,77 @@ def test_con_reporte_toma_referencia_intervalo_sensibilidad_y_limitaciones(tmp_p
     horas = leer(tmp_path / "app", "riesgo_horas")
     assert horas.to_dict("records") == [{"corte": "franja", "grupo": "manana", "politica": "historical",
                                          "riesgo": 5.0, "ic_bajo": 4.0, "ic_alto": 6.0}]
+    # El piso de azar y el error de una sola media salen de los reportes; "resto" sin riesgo no se guarda.
+    assert ind["piso_de_azar"]["pct_evitado"] == pytest.approx(0.08)
+    assert ind["pronostico_piso"]["media_global"]["salidas"]["wape"] == pytest.approx(1.16)
+    assert ind["contexto"]["por_tipo"] == {}
+
+
+def test_inventario_antes_y_estacion_de_ejemplo(construido):
+    salida, ind = construido
+    rec = leer(salida, "recomendaciones")
+    assert (rec["inventario_antes"] + rec["bicis"] == rec["inventario"]).all()
+    sin_mover = rec[rec["politica"] == "none"]
+    assert (sin_mover["inventario_antes"] == sin_mover["inventario"]).all()
+
+    # La estación de ejemplo sale de las tablas; si ninguna cumple la regla, es la de más salidas con pronóstico.
+    est = leer(salida, "estaciones")
+    ejemplo = ind["estacion_de_ejemplo"]
+    con_pronostico = est[est["tiene_pronostico"]].sort_values(["salidas", "estacion_id"], ascending=[False, True])
+    if not ejemplo["cumple_la_regla"]:
+        assert ejemplo["estacion_id"] == con_pronostico["estacion_id"].iloc[0] and ejemplo["fecha"] is None
+
+
+def test_la_estacion_de_ejemplo_sigue_la_regla():
+    """Oficinas, demanda alta, traslado en todas las franjas, con solución y en día laborable."""
+    est = pd.DataFrame({"estacion_id": ["A", "B", "C", "D"], "salidas": [900, 800, 700, 600],
+                        "tipo": ["residencial", "oficinas", "oficinas", "oficinas"],
+                        "volumen": ["alto", "alto", "alto", "medio"], "tiene_pronostico": True, "simulada": True})
+
+    def filas(estacion, fecha, bicis, factible=(True, True), riesgo=("alto", "alto")):
+        return [{"estacion_id": estacion, "fecha": pd.Timestamp(fecha), "franja": f, "politica": p,
+                 "bicis": b if p == "historical" else 0, "factible": ok,
+                 "nivel_riesgo": r if p == "historical" else "alto"}
+                for f, b, ok, r in zip(("manana", "tarde"), bicis, factible, riesgo) for p in ("none", "historical")]
+
+    rec = pd.DataFrame(
+        filas("A", "2026-09-08", (5, -5))                                   # no es de oficinas
+        + filas("B", "2026-09-08", (5, 0))                                  # una franja sin traslado
+        + filas("B", "2026-09-09", (5, -5), factible=(True, False))         # una franja sin solución
+        + filas("B", "2026-09-12", (9, -9))                                 # sábado
+        + filas("C", "2026-09-08", (9, -9))                                 # cumple, sin bajar el riesgo
+        + filas("C", "2026-09-10", (2, -2), riesgo=("medio", "alto"))       # cumple y baja el riesgo en una franja
+        + filas("D", "2026-09-08", (5, -5)))                                # demanda media
+    dias = rec[["estacion_id", "fecha"]].drop_duplicates()
+
+    assert app_tables._estacion_de_ejemplo(rec, est, dias) == {
+        "estacion_id": "C", "fecha": "2026-09-10", "cumple_la_regla": True}
+    # Si ninguna cumple: la de más salidas.
+    solo_a = app_tables._estacion_de_ejemplo(rec[rec["estacion_id"] == "A"], est, dias)
+    assert solo_a == {"estacion_id": "A", "fecha": None, "cumple_la_regla": False}
+
+
+def test_copia_la_validacion_y_la_prueba_final_solo_si_existe(tmp_path):
+    datos = tmp_path / "datos"
+    shutil.copytree(SAMPLE, datos)
+    assert app_tables.build(datos, tmp_path / "app")["validacion_y_prueba"] is None
+
+    (datos / "reports").mkdir()
+    falso = {"presupuesto_de_referencia": 172, "filas": [
+        {"clave": "evitado", "afirmacion": "Riesgo simulado evitado", "unidad": "pct", "validacion": 0.5,
+         "prueba": 0.4, "validacion_ic": [0.4, 0.6], "prueba_ic": None},
+        {"clave": "raro", "afirmacion": "Unidad desconocida", "unidad": "litros", "validacion": 3, "prueba": None},
+        {"clave": "sin_texto", "afirmacion": "", "unidad": "pct", "validacion": 1, "prueba": 1}]}
+    (datos / "reports" / "validacion_y_prueba.json").write_text(json.dumps(falso), encoding="utf-8")
+    copia = app_tables.build(datos, tmp_path / "app")["validacion_y_prueba"]
+    assert copia["presupuesto_de_referencia"] == 172
+    assert [f["clave"] for f in copia["filas"]] == ["evitado", "raro"]
+    assert copia["filas"][0]["validacion_ic"] == [0.4, 0.6] and copia["filas"][0]["prueba_ic"] is None
+    assert copia["filas"][1]["unidad"] == "numero" and copia["filas"][1]["prueba"] is None
+
+    # Un archivo que no se puede leer no rompe la construcción.
+    (datos / "reports" / "validacion_y_prueba.json").write_text("{esto no es json", encoding="utf-8")
+    assert app_tables.build(datos, tmp_path / "app")["validacion_y_prueba"] is None
 
 
 def test_es_determinista(construido, tmp_path):

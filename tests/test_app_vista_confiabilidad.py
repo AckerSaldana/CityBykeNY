@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 
+import pandas as pd
 import pyarrow as pa
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -120,18 +121,47 @@ def test_cambiar_de_medida_y_de_viajes_no_rompe_la_pagina(datos):
             assert len(graficas(at)) == 4
 
 
-def test_las_limitaciones_son_cinco_cuando_hay_reporte_de_simulacion(datos):
+def test_las_limitaciones_empiezan_por_el_inventario_inicial_y_la_demanda_atendida(datos):
     at = abrir()
-    lineas = datos.limitaciones(5)
+    lineas = datos.limitaciones()
     listas = [m.value for m in at.markdown if lineas and lineas[0] in m.value]
 
-    if datos.indicadores().get("limitaciones"):
-        assert len(lineas) == 5
-        assert len(listas) == 1
-        assert [renglon[2:] for renglon in listas[0].splitlines()] == lineas
+    # Siempre que hubo simulación van primero estas dos; después, las que escribió la simulación.
+    assert len(listas) == 1
+    assert [renglon[2:] for renglon in listas[0].splitlines()] == lineas
+    assert lineas[0].startswith("El resultado depende del inventario inicial supuesto")
+    assert "demanda atendida" in lineas[1]
+    assert sum("demanda atendida" in linea for linea in lineas) == 1  # no se repite la del reporte
+    ind = datos.indicadores()
+    if ind.get("limitaciones"):
+        assert len(lineas) == 6
+        rango = ind["sensibilidad"]["rango"]["historical"]
+        assert datos.rango_pct(rango["pct_min"], rango["pct_max"]) in lineas[0]
     else:
-        assert listas == []
-        assert any(c.value == datos.SIN_DATO for c in at.caption)
+        assert len(lineas) == 2
+
+
+def test_sin_simulacion_no_hay_limitaciones(datos, monkeypatch):
+    ind = datos.indicadores()
+    vacio = {**ind, "limitaciones": [], "referencia": {"presupuesto": None, "politicas": {}}}
+    monkeypatch.setattr(datos, "indicadores", lambda: vacio)
+    assert datos.limitaciones() == []
+    assert any(c.value == datos.SIN_DATO for c in abrir().caption)
+
+
+def test_resto_del_dia_no_se_dibuja_si_no_tiene_riesgo(datos, monkeypatch):
+    franja = datos.riesgo_horas("franja")
+    if franja.empty:  # los datos de muestra no traen horas por franja: se inventan
+        franja = pd.DataFrame({"corte": "franja", "grupo": ["manana"] * 3, "politica": ["none", "historical", "model"],
+                               "riesgo": [9.0, 5.0, 4.0], "ic_bajo": [8.0, 4.0, 3.0], "ic_alto": [10.0, 6.0, 5.0]})
+    resto = franja[franja["grupo"] == franja["grupo"].iloc[0]].assign(grupo="resto", riesgo=0.0, ic_bajo=0.0, ic_alto=0.0)
+    original = datos.riesgo_horas
+    monkeypatch.setattr(datos, "riesgo_horas", lambda corte=None: (
+        pd.concat([franja, resto], ignore_index=True) if corte == "franja" else original(corte)))
+    at = abrir()
+    assert not at.exception
+    assert not any(datos.FRANJAS["resto"] in g for g in graficas(at))
+    assert any(datos.FRANJAS[franja["grupo"].iloc[0]] in g for g in graficas(at))
 
 
 def test_el_riesgo_por_tipo_de_estacion_dice_que_se_muestra(datos):

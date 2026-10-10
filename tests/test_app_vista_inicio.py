@@ -59,13 +59,31 @@ def test_inicio_muestra_indicadores_curva_y_hallazgos(datos):
     # Cuatro indicadores, con las cifras de los datos y sin valores vacíos de Python.
     ind = datos.indicadores()
     assert [m.label for m in at.metric] == [
-        "Viajes analizados", "Estaciones", "Riesgo simulado evitado", "Error del pronóstico (WAPE)"]
+        "Viajes analizados", "Estaciones", "Riesgo simulado evitado", "Error del pronóstico por hora y estación"]
     valores = [m.value for m in at.metric]
+    notas = " ".join(c.value for c in at.caption)
     assert valores[0] == datos.num(ind["viajes_analizados"])
     assert valores[1] == datos.num(ind["estaciones"])
-    assert valores[2] == datos.pct(ind["referencia"]["politicas"]["model"]["pct_evitado"])
+    # El riesgo evitado es el de la regla histórica: el rango entre los inventarios iniciales supuestos
+    # si la simulación lo reportó; si no, el valor con el presupuesto de referencia.
+    rango = ind["sensibilidad"]["rango"].get("historical")
+    if rango:
+        assert valores[2] == datos.rango_pct(rango["pct_min"], rango["pct_max"])
+        assert "según el inventario inicial que se suponga" in notas
+    else:
+        assert valores[2] == datos.pct(ind["referencia"]["politicas"]["historical"]["pct_evitado"])
+    assert "Regla histórica, con" in notas
+    if ind["comparacion"]["modelo_evita"] == "igual":
+        assert "El modelo da prácticamente el mismo resultado" in notas
+        assert any("se enciman" in c.value for c in at.caption)  # la frase bajo la curva
+    if ind["piso_de_azar"]["pct_evitado"] is not None:
+        assert f"Mover las mismas bicis al azar evita {datos.pct(ind['piso_de_azar']['pct_evitado'])}." in notas
+    # El error es el del modelo, con el del promedio histórico y el de una sola media como contexto.
     assert valores[3] == datos.pct(ind["pronostico"]["lgbm"]["salidas"]["wape"])
-    assert datos.pct(ind["pronostico"]["lgbm"]["salidas"]["cobertura"]) in " ".join(c.value for c in at.caption)
+    assert f"promedio histórico: {datos.pct(ind['pronostico']['baseline']['salidas']['wape'])}" in notas
+    media_global = (ind["pronostico_piso"].get("media_global") or {}).get("salidas")
+    if media_global:
+        assert f"una sola media para todo el sistema: {datos.pct(media_global['wape'])}" in notas
 
     # Una gráfica: la curva con las tres políticas, sus nombres en pantalla y el presupuesto de referencia.
     graficas = at.get("vega_lite_chart")
@@ -77,12 +95,49 @@ def test_inicio_muestra_indicadores_curva_y_hallazgos(datos):
         assert nombre in texto_spec
     assert f"Presupuesto de referencia: {datos.num(ind['referencia']['presupuesto'])} bicis" in texto_spec
 
-    # Tres hallazgos, los mismos que arma datos.hallazgos().
+    # Cuatro hallazgos, los mismos que arma datos.hallazgos().
     frases = datos.hallazgos()
     textos = [m.value for m in at.markdown]
-    assert len(frases) == 3
+    assert len(frases) == 4
     for frase in frases:
         assert sum(frase in t for t in textos) == 1
+
+    # La comparación con la prueba final solo aparece cuando el constructor copió ese archivo.
+    hay_comparacion = any(s.value == "Validación y prueba final" for s in at.subheader)
+    assert hay_comparacion == bool(ind.get("validacion_y_prueba"))
+
+
+def test_validacion_y_prueba_final_lado_a_lado(datos, monkeypatch):
+    ind = datos.indicadores()
+    falso = {"presupuesto_de_referencia": 3241, "filas": [
+        {"clave": "a", "afirmacion": "Riesgo simulado evitado", "unidad": "pct", "validacion": 0.5692,
+         "prueba": 0.6401, "validacion_ic": [0.52, 0.61], "prueba_ic": None},
+        {"clave": "b", "afirmacion": "Horas de estación en riesgo por día", "unidad": "horas",
+         "validacion": 5374.89, "prueba": None, "validacion_ic": None, "prueba_ic": None},
+        {"clave": "c", "afirmacion": "Viajes bloqueados por día", "unidad": "viajes", "validacion": 3424.9,
+         "prueba": 2698.2, "validacion_ic": None, "prueba_ic": [2084.0, 3267.4]},
+        {"clave": "d", "afirmacion": "Error medio", "unidad": "numero", "validacion": 1.5177, "prueba": 2.0}]}
+    monkeypatch.setattr(datos, "indicadores", lambda: {**ind, "validacion_y_prueba": falso})
+
+    assert datos.validacion_y_prueba()["filas"] == [
+        {"afirmacion": "Riesgo simulado evitado", "validacion": "56.9 % (52.0 % a 61.0 %)", "prueba": "64.0 %"},
+        {"afirmacion": "Horas de estación en riesgo por día", "validacion": "5,375 horas", "prueba": "Sin dato"},
+        {"afirmacion": "Viajes bloqueados por día", "validacion": "3,425 viajes",
+         "prueba": "2,698 viajes (2,084 a 3,267)"},
+        {"afirmacion": "Error medio", "validacion": "1.5", "prueba": "2"}]
+    at = abrir()
+    assert [str(e.value) for e in at.exception] == []
+    tabla = next(m.value for m in at.markdown if "| Validación | Prueba final |" in m.value)
+    assert len(tabla.splitlines()) == 2 + 4
+    assert "56.9&nbsp;%" in tabla and "None" not in tabla and "nan" not in tabla
+    assert any("3,241 bicis movidas al día" in c.value for c in at.caption)
+
+    # Sin el archivo de la prueba final no hay ni título ni tabla vacía.
+    monkeypatch.setattr(datos, "indicadores", lambda: {**ind, "validacion_y_prueba": None})
+    at = abrir()
+    assert [str(e.value) for e in at.exception] == []
+    assert not any("Prueba final" in m.value for m in at.markdown)
+    assert not any("prueba final" in s.value.lower() for s in at.subheader)
 
 
 def test_inicio_no_se_rompe_si_falta_la_simulacion(datos, monkeypatch):

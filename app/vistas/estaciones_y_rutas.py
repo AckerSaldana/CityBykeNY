@@ -4,6 +4,8 @@ Todo es descriptivo y de todo el periodo analizado. Son viajes de usuarios
 entre estaciones (demanda atendida), no recorridos de camiones.
 """
 
+import math
+
 import altair as alt
 import pandas as pd
 import pydeck as pdk
@@ -16,6 +18,8 @@ COLOR_BARRA = datos.COLOR_SE_LLENA
 COLOR_ORIGEN = [230, 159, 0]    # naranja: donde empieza el viaje
 COLOR_DESTINO = [0, 114, 178]   # azul: donde termina
 ALTO_FILA = 28
+ALTO_MAPA = 520
+ANCHO_MAPA = 900  # ancho aproximado del mapa en pantalla, en pixeles, para calcular el acercamiento
 
 
 def _nombres_unicos(nombres: pd.Series, claves: pd.Series) -> pd.Series:
@@ -51,6 +55,22 @@ def _barras(tabla: pd.DataFrame, valor: str, titulo_valor: str, titulo_eje: str,
     return (barras + cifras).properties(height=ALTO_FILA * len(tabla) + 50, padding={"top": 22})
 
 
+def _vista(extremos: pd.DataFrame) -> pdk.ViewState:
+    """Centro y acercamiento para que quepan justo las rutas que se muestran (su caja, con margen)."""
+    oeste, este = float(extremos["lon"].min()), float(extremos["lon"].max())
+    sur, norte = float(extremos["lat"].min()), float(extremos["lat"].max())
+
+    def mercator(lat: float) -> float:
+        return math.degrees(math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)))
+
+    margen = 0.75  # las rutas ocupan tres cuartos del mapa
+    # A nivel 0 el mundo (360 grados) mide 512 pixeles; cada nivel lo duplica.
+    por_ancho = math.log2(ANCHO_MAPA * margen * 360 / (512 * max(este - oeste, 1e-4)))
+    por_alto = math.log2(ALTO_MAPA * margen * 360 / (512 * max(mercator(norte) - mercator(sur), 1e-4)))
+    return pdk.ViewState(latitude=(sur + norte) / 2, longitude=(oeste + este) / 2,
+                         zoom=min(por_ancho, por_alto, 15), pitch=30)
+
+
 def _mapa(rutas: pd.DataFrame) -> pdk.Deck | None:
     """Arcos de las rutas (del origen, naranja, al destino, azul). Los viajes que
     vuelven a la misma estación se dibujan como un punto. Sin coordenadas, no hay mapa."""
@@ -58,7 +78,7 @@ def _mapa(rutas: pd.DataFrame) -> pdk.Deck | None:
     r = rutas.dropna(subset=columnas)
     if r.empty:
         return None
-    r = r.assign(ancho=3 + 8 * r["viajes"] / r["viajes"].max(),
+    r = r.assign(ancho=6 + 10 * r["viajes"] / r["viajes"].max(),
                  radio=60 + 140 * r["viajes"] / r["viajes"].max())
     campos = ["nombre", "cifra", "ancho", "radio", "misma_estacion", *columnas]
     arcos = r.loc[~r["misma_estacion"], campos]
@@ -68,7 +88,14 @@ def _mapa(rutas: pd.DataFrame) -> pdk.Deck | None:
         capas.append(pdk.Layer(
             "ArcLayer", data=arcos, get_source_position=["origen_lon", "origen_lat"],
             get_target_position=["destino_lon", "destino_lat"], get_source_color=COLOR_ORIGEN,
-            get_target_color=COLOR_DESTINO, get_width="ancho", pickable=True, auto_highlight=True))
+            get_target_color=COLOR_DESTINO, get_width="ancho", get_height=0.6, pickable=True,
+            auto_highlight=True))
+        # Un punto en cada extremo: el arco de una ruta corta se ve aunque el mapa abarque toda la ciudad.
+        for lado, color in (("origen", COLOR_ORIGEN), ("destino", COLOR_DESTINO)):
+            capas.append(pdk.Layer(
+                "ScatterplotLayer", data=arcos, get_position=[f"{lado}_lon", f"{lado}_lat"], get_radius=40,
+                radius_min_pixels=5, radius_max_pixels=9, get_fill_color=color + [230], stroked=True,
+                get_line_color=[255, 255, 255, 200], line_width_min_pixels=1, pickable=True))
     if not puntos.empty:
         capas.append(pdk.Layer(
             "ScatterplotLayer", data=puntos, get_position=["origen_lon", "origen_lat"],
@@ -76,15 +103,13 @@ def _mapa(rutas: pd.DataFrame) -> pdk.Deck | None:
             pickable=True, auto_highlight=True))
     extremos = pd.DataFrame({"lon": pd.concat([r["origen_lon"], r["destino_lon"]]),
                              "lat": pd.concat([r["origen_lat"], r["destino_lat"]])})
-    vista = pdk.data_utils.compute_view(extremos[["lon", "lat"]], view_proportion=1)
-    vista.zoom = min(vista.zoom - 0.4, 14)  # un poco de margen; sin acercar de más si todo cae en un punto
-    vista.pitch = 35
+    vista = _vista(extremos)
     # Sin estilo fijo, el mapa base (CARTO, no pide llave) sigue el tema claro u oscuro de la app.
     return pdk.Deck(layers=capas, initial_view_state=vista, map_provider="carto", map_style=None,
                     tooltip={"html": "<b>{nombre}</b><br/>{cifra} viajes"})
 
 
-datos.encabezado("Estaciones y rutas")
+datos.encabezado("Estaciones y rutas", "viajes")
 
 ind = datos.indicadores()  # cifras ya calculadas; si faltan las tablas, avisa y se detiene
 periodo = ind.get("periodo") or {}
@@ -147,19 +172,17 @@ else:
         cifra=rutas["viajes"].map(datos.num),
         origen_txt=origen, destino_txt=destino,
     )
-    grafica, mapa = st.columns([3, 2])
-    with grafica:
-        st.altair_chart(
-            _barras(rutas, "viajes", "Viajes en el periodo", "Ruta (origen → destino)",
-                    [("origen_txt", "Origen"), ("destino_txt", "Destino")]),
-            width="stretch")
-    with mapa:
-        deck = _mapa(rutas)
-        if deck is not None:
-            st.pydeck_chart(deck, height=ALTO_FILA * len(rutas) + 20)
-            st.caption("Cada arco va del origen (naranja) al destino (azul); es más grueso cuanto más "
-                       "viajes tiene la ruta."
-                       + (" Los puntos son viajes que vuelven a la misma estación." if con_vueltas else ""))
+    st.altair_chart(
+        _barras(rutas, "viajes", "Viajes en el periodo", "Ruta (origen → destino)",
+                [("origen_txt", "Origen"), ("destino_txt", "Destino")]),
+        width="stretch")
+    deck = _mapa(rutas)
+    if deck is not None:
+        st.pydeck_chart(deck, height=ALTO_MAPA)
+        st.caption("Dónde están estas rutas. Cada arco va del origen (naranja) al destino (azul); es más "
+                   "grueso cuanto más viajes tiene la ruta. Son rutas cortas: acerca el mapa para verlas una por una."
+                   + (" Los puntos naranjas sin arco son viajes que vuelven a la misma estación."
+                      if con_vueltas else ""))
 
     total = ind.get("viajes_en_rutas")
     if total:

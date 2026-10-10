@@ -10,3 +10,12 @@ gatherUsageStats = false
 [server]
 # No pedir un correo en la terminal la primera vez que se abre la app.
 showEmailPrompt = false
+# Para la demostración: no vigilar los archivos de código. Así nunca aparece el
+# aviso "Source file changed" (ni "File change") arriba de la página.
+# Las tablas de datos no dependen de esto: al reconstruirlas, la app toma las
+# nuevas en la siguiente interacción o al recargar la página.
+# Si cambias el código de app/, hay que detener y volver a abrir la app
+# (o poner aquí "auto" mientras desarrollas).
+fileWatcherType = "none"
+runOnSave = false
+

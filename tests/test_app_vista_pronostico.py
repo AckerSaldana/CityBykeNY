@@ -87,6 +87,22 @@ def test_abre_con_selectores_grafica_y_acciones(datos):
     assert at.radio[0].options == ["Salidas", "Llegadas"]
     assert len(graficas(at)) == 1
 
+    # Abre con la estación (y el día) de ejemplo que eligió el constructor de las tablas.
+    ejemplo = datos.estacion_de_ejemplo()
+    assert selector(at, "Estación").value == ejemplo["estacion_id"]
+    if ejemplo.get("cumple_la_regla"):
+        ficha = datos.estacion(ejemplo["estacion_id"])
+        assert ficha["tipo"] == "oficinas" and ficha["volumen"] == "alto"
+        assert selector(at, "Día").value == pd.Timestamp(ejemplo["fecha"])
+        assert pd.Timestamp(ejemplo["fecha"]).weekday() < 5
+        rec = datos.recomendaciones_estacion(ejemplo["estacion_id"])
+        del_dia = rec[(rec["fecha"] == pd.Timestamp(ejemplo["fecha"])) & (rec["politica"] == "historical")]
+        assert len(del_dia) == rec["franja"].nunique() and (del_dia["bicis"] != 0).all() and del_dia["factible"].all()
+        for fila in del_dia.itertuples():
+            assert datos.inventario(fila.inventario_antes, fila.inventario) in textos(at)
+    else:
+        assert ejemplo["estacion_id"] == next(iter(datos.opciones_de_estacion()))
+
     # Los días se muestran como fechas en español y las estaciones por nombre.
     dia = selector(at, "Día")
     assert all(re.match(r"^(lunes|martes|miércoles|jueves|viernes|sábado|domingo) \d+ de \w+ de \d{4}$", o)
@@ -94,7 +110,7 @@ def test_abre_con_selectores_grafica_y_acciones(datos):
     opciones = datos.opciones_de_estacion()
     assert selector(at, "Estación").options == list(opciones.values())
 
-    # En un día simulado hay una tarjeta por franja y política, con el texto de la acción.
+    # En un día simulado hay una tarjeta por franja, de UNA política (la regla histórica al abrir).
     estacion_id = next(e for e in opciones if dia_simulado(datos, e) is not None)
     selector(at, "Estación").set_value(estacion_id)
     at = at.run()
@@ -102,11 +118,39 @@ def test_abre_con_selectores_grafica_y_acciones(datos):
     at = at.run()
     sin_errores(at)
     rec = datos.recomendaciones_estacion(estacion_id)
-    del_dia = rec[(rec["fecha"] == dia_simulado(datos, estacion_id)) & rec["politica"].isin(["model", "historical"])]
-    assert len(ACCION.findall(textos(at))) == len(del_dia) > 0
-    assert textos(at).count("Riesgo simulado:") == len(del_dia)
-    for politica in ("Modelo", "Regla histórica"):
-        assert f"**{politica}**" in textos(at)
+    politica = next(r for r in at.radio if r.label == "Política")
+    assert politica.options == ["Regla histórica", "Modelo"] and politica.value == "Regla histórica"
+    for nombre, clave in (("Regla histórica", "historical"), ("Modelo", "model")):
+        next(r for r in at.radio if r.label == "Política").set_value(nombre)
+        at = at.run()
+        sin_errores(at)
+        del_dia = rec[(rec["fecha"] == dia_simulado(datos, estacion_id)) & (rec["politica"] == clave)]
+        assert len(ACCION.findall(textos(at))) == len(del_dia) > 0
+        assert textos(at).count("Riesgo simulado:") == len(del_dia)
+        for fila in del_dia.itertuples():  # "13 bicis antes, 2 después"
+            assert datos.inventario(fila.inventario_antes, fila.inventario) in textos(at)
+
+
+def test_franja_sin_solucion_sugiere_una_segunda_visita(datos):
+    """Si ningún inventario inicial evita los dos riesgos, la tarjeta lo dice."""
+    assert datos.inventario(13, 2) == "13 bicis antes, 2 después"
+    assert datos.inventario(1, 3) == "1 bici antes, 3 después"
+    assert datos.inventario(None, 3) == "Sin dato"
+    frase = "conviene una segunda visita durante la franja"
+    for estacion_id in list(datos.opciones_de_estacion())[:400]:
+        rec = datos.recomendaciones_estacion(estacion_id)
+        casos = rec[(rec["politica"] == "historical") & ~rec["factible"].astype(bool)]
+        if not casos.empty:
+            break
+    else:
+        pytest.skip("Ninguna de las primeras estaciones tiene una franja sin solución")
+    at = abrir()
+    selector(at, "Estación").set_value(estacion_id)
+    at = at.run()
+    selector(at, "Día").set_value(pd.Timestamp(casos["fecha"].iloc[0]))
+    at = at.run()
+    sin_errores(at)
+    assert frase in textos(at)
 
 
 def test_cambiar_estacion_dia_y_objetivo_no_falla(datos):
@@ -161,7 +205,8 @@ def test_presupuesto_insuficiente_se_dice_en_una_frase(datos):
     """Riesgo alto sin mover bicis: la tarjeta dice que el presupuesto no alcanzó."""
     for estacion_id in list(datos.opciones_de_estacion())[:40]:
         rec = datos.recomendaciones_estacion(estacion_id)
-        casos = rec[(rec["politica"] == "model") & (rec["nivel_riesgo"] == "alto") & (rec["bicis"] == 0)]
+        casos = rec[(rec["politica"] == "model") & (rec["nivel_riesgo"] == "alto") & (rec["bicis"] == 0)
+                    & rec["factible"].astype(bool)]
         if not casos.empty:
             break
     else:
@@ -170,6 +215,8 @@ def test_presupuesto_insuficiente_se_dice_en_una_frase(datos):
     selector(at, "Estación").set_value(estacion_id)
     at = at.run()
     selector(at, "Día").set_value(pd.Timestamp(casos["fecha"].iloc[0]))
+    at = at.run()
+    next(r for r in at.radio if r.label == "Política").set_value("Modelo")
     at = at.run()
     sin_errores(at)
     assert "El presupuesto no alcanzó para esta estación." in textos(at)

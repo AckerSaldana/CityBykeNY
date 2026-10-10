@@ -71,14 +71,16 @@ def test_abre_con_el_mapa_y_los_tres_selectores(datos):
     assert at.selectbox(key="mapa_hora").label == "Hora del día"
     assert at.radio(key="mapa_tipo_dia").label == "Tipo de día"
     assert at.radio(key="mapa_usuario").label == "Tipo de usuario"
-    assert at.selectbox(key="mapa_hora").value is None  # abre en "Todo el día"
+    assert at.selectbox(key="mapa_hora").value == 8  # abre en un día laborable a las 08:00
+    assert at.radio(key="mapa_tipo_dia").value == "laborable"
+    assert any("08:00" in s.value for s in at.subheader)
     assert len(at.selectbox(key="mapa_hora").options) == 25
     assert "Todo el día" in at.selectbox(key="mapa_hora").options
     assert list(at.radio(key="mapa_tipo_dia").options) == list(datos.TIPOS_DIA.values())
     assert list(at.radio(key="mapa_usuario").options) == list(datos.USUARIOS.values())
 
     puntos = puntos_del_mapa(at)
-    assert len(puntos) == len(datos.demanda_mapa(None, "laborable", "todos"))
+    assert len(puntos) == len(datos.demanda_mapa(8, "laborable", "todos"))
     assert len(at.get("vega_lite_chart")) == 1  # demanda por hora del día
     notas = " ".join(c.value for c in at.caption)
     assert "demanda atendida" in notas and "no separan las llegadas" in notas

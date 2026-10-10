@@ -30,6 +30,10 @@ PAGES = {
     "Confiabilidad": "vistas/confiabilidad.py",
 }
 LINE = "Resultados de simulación con datos de validación"
+# Esa línea va solo en las páginas con resultados de la simulación o del pronóstico.
+# Las que describen viajes dicen de qué meses son (aquí, de los datos de muestra).
+PAGES_WITH_LINE = ("Inicio", "Pronóstico por estación", "Confiabilidad")
+CONTEXT_PAGE = "vistas/contexto.py"
 BUILD = "python scripts/build_app_tables.py"
 
 # Nombres que no deben verse en pantalla: columnas de los contratos, columnas
@@ -41,7 +45,10 @@ FORBIDDEN = [
     "end_station", "station_hour", "policy_curve", "baseline", "lgbm", "historical",
     "estacion_id", "nivel_riesgo", "pct_evitado", "flujo_neto", "tipo_dia", "sin_dato",
     ".parquet", ".json", ".csv", "datos leídos", "pendiente", "nan", "none",
+    "inventario_antes", "hora_inicio", "tipo_estacion", "pct_min", "media_global", "model",
 ]
+# Más de un decimal en pantalla (los números van con datos.num y datos.pct).
+LONG_DECIMALS = r"\d\.\d{2,}"
 
 
 @pytest.fixture(scope="session")
@@ -96,10 +103,40 @@ def test_la_pagina_abre_sin_errores_y_con_la_linea_discreta(datos, page):
     titulo = next(t for t, ruta in PAGES.items() if ruta == page)
     assert (titulo in at.title[0].value) == (titulo != "Inicio")  # se abrió esa página y no otra
     lineas = [e.value for e in at.caption if LINE in e.value]
-    assert len(lineas) == 1
+    if titulo in PAGES_WITH_LINE:
+        assert len(lineas) == 1
+    else:
+        assert lineas == []
+        lineas = [e.value for e in at.caption if e.value.startswith("Viajes de ejemplo de ")]
+        assert len(lineas) == 1 and "Viajes reales" not in lineas[0]
+        assert re.search(r"de \w+ a \w+ de \d{4}", lineas[0])  # los meses salen del periodo de los datos
     # Los datos de muestra son sintéticos y la línea lo dice (nunca se presentan como reales).
     assert "sintéticos" in lineas[0]
     assert not at.main.warning
+
+
+def test_la_linea_de_viajes_sale_del_periodo(datos, monkeypatch):
+    assert datos.periodo_en_meses("2026-07-01", "2026-09-29") == "julio a septiembre de 2026"
+    assert datos.periodo_en_meses("2026-07-01", "2026-07-31") == "julio de 2026"
+    assert datos.periodo_en_meses("2025-12-01", "2026-01-31") == "diciembre de 2025 a enero de 2026"
+    reales = {**datos.indicadores(), "sinteticos": False, "periodo": {"inicio": "2026-07-01", "fin": "2026-09-29"}}
+    monkeypatch.setattr(datos, "indicadores", lambda: reales)
+    assert datos.linea_discreta("viajes") == "Viajes reales de julio a septiembre de 2026"
+    assert datos.linea_discreta() == LINE
+    monkeypatch.setattr(datos, "indicadores", lambda: {**reales, "periodo": {}})
+    assert datos.linea_discreta("viajes") == "Viajes reales del periodo analizado"
+
+
+def test_la_pagina_de_contexto_abre_con_la_linea_de_viajes(datos):
+    """La sexta página: con los datos de muestra no hay tabla de contexto y lo dice sin fallar."""
+    at = open_page(CONTEXT_PAGE)
+
+    assert [str(e.value) for e in at.exception] == []
+    assert not at.error
+    assert not any(LINE in e.value for e in at.caption)
+    assert any(e.value.startswith("Viajes de ejemplo") for e in at.caption)
+    texto = visible_text_of(at)
+    assert ".parquet" not in texto and not re.search(r"\bnone\b|\bnan\b", texto)
 
 
 @pytest.mark.parametrize("page", PAGES.values(), ids=PAGES.keys())
@@ -112,8 +149,11 @@ def test_no_se_ven_nombres_de_columnas_ni_de_archivos(datos, page):
             patron = re.escape(nombre)
         else:
             patron = rf"\b{re.escape(nombre)}"
+        if nombre == "model":  # la clave interna; "modelo" sí es una palabra de la pantalla
+            patron = r"\bmodel\b"
         assert not re.search(patron, texto), f"{page}: se ve '{nombre}'"
     assert "traceback" not in texto
+    assert not re.search(LONG_DECIMALS, texto), f"{page}: número con más de un decimal"
 
 
 def test_el_menu_tiene_las_cinco_paginas_con_acentos():
@@ -190,13 +230,19 @@ def test_los_lectores_devuelven_lo_que_prometen(datos):
 def test_los_hallazgos_se_arman_con_las_cifras(datos, monkeypatch):
     ind = datos.indicadores()
     frases = datos.hallazgos()
-    assert len(frases) == 3 and all(isinstance(f, str) and f.endswith(".") for f in frases)
+    assert len(frases) == 4 and all(isinstance(f, str) and f.endswith(".") for f in frases)
     assert datos.num(ind["referencia"]["presupuesto"]) in frases[0]
 
     # Si cambia una cifra, cambia la frase: no hay números escritos a mano.
     otro = {**ind, "referencia": {**ind["referencia"], "presupuesto": 987654}}
     monkeypatch.setattr(datos, "indicadores", lambda: otro)
     assert "987,654" in datos.hallazgos()[0]
+
+    # El cuarto: empleos alrededor de las estaciones de oficinas contra las residenciales.
+    con_contexto = {**ind, "contexto": {"por_tipo": {"oficinas": {"proporcion_empleos": 0.871},
+                                                     "residencial": {"proporcion_empleos": 0.294}}}}
+    monkeypatch.setattr(datos, "indicadores", lambda: con_contexto)
+    assert "87 %" in datos.hallazgos()[3] and "29 %" in datos.hallazgos()[3]
 
     # Sin simulación, las frases dicen "Sin dato" en lugar de fallar.
     vacio = {**ind, "referencia": {"presupuesto": None, "politicas": {}},
@@ -216,6 +262,9 @@ def test_la_configuracion_de_streamlit_esta_junto_a_inicio():
     config = tomllib.loads((APP / ".streamlit" / "config.toml").read_text(encoding="utf-8"))
 
     assert config["server"]["showEmailPrompt"] is False
+    # Para la demostración no se vigilan los archivos: no aparece el aviso de "Source file changed".
+    assert config["server"]["fileWatcherType"] == "none"
+    assert config["server"]["runOnSave"] is False
     assert config["browser"]["gatherUsageStats"] is False
 
 

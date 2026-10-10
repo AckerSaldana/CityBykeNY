@@ -219,6 +219,9 @@ def riesgo_por(corte: str, grupos: dict, titulo_grupo: str):
     horas. Si no, la proporción de franjas de estación en riesgo alto.
     """
     horas = datos.riesgo_horas(corte)
+    # Un grupo sin riesgo en ninguna política (como "Resto del día" cuando las franjas cubren las 24 horas) no se dibuja.
+    con_riesgo = horas.groupby("grupo")["riesgo"].transform(lambda r: (r.fillna(0) > 0).any()) if not horas.empty else []
+    horas = horas[con_riesgo] if not horas.empty else horas
     if not horas.empty:
         grafica = barras(horas, grupos=grupos, series=datos.POLITICAS, colores=datos.COLORES_POLITICA,
                          columna_serie="politica", columna_valor="riesgo",
@@ -253,7 +256,7 @@ for columna, corte, grupos, titulo, titulo_grupo in (
 
 st.subheader("Limitaciones de la simulación")
 
-limitaciones = datos.limitaciones(5)
+limitaciones = datos.limitaciones()
 if limitaciones:
     st.markdown("\n".join(f"- {datos.texto(linea)}" for linea in limitaciones))
 else:

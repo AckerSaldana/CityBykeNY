@@ -15,7 +15,9 @@ Reglas para las páginas:
   ni de archivos.
 - Ninguna cifra se escribe a mano: todo sale de `indicadores()` y de las
   tablas. Cuando cambie la simulación solo se vuelve a correr el constructor.
-- Cada página empieza con `datos.encabezado("Título")`.
+- Cada página empieza con `datos.encabezado("Título")`. Las páginas que solo
+  describen viajes (mapa, estaciones y rutas, contexto) usan
+  `datos.encabezado("Título", "viajes")`.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import streamlit as st
 CARPETA = Path(__file__).resolve().parents[1] / "data" / "processed" / "app"
 
 LINEA = "Resultados de simulación con datos de validación"
+LINEA_VIAJES = "Viajes reales"
 SIN_DATO = "Sin dato"
 CONSTRUIR = "python scripts/build_app_tables.py"
 
@@ -187,6 +190,11 @@ def _json(ruta: str, cambio: float) -> dict:
     return json.loads(Path(ruta).read_text(encoding="utf-8"))
 
 
+def ruta_de_contexto() -> Path:
+    """Dónde está la tabla de la página de contexto (puede no existir todavía)."""
+    return CARPETA / "contexto_estaciones.parquet"
+
+
 def _leer(nombre: str) -> pd.DataFrame:
     return _tabla(*_ruta(f"{nombre}.parquet")).copy()
 
@@ -296,9 +304,26 @@ def recomendaciones_estacion(estacion_id: str) -> pd.DataFrame:
 
     Columnas: estacion_id, fecha, franja, hora_inicio, hora_fin, politica, bicis
     (positivo es llevar, negativo es retirar), nivel_riesgo, factible, inventario
-    (bicis en la estación justo después del traslado). Vacío si no se simuló.
+    (bicis en la estación justo después del traslado) e inventario_antes (justo
+    antes). Vacío si no se simuló.
     """
     return _tabla_de_estacion(*_ruta("recomendaciones.parquet"), estacion_id).copy()
+
+
+def estacion_de_ejemplo() -> dict:
+    """La estación y el día con que abre "Pronóstico por estación":
+    {"estacion_id", "fecha"}. La elige el constructor de las tablas con una regla
+    fija (oficinas, demanda alta, traslado en todas las franjas y con solución,
+    en día laborable); si ninguna cumple, es la estación con más salidas."""
+    return indicadores().get("estacion_de_ejemplo") or {}
+
+
+def inventario(antes, despues) -> str:
+    """ "13 bicis antes, 2 después": las bicis en la estación antes y después del traslado."""
+    if _falta(antes) or _falta(despues):
+        return SIN_DATO
+    unidad = "bici" if int(antes) == 1 else "bicis"
+    return f"{num(antes)} {unidad} antes, {num(despues)} después"
 
 
 def curva() -> pd.DataFrame:
@@ -349,32 +374,129 @@ def sensibilidad() -> pd.DataFrame:
                                         "riesgo", "evitado", "pct_evitado"])
 
 
-def limitaciones(n: int = 5) -> list[str]:
-    """Las primeras `n` limitaciones que escribió la simulación (puede venir vacía)."""
-    return list(indicadores().get("limitaciones") or [])[:n]
+DEMANDA_ATENDIDA = "Los datos solo registran demanda atendida."
+
+
+def limitaciones(n: int = 6) -> list[str]:
+    """Hasta `n` limitaciones de la simulación (vacía si no hubo simulación).
+
+    Las dos primeras van siempre: el resultado depende del inventario inicial
+    supuesto (con el rango que reportó la simulación, si lo hay) y los datos solo
+    registran demanda atendida. Después, las que escribió la simulación.
+    """
+    ind = indicadores()
+    reporte = [str(x) for x in ind.get("limitaciones") or []]
+    if not reporte and (ind.get("referencia") or {}).get("presupuesto") is None:
+        return []
+    rango = ((ind.get("sensibilidad") or {}).get("rango") or {}).get("historical") or {}
+    inicial = "El resultado depende del inventario inicial supuesto"
+    if rango.get("pct_min") is not None and rango.get("pct_max") is not None:
+        inicial += (f": con la {POLITICAS['historical'].lower()}, el riesgo simulado evitado va de "
+                    f"{rango_pct(rango['pct_min'], rango['pct_max'])} según el supuesto")
+    atendida = next((x for x in reporte if "demanda atendida" in x.lower()), DEMANDA_ATENDIDA)
+    resto = [x for x in reporte if x != atendida and "inventario inicial" not in x.lower()]
+    return ([inicial + ".", atendida] + resto)[:n]
+
+
+def validacion_y_prueba() -> dict:
+    """Validación y prueba final lado a lado: {"presupuesto": bicis o None,
+    "filas": [{"afirmacion", "validacion", "prueba"}]} con los valores ya
+    escritos según su unidad. Sin el archivo de la prueba final, "filas" va vacía."""
+    crudo = indicadores().get("validacion_y_prueba") or {}
+
+    def escribir(valor, intervalo, unidad) -> str:
+        def uno(x, decimales_pct=1):
+            if unidad == "pct":
+                return pct(x, decimales_pct)
+            if unidad in ("horas", "viajes"):
+                return num(x)
+            return num(x, 0 if not _falta(x) and float(x) == int(float(x)) else 1)
+        texto_valor = uno(valor)
+        if texto_valor == SIN_DATO:
+            return SIN_DATO
+        if unidad in ("horas", "viajes"):
+            texto_valor += f" {unidad}"
+        if intervalo and not any(_falta(x) for x in intervalo):
+            texto_valor += f" ({uno(intervalo[0])} a {uno(intervalo[1])})"
+        return texto_valor
+
+    filas = [{"afirmacion": texto(f.get("afirmacion")),
+              "validacion": escribir(f.get("validacion"), f.get("validacion_ic"), f.get("unidad")),
+              "prueba": escribir(f.get("prueba"), f.get("prueba_ic"), f.get("unidad"))}
+             for f in crudo.get("filas") or []]
+    return {"presupuesto": crudo.get("presupuesto_de_referencia"), "filas": filas}
 
 
 # --------------------------------------------------------------------------- #
 # Textos que se arman con las cifras
 # --------------------------------------------------------------------------- #
 
-def linea_discreta() -> str:
-    """La única nota de contexto que lleva cada página."""
+def periodo_en_meses(inicio, fin) -> str:
+    """ "julio a septiembre de 2026" (o "julio de 2026", o con los dos años si cambian)."""
+    if _falta(inicio) or _falta(fin):
+        return SIN_DATO
+    a, b = pd.Timestamp(inicio), pd.Timestamp(fin)
+    if a.year != b.year:
+        return f"{_MESES[a.month - 1]} de {a.year} a {_MESES[b.month - 1]} de {b.year}"
+    if a.month != b.month:
+        return f"{_MESES[a.month - 1]} a {_MESES[b.month - 1]} de {b.year}"
+    return f"{_MESES[b.month - 1]} de {b.year}"
+
+
+def meses_de_historia() -> str:
+    """Los meses anteriores a la validación ("julio a agosto de 2026"), o "Sin dato".
+    No detiene la página si faltan las tablas: la usa la sección de contexto."""
+    ruta = CARPETA / "indicadores.json"
+    if not ruta.exists():
+        return SIN_DATO
+    ind = _json(str(ruta), ruta.stat().st_mtime)
+    inicio, corte = (ind.get("periodo") or {}).get("inicio"), (ind.get("validacion") or {}).get("inicio")
+    if _falta(inicio) or _falta(corte) or pd.Timestamp(corte) <= pd.Timestamp(inicio):
+        return SIN_DATO
+    return periodo_en_meses(inicio, pd.Timestamp(corte) - pd.Timedelta(days=1))
+
+
+def linea_discreta(clase: str = "simulacion") -> str:
+    """La única nota de contexto que lleva cada página.
+
+    "simulacion": páginas con resultados de la simulación o del pronóstico.
+    "viajes": páginas que solo describen los viajes del periodo analizado.
+    """
     try:
-        sinteticos = indicadores().get("sinteticos")
+        ind = indicadores()
     except FileNotFoundError:
-        sinteticos = False
-    return LINEA + (" · datos sintéticos de ejemplo" if sinteticos else "")
+        ind = {}
+    sinteticos = ind.get("sinteticos")
+    linea = LINEA
+    if clase == "viajes":
+        periodo = ind.get("periodo") or {}
+        meses = periodo_en_meses(periodo.get("inicio"), periodo.get("fin"))
+        # Los datos de muestra son inventados: no se presentan como viajes reales.
+        linea = "Viajes de ejemplo" if sinteticos else LINEA_VIAJES
+        linea += " del periodo analizado" if meses == SIN_DATO else f" de {meses}"
+    return linea + (" · datos sintéticos de ejemplo" if sinteticos else "")
 
 
-def encabezado(titulo: str) -> None:
+def encabezado(titulo: str, clase: str = "simulacion") -> None:
     """Título de la página y, debajo, la línea discreta. Toda página empieza así."""
     st.title(titulo)
-    st.caption(linea_discreta())
+    st.caption(linea_discreta(clase))
+
+
+def _hallazgo_de_contexto(ind: dict) -> str:
+    """Empleos alrededor de las estaciones de oficinas contra las residenciales."""
+    por_tipo = (ind.get("contexto") or {}).get("por_tipo") or {}
+    oficinas = (por_tipo.get("oficinas") or {}).get("proporcion_empleos")
+    residencial = (por_tipo.get("residencial") or {}).get("proporcion_empleos")
+    if oficinas is None or residencial is None:
+        return f"Empleos alrededor de las estaciones de oficinas y de las residenciales: {SIN_DATO}."
+    return (f"A 300 metros de la estación típica de oficinas, los empleos son {pct(oficinas, 0)} de la suma de "
+            f"empleos y trabajadores residentes; en la residencial, {pct(residencial, 0)}. El tipo de estación "
+            "sale del patrón de uso y los datos del Censo lo confirman por separado.")
 
 
 def hallazgos() -> list[str]:
-    """Los tres hallazgos de la página de inicio, armados con las cifras."""
+    """Los cuatro hallazgos de la página de inicio, armados con las cifras."""
     ind = indicadores()
     ref = ind["referencia"]
     hist = ref["politicas"].get("historical") or {}
@@ -382,7 +504,9 @@ def hallazgos() -> list[str]:
     presupuesto = ref.get("presupuesto")
 
     # 1. Cuánto riesgo evita planear con presupuesto.
-    rangos = [r for r in ind["sensibilidad"]["rango"].values()]
+    # El mismo rango que el indicador de la página: el de la regla histórica (si no se simuló, el del modelo).
+    por_politica = ind["sensibilidad"]["rango"]
+    rangos = [r for r in (por_politica.get("historical") or por_politica.get("model"),) if r]
     if presupuesto is None or not (hist or modelo):
         uno = f"Riesgo simulado evitado al planear con presupuesto: {SIN_DATO}."
     elif rangos:
@@ -420,4 +544,4 @@ def hallazgos() -> list[str]:
         tres = "En los presupuestos simulados, cada bici extra todavía reduce el riesgo."
     else:
         tres = f"Presupuesto a partir del cual mover más deja de ayudar: {SIN_DATO}."
-    return [uno, dos, tres]
+    return [uno, dos, tres, _hallazgo_de_contexto(ind)]

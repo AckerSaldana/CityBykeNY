@@ -13,6 +13,7 @@ import streamlit as st
 import datos  # app/datos.py: el único archivo que sabe dónde están los datos
 
 TODO_EL_DIA = "Todo el día"
+HORA_INICIAL = 8  # la página abre en la hora pico de la mañana de un día laborable
 COLOR_EQUILIBRIO = "#8A8F98"
 # Con menos de esto el flujo neto se escribe 0.0: la estación está en equilibrio.
 UMBRAL_EQUILIBRIO = 0.05
@@ -134,14 +135,15 @@ def _demanda_por_hora(usuario: str, hora_elegida: int | None) -> alt.Chart:
     return alt.layer(*capas).properties(height=330)
 
 
-datos.encabezado("Mapa de demanda")
+datos.encabezado("Mapa de demanda", "viajes")
 
 # --- Selectores ------------------------------------------------------------- #
 horas = [None, *range(24)]
 c_hora, c_dia, c_usuario = st.columns([2, 2, 3])
-hora_elegida = c_hora.selectbox("Hora del día", horas, key="mapa_hora",
+hora_elegida = c_hora.selectbox("Hora del día", horas, index=horas.index(HORA_INICIAL), key="mapa_hora",
                                 format_func=lambda h: TODO_EL_DIA if h is None else datos.hora(h))
-tipo_dia = c_dia.radio("Tipo de día", list(datos.TIPOS_DIA), key="mapa_tipo_dia", horizontal=True,
+tipo_dia = c_dia.radio("Tipo de día", list(datos.TIPOS_DIA), index=list(datos.TIPOS_DIA).index("laborable"),
+                       key="mapa_tipo_dia", horizontal=True,
                        format_func=datos.TIPOS_DIA.get)
 usuario = c_usuario.radio("Tipo de usuario", list(datos.USUARIOS), key="mapa_usuario", horizontal=True,
                           format_func=datos.USUARIOS.get)
@@ -172,7 +174,7 @@ with c_mapa:
                 "el color usa a todos los usuarios.</small>", unsafe_allow_html=True)
 
 with c_lado:
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3 = st.columns([3, 2, 2])
     m1.metric(f"Salidas {unidad}", datos.num(mapa["salidas"].sum()))
     m2.metric("Se vacían", datos.num((estados == "se_vacia").sum()))
     m3.metric("Se llenan", datos.num((estados == "se_llena").sum()))

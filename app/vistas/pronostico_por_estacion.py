@@ -2,7 +2,11 @@
 
 Para una estación y un día de validación: el pronóstico del modelo por hora
 (línea central y rango 10 a 90), lo observado y el promedio histórico; debajo,
-una tarjeta por franja con lo que hizo cada política en la simulación.
+una tarjeta por franja con lo que hizo UNA política en la simulación (se elige
+con un selector; abre con la regla histórica).
+
+La página abre con la estación y el día de ejemplo que elige el constructor de
+las tablas (`datos.estacion_de_ejemplo()`), no con un id escrito aquí.
 """
 
 import altair as alt
@@ -16,6 +20,7 @@ SERIE_RANGO = "Rango 10 a 90 del modelo"
 SERIE_PROMEDIO = datos.MODELOS["baseline"]
 SERIE_OBSERVADO = "Observado"
 COLOR_TEXTO_RIESGO = {"alto": "#FFFFFF", "medio": "#1A1A1A", "bajo": "#FFFFFF"}
+POLITICAS_CON_TRASLADO = ("historical", "model")  # la primera es la que se muestra al abrir
 
 datos.encabezado("Pronóstico por estación")
 
@@ -98,9 +103,13 @@ def tarjeta(fila: pd.Series, riesgo_sin_mover) -> None:
             f'<span style="background:{fondo};color:{letra};padding:3px 12px;border-radius:12px;'
             f'font-weight:600">Riesgo simulado: {datos.etiqueta(datos.RIESGOS, nivel)}</span>',
             unsafe_allow_html=True)
-        st.caption(f"Bicis simuladas al empezar la franja: {datos.num(fila['inventario'])} · "
-                   f"{datos.POLITICAS['none']}: riesgo {datos.etiqueta(datos.RIESGOS, riesgo_sin_mover).lower()}")
-        if nivel == "alto" and not datos._falta(fila["bicis"]) and int(fila["bicis"]) == 0:
+        st.markdown(f"En la estación: **{datos.inventario(fila['inventario_antes'], fila['inventario'])}**")
+        st.caption(f"{datos.POLITICAS['none']}: riesgo simulado "
+                   f"{datos.etiqueta(datos.RIESGOS, riesgo_sin_mover).lower()}")
+        if not datos._falta(fila["factible"]) and not bool(fila["factible"]):
+            st.markdown("Ningún inventario inicial evita los dos riesgos (quedar casi vacía y quedar casi "
+                        "llena) en esta franja: conviene una segunda visita durante la franja.")
+        elif nivel == "alto" and not datos._falta(fila["bicis"]) and int(fila["bicis"]) == 0:
             st.markdown("El presupuesto no alcanzó para esta estación.")
 
 
@@ -112,6 +121,14 @@ opciones = datos.opciones_de_estacion()
 if not opciones:
     st.info("No hay estaciones con pronóstico.")
     st.stop()
+
+# Al abrir: la estación y el día de ejemplo (una de oficinas con mucha demanda, traslado en todas
+# las franjas y con solución, en día laborable). Si no existe, la primera de la lista (la de más salidas).
+ejemplo = datos.estacion_de_ejemplo()
+if "pron_estacion" not in st.session_state and ejemplo.get("estacion_id") in opciones:
+    st.session_state["pron_estacion"] = ejemplo["estacion_id"]
+    if ejemplo.get("fecha") and "pron_dia" not in st.session_state:
+        st.session_state["pron_dia"] = pd.Timestamp(ejemplo["fecha"])
 
 col_estacion, col_dia, col_objetivo = st.columns([3, 2, 2])
 estacion_id = col_estacion.selectbox("Estación", list(opciones), format_func=opciones.get, key="pron_estacion")
@@ -178,13 +195,14 @@ elif rec_dia.empty:
 else:
     presupuesto = (ind.get("referencia") or {}).get("presupuesto")
     st.caption(f"Presupuesto de referencia: {datos.num(presupuesto)} bicis al día en todo el sistema.")
+    # Las opciones son los textos en pantalla; aquí se regresan a su clave.
+    por_texto = {datos.POLITICAS[p]: p for p in POLITICAS_CON_TRASLADO}
+    politica = por_texto[st.radio("Política", list(por_texto), horizontal=True, key="pron_politica")]
     sin_mover = rec_dia[rec_dia["politica"] == "none"].set_index("franja")["nivel_riesgo"]
-    columnas = st.columns(2)
-    for columna, politica in zip(columnas, ("model", "historical")):
-        with columna:
-            st.markdown(f"**{datos.POLITICAS[politica]}**")
-            filas = rec_dia[rec_dia["politica"] == politica].sort_values("hora_inicio")
-            if filas.empty:
-                st.caption(datos.SIN_DATO)
-            for _, fila in filas.iterrows():
+    filas = rec_dia[rec_dia["politica"] == politica].sort_values("hora_inicio")
+    if filas.empty:
+        st.caption(datos.SIN_DATO)
+    else:
+        for columna, (_, fila) in zip(st.columns(len(filas)), filas.iterrows()):
+            with columna:
                 tarjeta(fila, sin_mover.get(fila["franja"]))

@@ -11,8 +11,12 @@ Desde la carpeta raíz del proyecto, con el entorno activado:
 
 El primer comando deja en `data/processed/app/` unas tablas pequeñas, que son
 lo único que lee el tablero. **Hay que repetirlo cada vez que cambien los
-datos o se corra una simulación nueva**; el tablero toma las tablas nuevas sin
-reiniciarlo. Si faltan, cada página muestra un mensaje que dice qué correr.
+datos, se corra una simulación nueva o aparezca el archivo con la prueba
+final**; el tablero toma las tablas nuevas sin reiniciarlo (en la siguiente
+interacción o al recargar la página). En cambio, si se edita el código de
+`app/` hay que detener y volver a abrir el tablero: para la demostración,
+`app/.streamlit/config.toml` apaga la vigilancia de archivos y así no aparece
+el aviso de "Source file changed". Si faltan, cada página muestra un mensaje que dice qué correr.
 
 Para comprobar que todo abre después de un cambio:
 
@@ -23,7 +27,7 @@ Para comprobar que todo abre después de un cambio:
 | Archivo | Para qué sirve |
 |---|---|
 | `app/Inicio.py` | Entrada. Solo arma el menú: orden y títulos de las páginas. |
-| `app/vistas/inicio.py` | Página 1, Inicio: el problema, cuatro indicadores, la curva de riesgo contra presupuesto y tres hallazgos. |
+| `app/vistas/inicio.py` | Página 1, Inicio: el problema, cuatro indicadores, la curva de riesgo contra presupuesto, cuatro hallazgos y, si ya existe, la comparación de validación contra prueba final. |
 | `app/vistas/mapa_de_demanda.py` | Página 2, Mapa de demanda. |
 | `app/vistas/estaciones_y_rutas.py` | Página 3, Estaciones y rutas. |
 | `app/vistas/pronostico_por_estacion.py` | Página 4, Pronóstico por estación. |
@@ -34,7 +38,11 @@ Para comprobar que todo abre después de un cambio:
 ## Reglas de las páginas
 
 - Cada página empieza con `datos.encabezado("Título")`: pone el título y una
-  sola línea discreta, "Resultados de simulación con datos de validación".
+  sola línea discreta, "Resultados de simulación con datos de validación"
+  (Inicio, Pronóstico por estación y Confiabilidad). Las páginas que solo
+  describen viajes (Mapa de demanda, Estaciones y rutas, Contexto) usan
+  `datos.encabezado("Título", "viajes")`: "Viajes reales de julio a septiembre
+  de 2026", con los meses calculados del periodo de los datos.
 - En pantalla no van nombres de columnas ni de archivos, tablas crudas ni
   listas de pendientes.
 - Números con `datos.num()` y `datos.pct()` (separador de miles y un decimal
@@ -53,8 +61,12 @@ Para comprobar que todo abre después de un cambio:
   prueba final no se muestra ni se califica.
 - Recomendaciones: una fila por estación, día, franja horaria y política, con
   el presupuesto de referencia. Las bicis son las que esa política movió en la
-  simulación (positivo es llevar, negativo es retirar). El inventario es el
-  simulado justo después del traslado. No es el inventario ideal.
+  simulación (positivo es llevar, negativo es retirar). La tarjeta muestra las
+  bicis simuladas en la estación justo antes y justo después del traslado. No
+  es el inventario ideal. La página muestra una política a la vez y abre con
+  la estación de ejemplo que elige el constructor (regla en `src/app_tables.py`).
+- Si en una franja ningún inventario inicial evita los dos riesgos, la tarjeta
+  lo dice y sugiere una segunda visita durante la franja.
 - Si una franja queda en riesgo alto y no se movió ninguna bici,
   el presupuesto no alcanzó para esa estación.
 - Una estación sin recomendaciones no se simuló (no tiene capacidad conocida o

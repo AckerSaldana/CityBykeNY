@@ -7,9 +7,13 @@ resultado en `data/processed/app/`. `app/datos.py` solo lee esa carpeta.
     python scripts/build_app_tables.py                      # datos reales
     python scripts/build_app_tables.py --datos data/sample --salida /tmp/app
 
-Qué lee de la carpeta de datos: los seis contratos y, si existe,
-`reports/simulacion.json`. Todo lo que falte se escribe vacío o como `null`
-(el dashboard muestra "Sin dato"); nada de esto hace fallar la construcción.
+Qué lee de la carpeta de datos: los seis contratos y, si existen,
+`reports/simulacion.json`, `reports/piso_wape.json` (el error de pronosticar
+con una sola media), `station_context.parquet` (empleos y residentes cerca de
+cada estación) y `reports/validacion_y_prueba.json` (validación y prueba final
+lado a lado). Todo lo que falte se escribe vacío o como `null` (el dashboard
+muestra "Sin dato" o no dibuja ese bloque); nada de esto hace fallar la
+construcción.
 
 Decisión 4: lo observado solo se cruza con el pronóstico en el tramo de
 validación (`split = "val"`). Las filas de la prueba final nunca se leen para
@@ -34,6 +38,14 @@ Definiciones que fija este módulo (y que el dashboard solo muestra):
   curva desde el cual el siguiente escalón evita, por cada bici extra, menos
   del 10 % de lo que evitaba cada bici en el primer escalón
   (`UMBRAL_GANANCIA`).
+- Estación de ejemplo (la que abre "Pronóstico por estación"): entre las
+  estaciones de oficinas con demanda alta, la de más salidas que tenga algún día
+  laborable en que la regla histórica movió bicis en todas las franjas y todas
+  tuvieron solución; de esos días, el que tiene más franjas con menos riesgo
+  que sin intervenir y, si empatan, el de más bicis movidas (ver
+  `_estacion_de_ejemplo`). Si ninguna cumple, la estación con más salidas.
+- Inventario antes del traslado: el inventario justo después del traslado
+  menos las bicis movidas (positivo es llevar).
 """
 
 from __future__ import annotations
@@ -270,7 +282,8 @@ def _pronostico(con, datos: Path, salida: Path, estaciones: pd.DataFrame) -> dic
         general.setdefault(fila.modelo, {})[fila.objetivo] = {
             "n": int(fila.n), "mae": _f(fila.mae), "rmse": _f(fila.rmse), "wape": _f(fila.wape),
             "cobertura": _f(fila.cobertura), "ancho": _f(fila.ancho)}
-    return {"estaciones_df": estaciones, "validacion": val, "pronostico": general}
+    dias = tabla[["estacion_id", "fecha"]].drop_duplicates()
+    return {"estaciones_df": estaciones, "validacion": val, "pronostico": general, "dias_df": dias}
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +306,8 @@ def _recomendaciones(con, datos: Path, salida: Path, reporte: dict, estaciones: 
         FROM read_parquet('{ruta}') ORDER BY 1, 2, 3, 5""").df() if ruta.exists() else pd.DataFrame(
         columns=["estacion_id", "fecha", "hora_inicio", "hora_fin", "politica", "bicis",
                  "nivel_riesgo", "factible", "inventario"])
+    # Bicis en la estación justo antes del traslado (el contrato trae las de después).
+    rec["inventario_antes"] = (rec["inventario"] - rec["bicis"]).astype("int32")
     rec.insert(2, "franja", [franjas.get(h) or ("manana" if h < 12 else "tarde") for h in rec["hora_inicio"]])
     _escribir(rec, salida / "recomendaciones.parquet", grupo=8192)
 
@@ -428,6 +443,10 @@ def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: P
     horas_df = pd.DataFrame(horas, columns=["corte", "grupo", "politica", "riesgo", "ic_bajo", "ic_alto"])
     for col in ("riesgo", "ic_bajo", "ic_alto"):
         horas_df[col] = horas_df[col].astype(float)
+    # "Resto del día" solo existe si las franjas no cubren las 24 horas: sin riesgo, no se guarda.
+    resto = (horas_df["corte"] == "franja") & (horas_df["grupo"] == "resto")
+    if resto.any() and not (horas_df.loc[resto, "riesgo"].fillna(0) > 0).any():
+        horas_df = horas_df[~resto]
     _escribir(horas_df, salida / "riesgo_horas.parquet")
 
     # Sensibilidad al inventario inicial.
@@ -447,6 +466,15 @@ def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: P
         if pcts:
             rango[politica] = {"pct_min": min(pcts), "pct_max": max(pcts),
                                "evitado_min": min(evs), "evitado_max": max(evs), "escenarios": len(pcts)}
+
+    # Piso de azar: mover las mismas bicis sin información.
+    azar = reporte.get("piso_de_azar") or {}
+    ev_azar = _f((azar.get("riesgo_simulado_evitado_por_dia") or {}).get("media"))
+    r_azar = _f((azar.get("riesgo_por_dia") or {}).get("media"))
+    sin_azar = r_azar + ev_azar if r_azar is not None and ev_azar is not None else None
+    piso = {"presupuesto": azar.get("presupuesto_del_dia_en_bicis"), "corridas": azar.get("corridas"),
+            "riesgo": r_azar, "evitado": ev_azar,
+            "pct_evitado": ev_azar / sin_azar if sin_azar else None}
 
     tramo = reporte.get("tramo") or {}
     dias = sorted(rec["fecha"].astype(str).unique().tolist()) if not rec.empty else []
@@ -470,6 +498,7 @@ def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: P
         },
         "referencia": referencia,
         "sensibilidad": {"filas": filas, "rango": rango},
+        "piso_de_azar": piso,
         "presupuesto_umbral": _umbral(curva),
         "limitaciones": _limitaciones(reporte),
     }
@@ -494,6 +523,112 @@ def _comparacion(pronostico: dict, referencia: dict) -> dict:
             evita = "igual"
     return {"modelo_pronostica_mejor": mejor, "modelo_evita": evita,
             "diferencia_de_riesgo": (modelo["riesgo"] - hist["riesgo"]) if evita else None}
+
+
+def _piso_del_pronostico(datos: Path) -> dict:
+    """Error de pronosticar sin información (reports/piso_wape.json), en validación:
+    {"media_global": {"salidas": {"wape", "mae"}, "llegadas": {...}}, "permutacion": {...}}."""
+    claves = {"media global": "media_global", "permutación": "permutacion"}
+    objetivos = {"dep": "salidas", "arr": "llegadas"}
+    piso = {}
+    for m in _leer_json(datos / "reports" / "piso_wape.json").get("metricas") or []:
+        if (m.get("group_by") == "general" and m.get("split") == "val"
+                and m.get("model") in claves and m.get("target") in objetivos):
+            piso.setdefault(claves[m["model"]], {})[objetivos[m["target"]]] = {
+                "wape": _f(m.get("wape")), "mae": _f(m.get("mae"))}
+    return piso
+
+
+def _contexto(datos: Path, estaciones: pd.DataFrame) -> dict:
+    """Empleos alrededor de la estación típica de cada tipo (mediana), con
+    station_context.parquet: {"por_tipo": {tipo: {"estaciones", "proporcion_empleos"}}}."""
+    ruta = datos / "station_context.parquet"
+    if not ruta.exists():
+        return {"por_tipo": {}}
+    ctx = pq.read_table(ruta, columns=["station_id", "proporcion_empleos"]).to_pandas()
+    ctx["station_id"] = ctx["station_id"].astype(str)
+    t = estaciones[["estacion_id", "tipo"]].merge(ctx, left_on="estacion_id", right_on="station_id")
+    t = t[t["tipo"].notna() & t["proporcion_empleos"].notna()]
+    por_tipo = {str(tipo): {"estaciones": int(len(g)), "proporcion_empleos": _f(g["proporcion_empleos"].median())}
+                for tipo, g in t.groupby("tipo")}
+    return {"por_tipo": por_tipo}
+
+
+def _estacion_de_ejemplo(rec: pd.DataFrame, estaciones: pd.DataFrame, dias_con_pronostico: pd.DataFrame,
+                         politica: str = "historical") -> dict:
+    """La estación y el día con que abre "Pronóstico por estación" (regla en el encabezado)."""
+    con_pronostico = estaciones[estaciones["tiene_pronostico"]].sort_values(
+        ["salidas", "estacion_id"], ascending=[False, True])
+    respaldo = {"estacion_id": con_pronostico["estacion_id"].iloc[0] if len(con_pronostico) else None,
+                "fecha": None, "cumple_la_regla": False}
+    candidatas = con_pronostico[(con_pronostico["tipo"] == "oficinas") & (con_pronostico["volumen"] == "alto")
+                                & con_pronostico["simulada"]]
+    if rec.empty or candidatas.empty:
+        return respaldo
+    r = rec[rec["estacion_id"].isin(set(candidatas["estacion_id"]))]
+    # Solo días en que la estación también tiene pronóstico: la página dibuja las dos cosas.
+    con = dias_con_pronostico.assign(fecha=pd.to_datetime(dias_con_pronostico["fecha"]))
+    r = r.assign(fecha=pd.to_datetime(r["fecha"])).merge(con, on=["estacion_id", "fecha"])
+    if r.empty:
+        return respaldo
+    laborable = pd.to_datetime(r["fecha"]).dt.weekday < 5
+    franjas = rec["franja"].nunique()
+    con_solucion = r[laborable].groupby(["estacion_id", "fecha"])["factible"].all()
+    orden = {"bajo": 0, "medio": 1, "alto": 2}
+    sin_mover = r[r["politica"] == "none"].set_index(["estacion_id", "fecha", "franja"])["nivel_riesgo"].map(orden)
+    p = r[laborable & (r["politica"] == politica)].assign(mueve=lambda d: d["bicis"] != 0, movidas=lambda d: d["bicis"].abs())
+    antes = sin_mover.reindex(pd.MultiIndex.from_frame(p[["estacion_id", "fecha", "franja"]])).to_numpy()
+    p["mejora"] = p["nivel_riesgo"].map(orden).to_numpy() < antes
+    dias = p.groupby(["estacion_id", "fecha"]).agg(franjas=("franja", "nunique"), mueve=("mueve", "all"),
+                                                    movidas=("movidas", "sum"), mejoras=("mejora", "sum"))
+    dias = dias[(dias["franjas"] == franjas) & dias["mueve"] & con_solucion.reindex(dias.index).fillna(False)]
+    if dias.empty:
+        return respaldo
+    buenas = set(dias.index.get_level_values("estacion_id"))
+    estacion_id = next(e for e in candidatas["estacion_id"] if e in buenas)  # la de más salidas
+    del_dia = dias.loc[estacion_id].reset_index().sort_values(
+        ["mejoras", "movidas", "fecha"], ascending=[False, False, True])
+    return {"estacion_id": estacion_id, "fecha": str(pd.Timestamp(del_dia["fecha"].iloc[0]).date()),
+            "cumple_la_regla": True}
+
+
+UNIDADES = ("pct", "horas", "viajes", "numero")
+
+
+def _par(x) -> list | None:
+    """Un intervalo como [bajo, alto], venga como lista o como diccionario."""
+    if isinstance(x, dict):
+        x = [x.get("ic_bajo", x.get("bajo")), x.get("ic_alto", x.get("alto"))]
+    if not isinstance(x, (list, tuple)) or len(x) != 2:
+        return None
+    try:
+        par = [_f(x[0]), _f(x[1])]
+    except (TypeError, ValueError):
+        return None
+    return None if None in par else par
+
+
+def _validacion_y_prueba(datos: Path) -> dict | None:
+    """Copia reports/validacion_y_prueba.json (validación y prueba final, lado a
+    lado). Sin archivo, o si no trae filas que se puedan leer, es `None`."""
+    crudo = _leer_json(datos / "reports" / "validacion_y_prueba.json")
+    filas = []
+    for f in crudo.get("filas") or []:
+        if not isinstance(f, dict) or not str(f.get("afirmacion") or "").strip():
+            continue
+        try:
+            validacion, prueba = _f(f.get("validacion")), _f(f.get("prueba"))
+        except (TypeError, ValueError):
+            continue
+        filas.append({"clave": str(f.get("clave") or ""), "afirmacion": str(f["afirmacion"]).strip(),
+                      "unidad": f.get("unidad") if f.get("unidad") in UNIDADES else "numero",
+                      "validacion": validacion, "prueba": prueba,
+                      "validacion_ic": _par(f.get("validacion_ic")), "prueba_ic": _par(f.get("prueba_ic"))})
+    if not filas:
+        return None
+    presupuesto = crudo.get("presupuesto_de_referencia")
+    return {"presupuesto_de_referencia": int(presupuesto) if isinstance(presupuesto, (int, float)) else None,
+            "filas": filas}
 
 
 # --------------------------------------------------------------------------- #
@@ -529,6 +664,10 @@ def build(datos: Path | str = DATOS, salida: Path | str = SALIDA) -> dict:
         "pronostico": pron["pronostico"],
         **sim,
         "comparacion": _comparacion(pron["pronostico"], sim["referencia"]),
+        "pronostico_piso": _piso_del_pronostico(datos),
+        "contexto": _contexto(datos, estaciones),
+        "estacion_de_ejemplo": _estacion_de_ejemplo(rec, estaciones, pron["dias_df"]),
+        "validacion_y_prueba": _validacion_y_prueba(datos),
         "bloques_de_hora": [{"nombre": n, "desde": a, "hasta": b} for n, a, b in BLOQUES],
     }
     (salida / INDICADORES).write_text(

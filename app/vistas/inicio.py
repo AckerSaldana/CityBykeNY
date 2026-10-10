@@ -1,6 +1,7 @@
 """Página "Inicio": el problema, cuatro indicadores, la curva de riesgo contra
-presupuesto y tres hallazgos. Ninguna cifra está escrita a mano: todas salen de
-app/datos.py, así que cambian solas al reconstruir las tablas."""
+presupuesto, cuatro hallazgos y, cuando ya se corrió la prueba final, la
+comparación de validación contra prueba final. Ninguna cifra está escrita a
+mano: todas salen de app/datos.py, así que cambian solas al reconstruir las tablas."""
 
 import altair as alt
 import streamlit as st
@@ -37,30 +38,50 @@ def indicador(columna, titulo: str, valor: str, nota: str) -> None:
 periodo = ind.get("periodo") or {}
 simulacion = ind.get("simulacion") or {}
 politicas = referencia.get("politicas") or {}
-# El indicador usa el modelo; si no se simuló, la regla histórica.
-clave = next((p for p in ("model", "historical") if politicas.get(p)), None)
+# El indicador usa la regla histórica; si no se simuló, el modelo.
+clave = next((p for p in ("historical", "model") if politicas.get(p)), None)
 evitado = politicas.get(clave) or {}
-error = ((ind.get("pronostico") or {}).get("lgbm") or {}).get("salidas") or {}
+pronostico = ind.get("pronostico") or {}
+error = (pronostico.get("lgbm") or {}).get("salidas") or {}
+error_promedio = (pronostico.get("baseline") or {}).get("salidas") or {}
+error_media_global = (((ind.get("pronostico_piso") or {}).get("media_global") or {}).get("salidas") or {})
+# Con casi el mismo resultado (intervalos que se traslapan), las dos líneas de la curva se enciman.
+mismo_resultado = (ind.get("comparacion") or {}).get("modelo_evita") == "igual"
 
 if periodo.get("inicio") and periodo.get("fin"):
     nota_viajes = f"Del {datos.fecha(periodo['inicio'], False)} al {datos.fecha(periodo['fin'], False)}"
 else:
     nota_viajes = f"Periodo: {datos.SIN_DATO}"
 
-nota_evitado = datos.SIN_DATO
+# Riesgo simulado evitado: el rango entre los inventarios iniciales supuestos, no solo el valor más alto.
+valor_evitado, nota_evitado = datos.pct(evitado.get("pct_evitado")), datos.SIN_DATO
 if clave is not None:
+    rango = ((ind.get("sensibilidad") or {}).get("rango") or {}).get(clave) or {}
     nota_evitado = f"{datos.POLITICAS[clave]}, con {datos.num(presupuesto)} bicis movidas al día"
-    intervalo = datos.rango_pct(evitado.get("pct_ic_bajo"), evitado.get("pct_ic_alto"))
-    if intervalo != datos.SIN_DATO:
-        nota_evitado += f" · intervalo de {intervalo}"
+    if rango.get("pct_min") is not None and rango.get("pct_max") is not None:
+        valor_evitado = datos.rango_pct(rango["pct_min"], rango["pct_max"])
+        nota_evitado += ", según el inventario inicial que se suponga"
+    nota_evitado += "."
+    if clave == "historical" and politicas.get("model"):
+        nota_evitado += (f" El {datos.POLITICAS['model'].lower()} da prácticamente el mismo resultado."
+                         if mismo_resultado else
+                         f" Con el {datos.POLITICAS['model'].lower()}: {datos.pct(politicas['model'].get('pct_evitado'))}.")
+    al_azar = (ind.get("piso_de_azar") or {}).get("pct_evitado")
+    if al_azar is not None:
+        nota_evitado += f" Mover las mismas bicis al azar evita {datos.pct(al_azar)}."
 
-c1, c2, c3, c4 = st.columns(4)
+nota_error = f"Salidas, con el {datos.MODELOS['lgbm'].lower()}."
+if error_promedio.get("wape") is not None:
+    nota_error += f" Con el {datos.MODELOS['baseline'].lower()}: {datos.pct(error_promedio['wape'])}."
+if error_media_global.get("wape") is not None:
+    nota_error += f" Con una sola media para todo el sistema: {datos.pct(error_media_global['wape'])}."
+
+c1, c2, c3, c4 = st.columns([4, 3, 4, 5])  # el último título es largo
 indicador(c1, "Viajes analizados", datos.num(ind.get("viajes_analizados")), nota_viajes)
 indicador(c2, "Estaciones", datos.num(ind.get("estaciones")),
           f"{datos.num(simulacion.get('estaciones_simuladas'))} en la simulación")
-indicador(c3, "Riesgo simulado evitado", datos.pct(evitado.get("pct_evitado")), nota_evitado)
-indicador(c4, "Error del pronóstico (WAPE)", datos.pct(error.get("wape")),
-          f"Salidas por hora, con el modelo · cobertura del intervalo: {datos.pct(error.get('cobertura'))}")
+indicador(c3, "Riesgo simulado evitado", valor_evitado, nota_evitado)
+indicador(c4, "Error del pronóstico por hora y estación", datos.pct(error.get("wape")), nota_error)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,12 +156,36 @@ else:
                      .encode(x="presupuesto:Q", y="altura:Q", text="texto:N"))
 
     st.altair_chart(alt.layer(*capas).properties(height=ALTO), width="stretch", height=ALTO + 110)
+    if mismo_resultado and {"historical", "model"} <= set(claves):
+        st.caption(f"Las líneas de {datos.POLITICAS['historical']} y {datos.POLITICAS['model']} se enciman: "
+                   "su resultado es casi el mismo.")
 
 
 # --------------------------------------------------------------------------- #
-# Tres hallazgos
+# Cuatro hallazgos
 # --------------------------------------------------------------------------- #
 
 st.subheader("Hallazgos")
 for numero, frase in enumerate(datos.hallazgos(), start=1):
     st.markdown(f"**{numero}.** {frase}")
+
+
+# --------------------------------------------------------------------------- #
+# Validación y prueba final, lado a lado (solo cuando ya existe la prueba final)
+# --------------------------------------------------------------------------- #
+
+comparacion = datos.validacion_y_prueba()
+if comparacion["filas"]:
+    st.subheader("Validación y prueba final")
+    lineas = ["| | Validación | Prueba final |", "|:--|--:|--:|"]
+    junto = lambda valor: valor.replace(" ", "&nbsp;")  # la cifra y su intervalo, en un solo renglón
+    lineas += [f"| {f['afirmacion']} | {junto(f['validacion'])} | {junto(f['prueba'])} |"
+               for f in comparacion["filas"]]
+    st.markdown("\n".join(lineas))
+    notas = []
+    if comparacion["presupuesto"] is not None:
+        notas.append(f"Con {datos.num(comparacion['presupuesto'])} bicis movidas al día.")
+    if any("(" in f["validacion"] or "(" in f["prueba"] for f in comparacion["filas"]):
+        notas.append("Entre paréntesis, el intervalo.")
+    if notas:
+        st.caption(" ".join(notas))
