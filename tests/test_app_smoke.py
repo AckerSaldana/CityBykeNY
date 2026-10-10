@@ -31,12 +31,15 @@ PAGES = [
 ]
 PAGE_IDS = ["inicio", "mapa", "ranking", "pronostico"]
 RANKING = PAGES[2]  # la vista 2: la única vista que usa la tabla routes
+FORECAST = PAGES[3]  # la vista 3: la única vista que usa la tabla predictions
 # Todas las vistas que hay hoy en app/pages, leídas del disco. Una vista nueva
 # entra sola a la prueba del aviso, sin tocar este archivo.
 ALL_PAGES = [None] + sorted(f"pages/{path.name}" for path in (APP / "pages").glob("*.py"))
 # Las seis tablas, en el mismo orden que TABLES de app/datos.py.
 TABLES = ["stations", "station_hour", "predictions", "recommendations", "policy_curve", "routes"]
 WARNING = "DATOS SINTÉTICOS DE MUESTRA: no son resultados reales"
+# Nota de una vista cuyas tablas son todas reales mientras otras siguen sintéticas.
+REAL_ONLY = "Esta vista usa solo tablas reales"
 MAKE_SAMPLE = "python scripts/make_sample_data.py"
 
 
@@ -59,10 +62,36 @@ def processed(datos, monkeypatch, tmp_path):
     return folder
 
 
-def open_page(page: str | None) -> AppTest:
-    """Abre la app como `streamlit run app/Inicio.py` y, si se pide, cambia de vista."""
+@pytest.fixture()
+def loaded(datos, monkeypatch):
+    """Lista de las tablas que una página lee DE VERDAD, no las que declara.
+
+    Se llena sola: cada lectura de app/datos.py pasa por datos._load. Hay que
+    pasarla a open_page(), que la deja solo con las tablas de la página pedida.
+    """
+    tables: list[str] = []
+    original = datos._load
+
+    def spy(table: str) -> pd.DataFrame:
+        tables.append(table)
+        return original(table)
+
+    monkeypatch.setattr(datos, "_load", spy)
+    return tables
+
+
+def open_page(page: str | None, loaded: list[str] | None = None) -> AppTest:
+    """Abre la app como `streamlit run app/Inicio.py` y, si se pide, cambia de vista.
+
+    `loaded` es la lista del fixture del mismo nombre. Al terminar tiene solo
+    las tablas que leyó `page`.
+    """
+    if loaded is not None:
+        loaded.clear()
     at = AppTest.from_file(str(APP / "Inicio.py"), default_timeout=30).run()
     if page is not None:
+        if loaded is not None:
+            loaded.clear()  # lo que leyó Inicio no cuenta para la vista
         at = at.switch_page(page).run()
     return at
 
@@ -125,17 +154,31 @@ def test_abre_sin_errores_y_avisa_que_los_datos_son_sinteticos(datos, processed,
     assert WARNING in text
     for table in TABLES:
         assert f"`{table}`" in text
-    assert WARNING in at.sidebar.warning[0].value
+    # El aviso del menú de la izquierda también las nombra.
+    side = at.sidebar.warning[0].value
+    assert WARNING in side
+    for table in TABLES:
+        assert f"`{table}`" in side
+    # Nadie dice "solo tablas reales" cuando todo sale de la muestra.
+    assert not any(REAL_ONLY in element.value for element in at.info)
 
 
-def test_abre_con_lo_que_hay_hoy_en_el_repositorio(datos):
+def test_abre_con_lo_que_hay_hoy_en_el_repositorio(datos, loaded):
     """Sin carpetas temporales: data/processed y data/sample tal como están."""
+    synthetic = set(datos.synthetic_tables())
     for page in PAGES:
-        at = open_page(page)
+        at = open_page(page, loaded)
         assert errors_of(at) == [], page
         assert not at.error, page
-        # El aviso se ve exactamente cuando alguna tabla sale de la muestra.
-        assert bool(at.main.warning) == bool(datos.synthetic_tables()), page
+        reads_synthetic = bool(synthetic & set(loaded))
+        # El aviso completo se ve exactamente cuando la página lee alguna tabla
+        # de la muestra.
+        assert bool(at.main.warning) == reads_synthetic, page
+        assert bool(at.sidebar.warning) == reads_synthetic, page
+        # Si la página lee solo tablas reales y quedan sintéticas en otras
+        # vistas, lo dice con la nota corta. Si todo es real, no dice nada.
+        note = any(REAL_ONLY in element.value for element in at.main.info)
+        assert note == (bool(synthetic) and not reads_synthetic), page
 
 
 @pytest.mark.parametrize("page", ALL_PAGES, ids=lambda page: Path(page).stem if page else "inicio")
@@ -150,6 +193,98 @@ def test_toda_vista_de_app_pages_abre_y_muestra_el_aviso(datos, processed, page)
         f"{name} no llama a datos.show_synthetic_warning()"
     )
     assert any(WARNING in element.value for element in at.sidebar.warning), name
+
+
+@pytest.mark.parametrize("only", TABLES)
+@pytest.mark.parametrize("page", ALL_PAGES, ids=lambda page: Path(page).stem if page else "inicio")
+def test_la_vista_que_lee_una_tabla_sintetica_muestra_el_aviso_completo(datos, processed, loaded, page, only):
+    """Regla para cualquier vista, también las nuevas, cuando solo UNA tabla sigue en la muestra.
+
+    Si la vista lee esa tabla, muestra el aviso completo en el cuerpo y en el
+    menú. No vale declarar otra lista: cuenta lo que la vista lee de verdad.
+    """
+    # Copias de la muestra en la carpeta temporal: simulan que llegó todo menos `only`.
+    copy_sample(processed, skip=only)
+    at = open_page(page, loaded)
+    name = page or "Inicio.py"
+
+    assert errors_of(at) == [], name
+    assert not at.error, name
+    assert datos.synthetic_tables() == [only]
+    warns = any(WARNING in element.value and f"`{only}`" in element.value for element in at.main.warning)
+    notes = any(REAL_ONLY in element.value and f"`{only}`" in element.value for element in at.main.info)
+    if only in loaded:
+        assert warns, (
+            f"{name} lee la tabla sintética `{only}` y no muestra el aviso completo. "
+            f"Agrega \"{only}\" a la lista de datos.show_synthetic_warning([...]) de esa vista."
+        )
+        assert any(
+            WARNING in element.value and f"`{only}`" in element.value for element in at.sidebar.warning
+        ), f"{name}: falta el aviso en el menú de la izquierda"
+        assert not any(REAL_ONLY in element.value for element in at.info), (
+            f"{name} dice que usa solo tablas reales, pero lee la tabla sintética `{only}`"
+        )
+    else:
+        # La vista no lee la tabla sintética: aviso completo o nota corta, nunca nada.
+        assert warns or notes, f"{name} no llama a datos.show_synthetic_warning()"
+
+
+@pytest.mark.parametrize("page", PAGES, ids=PAGE_IDS)
+def test_con_la_mezcla_de_hoy_solo_la_vista_del_mapa_dice_que_usa_tablas_reales(datos, processed, loaded, page):
+    """Hoy son reales stations, station_hour, predictions y routes; siguen sintéticas las otras dos."""
+    pending = ["recommendations", "policy_curve"]
+    for table in TABLES:
+        if table not in pending:
+            # Copia de la muestra en la carpeta temporal: solo para simular que llegó el archivo.
+            shutil.copy(SAMPLE / f"{table}.parquet", processed / f"{table}.parquet")
+
+    at = open_page(page, loaded)
+
+    assert errors_of(at) == []
+    assert not at.error
+    assert datos.synthetic_tables() == pending
+    if page == "pages/1_Mapa_de_demanda.py":
+        # Sus dos tablas son reales: nota corta en el cuerpo y en el menú, sin aviso.
+        assert sorted(set(loaded)) == ["station_hour", "stations"]
+        assert not at.warning
+        for note in (at.main.info[0].value, at.sidebar.info[0].value):
+            assert REAL_ONLY in note
+            assert WARNING not in note
+            for table in pending:
+                assert f"`{table}`" in note
+    else:
+        # Inicio y las vistas 2 y 3 leen al menos una tabla sintética: aviso completo.
+        assert set(loaded) & set(pending)
+        for text in (at.main.warning[0].value, at.sidebar.warning[0].value):
+            assert WARNING in text
+            for table in pending:
+                assert f"`{table}`" in text
+        assert "mezcladas" in at.main.warning[0].value
+        assert not any(REAL_ONLY in element.value for element in at.info)
+
+
+@pytest.mark.parametrize(
+    ("used", "shows_warning"),
+    [
+        ('["stations", "station_hour"]', False),  # todas reales: nota corta
+        ('["stations", "recommendations"]', True),  # una es sintética
+        ("", True),  # sin lista: se supone que lee las seis tablas
+        ("[]", True),  # lista vacía: igual que sin lista
+        ('["estaciones"]', True),  # nombre mal escrito: ante la duda, aviso completo
+    ],
+    ids=["todas_reales", "una_sintetica", "sin_lista", "lista_vacia", "nombre_mal_escrito"],
+)
+def test_ante_la_duda_el_aviso_completo(datos, processed, used, shows_warning):
+    """show_synthetic_warning(lista): solo calla el aviso si TODAS las tablas de la lista son reales."""
+    copy_sample(processed, skip="recommendations")  # la única sintética: recommendations
+
+    at = AppTest.from_string(f"import datos\ndatos.show_synthetic_warning({used})\n", default_timeout=30).run()
+
+    assert errors_of(at) == []
+    assert bool(at.main.warning) == shows_warning
+    assert bool(at.sidebar.warning) == shows_warning
+    assert any(REAL_ONLY in element.value for element in at.main.info) != shows_warning
+    assert any(REAL_ONLY in element.value for element in at.sidebar.info) != shows_warning
 
 
 def test_un_enlace_a_una_vista_que_ya_no_existe_avisa_sin_tumbar_inicio(datos, processed, monkeypatch, tmp_path):
@@ -177,6 +312,22 @@ def test_el_selector_de_estacion_filtra_las_tablas(datos, processed):
     assert errors_of(at) == []
     assert at.selectbox[0].value == last
     assert any(f"({last})" in element.value for element in at.markdown)
+
+
+def test_la_vista_de_pronostico_dice_que_lo_observado_solo_se_compara_en_validacion(datos, processed):
+    """Decisión 4: la prueba final se usa una sola vez. La vista 3 lo deja escrito en pantalla."""
+    at = open_page(FORECAST)
+    text = visible_text_of(at)
+
+    assert "decisión 4" in text
+    assert "solo en los días de validación" in text
+    assert "sin lo observado al lado y sin calcular su error" in text
+    # La prueba de lectura cuenta aparte las filas de validación de la estación elegida.
+    predictions = datos.load_predictions()
+    station = predictions["station_id"] == at.selectbox[0].value
+    rows = int((station & (predictions["split"] == "val")).sum())
+    assert 0 < rows < int(station.sum())  # la estación tiene filas de validación y de prueba final
+    assert f"({rows} de validación)" in text
 
 
 # --------------------------------------------------------------------------- #

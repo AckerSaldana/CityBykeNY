@@ -27,7 +27,10 @@ st.write(
 )
 
 # Aviso de datos sintéticos. Va en todas las páginas; no lo quites.
-datos.show_synthetic_warning()
+# La lista dice qué tablas lee esta vista. Si son todas reales, en lugar del
+# aviso sale una nota corta que lo dice.
+# OJO: si la vista empieza a leer otra tabla, agrégala a esta lista.
+datos.show_synthetic_warning(["stations", "recommendations", "policy_curve", "routes"])
 
 # --- Datos de esta vista ---
 # stations: nombre y ubicación de cada estación (capacity y station_type

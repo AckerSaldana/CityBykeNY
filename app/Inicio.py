@@ -28,6 +28,8 @@ st.write(
 
 # Aviso de datos sintéticos. Va en todas las páginas y no se quita a mano:
 # desaparece solo cuando los archivos reales estén en data/processed.
+# Inicio lee las seis tablas. Por eso va sin lista: muestra el aviso completo
+# mientras quede alguna tabla sintética.
 datos.show_synthetic_warning()
 
 # --- Vistas ---

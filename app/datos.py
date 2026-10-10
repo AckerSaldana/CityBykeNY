@@ -10,9 +10,14 @@ Regla para cada tabla:
 3. Si no está en ninguna de las dos carpetas, la página muestra un mensaje que
    dice cómo generar la muestra y se detiene. No aparece un error de Python.
 
-Mientras ALGUNA tabla venga de data/sample, cada página muestra un aviso
-visible. Ese aviso no se quita a mano: desaparece solo cuando los archivos
-reales llegan a data/processed.
+Mientras ALGUNA tabla venga de data/sample, cada página lo dice:
+
+- La página que lee al menos una tabla sintética muestra el aviso completo.
+- La página cuyas tablas son todas reales muestra una nota corta: dice que
+  usa solo tablas reales y cuáles siguen sintéticas en otras vistas.
+
+Ni el aviso ni la nota se quitan a mano: desaparecen solos cuando los
+archivos reales llegan a data/processed.
 
 OJO con la mezcla: si unas tablas ya son reales y otras siguen en la muestra,
 sus estaciones no coinciden (las de la muestra se llaman SIM-...). Al cruzar
@@ -45,6 +50,7 @@ TABLES = {
 }
 
 SYNTHETIC_WARNING = "DATOS SINTÉTICOS DE MUESTRA: no son resultados reales"
+REAL_ONLY_NOTE = "Esta vista usa solo tablas reales"
 MAKE_SAMPLE_COMMAND = "python scripts/make_sample_data.py"
 
 
@@ -74,16 +80,41 @@ def missing_tables() -> list[str]:
     return [table for table in TABLES if find_file(table) is None]
 
 
-def show_synthetic_warning() -> None:
+def show_synthetic_warning(used: list[str] | None = None) -> None:
     """Aviso visible mientras alguna tabla venga de data/sample.
 
-    Hay que llamarla al inicio de TODAS las páginas. Si todas las tablas son
-    reales no muestra nada.
+    Hay que llamarla al inicio de TODAS las páginas.
+
+    `used` es la lista de las tablas que lee la vista, por ejemplo
+    ["stations", "station_hour"]. Según esa lista, la página muestra:
+
+    - El aviso completo, si la vista lee al menos una tabla sintética.
+    - Una nota corta, si las tablas de la vista son todas reales pero quedan
+      tablas sintéticas en otras vistas.
+    - Nada, si las seis tablas ya son reales.
+
+    Sin lista se supone que la vista lee las seis tablas: sale el aviso
+    completo mientras quede alguna sintética. Es lo que usa Inicio.
+
+    OJO: si la vista empieza a leer otra tabla, hay que agregarla a su lista.
+    La prueba (pytest tests/test_app_smoke.py) falla si falta.
     """
     tables = synthetic_tables()
     if not tables:
         return
     names = ", ".join(f"`{table}`" for table in tables)
+    # ¿La vista lee alguna tabla sintética? Sin lista se supone que sí. Un
+    # nombre mal escrito también cuenta como sí: ante la duda, aviso completo.
+    uses_synthetic = not used or any(
+        table in tables or table not in TABLES for table in used
+    )
+    if not uses_synthetic:
+        # Todas las tablas de esta vista son reales: se dice eso, sin alarmar,
+        # y se nombran las que siguen sintéticas en las demás vistas.
+        note = f"{REAL_ONLY_NOTE}. Siguen sintéticas en otras vistas: {names}."
+        st.info(note)
+        st.sidebar.info(note)
+        return
     text = (
         f"**{SYNTHETIC_WARNING}.**\n\n"
         f"Tablas que vienen de `data/sample`: {names}.\n\n"
@@ -101,8 +132,9 @@ def show_synthetic_warning() -> None:
             "arregla solo cuando llegue el resto de los archivos reales."
         )
     st.warning(text)
-    # También en el menú de la izquierda, que sigue a la vista al bajar la página.
-    st.sidebar.warning(f"{SYNTHETIC_WARNING}.")
+    # También en el menú de la izquierda, que sigue a la vista al bajar la
+    # página. Ahí también se nombran las tablas sintéticas.
+    st.sidebar.warning(f"{SYNTHETIC_WARNING}. Tablas: {names}.")
 
 
 # --------------------------------------------------------------------------- #
@@ -195,7 +227,16 @@ def load_predictions() -> pd.DataFrame:
 
     `ts_hour` es hora local de Nueva York, con zona horaria.
     OJO: son periodos de evaluación que ya pasaron, no horas futuras. Es lo
-    que el modelo esperaba para esos días, para compararlo con lo observado.
+    que el modelo esperaba para esos días.
+
+    OJO, decisión 4 del equipo (la prueba final se usa una sola vez):
+    lo observado se compara SOLO con las filas de `split == "val"`
+    (validación). Las filas de `split == "test"` (prueba final) se muestran
+    como pronóstico, sin lo observado al lado y sin calcular su error, hasta
+    la evaluación final del proyecto.
+
+    Con `model == "baseline"`, `q50` es el promedio histórico de esa estación,
+    día de la semana y hora. No es la mediana.
     """
     return _load("predictions")
 
