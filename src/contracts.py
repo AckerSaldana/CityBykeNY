@@ -121,7 +121,7 @@ RECOMMENDATIONS = Contract(
             ("window_start", TS),
             ("window_end", TS),
             ("policy", pa.string()),
-            ("start_inventory_target", pa.int64()),
+            ("start_inventory_target", pa.int64()),  # inventario con el que queda la estación tras el traslado
             ("bikes_to_move", pa.int64()),  # positivo es llevar, negativo es retirar
             ("risk_level", pa.string()),
             ("feasible", pa.bool_()),
