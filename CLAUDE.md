@@ -195,6 +195,9 @@ pip install -r requirements.txt -c constraints.txt
 
 pytest                                    # contratos, fuga, config, scripts y app
 python scripts/make_sample_data.py        # regenera data/sample (sintético)
+
+python scripts/build_tables.py            # limpieza: stations, station_hour y routes reales
+python scripts/run_baseline.py            # línea base: predictions y métricas de validación
 streamlit run app/Inicio.py               # dashboard
 
 python scripts/download_trips.py --listar 202609          # qué hay en el índice
@@ -208,7 +211,8 @@ python scripts/capture_gbfs.py --una-vez  # una sola captura (para cron)
 
 ```
 app/            Dashboard de Streamlit (Inicio.py, pages/, datos.py, LEEME.md)
-config/         operacion.yaml: reglas de operación
+config/         operacion.yaml: reglas de operación (logística)
+                datos.yaml: periodo, tramos y reglas de limpieza (programación)
 data/raw/       Descargas pesadas: trips/, zips/, gbfs/      (no va en Git)
 data/processed/ Salidas reales del flujo, los seis contratos (no va en Git)
 data/sample/    Datos SINTÉTICOS pequeños con los seis contratos (sí va en Git)
@@ -218,9 +222,9 @@ notebooks/b/    Notebooks del compañero
 scripts/        Puntos de entrada: python scripts/<nombre>.py
 src/contracts.py  Contratos de datos: esquemas, validación, lectura y escritura
 src/paths.py      Rutas y zona horaria
-src/data/       Descarga de viajes, captura de GBFS, datos de muestra
+src/data/       Descarga de viajes, captura de GBFS, limpieza y tablas, datos de muestra
 src/features/   Variables: registro de constructores y revisión de fuga
-src/models/     Línea base y LightGBM (pendiente)
+src/models/     Línea base y métricas; LightGBM pendiente
 src/sim/        Simulador (pendiente) y lector de operacion.yaml
 tests/          Pruebas
 ```
@@ -249,9 +253,9 @@ Viajes (`https://s3.amazonaws.com/tripdata`):
 - Las filas de un CSV no vienen ordenadas por fecha.
 - El script deja la capa cruda en `data/raw/trips/AAAAMM.parquet` con esas 13
   columnas, sin limpiar: ids y nombres como texto, fechas sin zona, coordenadas
-  decimales. En la máquina de Acker ya existe un mes real, `202604.parquet`
-  (3,860,371 filas); no va en Git y se regenera con
-  `python scripts/download_trips.py 202604`.
+  decimales. En la máquina de Acker hay cuatro meses reales: 202604
+  (3,860,371 filas) y 202607 a 202609, que son los que usa `config/datos.yaml`.
+  No van en Git; se regeneran con `python scripts/download_trips.py`.
 - **Los ids de estación vienen inconsistentes en el origen** (visto en 202604,
   está así en el CSV): 60 ids aparecen con un solo decimal (`2231.1`) y 57 de
   ellos también con el cero final (`2231.10`) y el mismo nombre de estación;
@@ -273,6 +277,49 @@ Viajes (`https://s3.amazonaws.com/tripdata`):
   viaje termina en abril y 202604 no trae ninguno que empiece en marzo (no se
   revisó el archivo completo). La limpieza debe unir los meses, quitar
   duplicados por `ride_id` y después filtrar la ventana por `started_at`.
+
+Julio a septiembre de 2026 (medido el 10 de octubre sobre los tres archivos,
+del 1 de julio al 30 de septiembre y antes de excluir estaciones):
+
+- 15,222,228 viajes; son exactamente los que terminan entre el 1 de julio y
+  el 30 de septiembre. Ningún `ride_id` repetido. 869 empiezan el 30 de junio.
+- No hay cambio de horario dentro del periodo: Nueva York va 4 horas detrás de
+  UTC todo el tiempo.
+- Viajes sin estación de inicio: 8,814. Sin estación de fin: 44,469 (3,080
+  traen nombre pero no id). De los 3,430 viajes de más de 24 horas, 3,345 no
+  tienen estación de fin.
+- 2,572 ids crudos. 98 pares de variantes: 94 son un decimal contra dos
+  (`2231.1` / `2231.10`) y 4 son con guion bajo final. En los 98 coincide el
+  nombre; en 95 la coordenada es idéntica y en 3 difiere entre 12 y 33 metros
+  (`5303.06_`, `6517.08_`, `6569.09_`). `5303.06_` es una estación aparte en
+  GBFS. `3593.1` y `6131.1` son ids oficiales de un decimal, sin gemelo.
+- La escritura de un decimal aparece casi solo en las llegadas (23.7 % de las
+  llegadas de esas estaciones contra 0.035 % de las salidas). Sin unir, el
+  flujo neto de esas 94 estaciones sale muy mal.
+- La coordenada es fija por id (no hay ruido de GPS; la única excepción es una
+  salida de `5914.08` a 362 m de su punto) y el nombre también, salvo 4 ids con
+  dos formas de escribirlo.
+- Una estación reubicada recibe un id nuevo a pocos metros y su historia se
+  parte (`3022.01` → `3022.05`, `7363.03` → `7363.04`, `5329.08` → `5329.13`).
+- **Ceros que no son demanda cero:** una estación cerrada varios días sigue
+  teniendo filas en cero dentro de su tramo. En la tabla final, 40,323
+  horas-estación caen en rachas de 72 horas o más sin ningún viaje, también en
+  estaciones grandes. No se determinó la causa. Conviene tenerlo presente al
+  leer errores de pronóstico y al simular.
+- Hay días con mucho menos uso que los de su misma semana. No se contrastó con
+  clima ni con otra fuente.
+- La exploración miró todo el periodo, también el tramo de prueba final. Lo
+  que se vio ahí (qué estaciones y qué días) queda fuera de este archivo a
+  propósito: ninguna decisión de modelado se ajusta con eso (decisión 4).
+- Contra el GBFS de hoy: 27 estaciones con viajes en el periodo tienen
+  capacidad 0 (ya no están instaladas) y 21 ids de los viajes no están, sin
+  contar las 95 escrituras que se unen a su gemela: 15 estaciones de las tablas
+  y 6 excluidas (`1234.56`, `HB106`, `SYS016`, `SYS033`, `SYS038`,
+  `Shop Morgan`).
+- Viaje conocido para la zona horaria: `ride_id` `0005122465C6A4A8`, inicio
+  `2026-07-15 08:20:16` en la estación `4327.09`. Su hora es
+  `2026-07-15 08:00` de Nueva York, que es `12:00` UTC. Con un `CAST` a secas
+  en esta máquina cae dos horas tarde.
 
 GBFS (`https://gbfs.citibikenyc.com/gbfs/gbfs.json`):
 
@@ -313,10 +360,129 @@ Herramientas:
   TimeZone` anterior). Nunca un `::TIMESTAMPTZ` o `CAST(... AS TIMESTAMPTZ)` a
   secas: desplaza cada hora 1 o 2 horas, el resultado trae zona y
   `write_contract` no lo nota. Con `AT TIME ZONE`, la 01:xx repetida del cambio
-  de horario de otoño queda toda en la segunda 01:00 (-05:00). Al escribir la
-  limpieza conviene una prueba con un viaje conocido.
+  de horario de otoño queda toda en la segunda 01:00 (-05:00).
+- Un viaje que empieza en la primera 01:xx del cambio de horario de otoño y
+  termina en la repetida trae `ended_at` menor que `started_at`, y la limpieza
+  lo quita como fecha imposible (queda contado en "terminan antes de empezar").
+  El periodo actual no tiene cambio de horario; si se agrega noviembre, hay que
+  arreglarlo antes.
 - pandas 3: el texto es tipo `str` y un entero con nulos se lee como decimal
   salvo que se use `src.contracts.read_contract`.
+
+## Periodo, limpieza y línea base
+
+El periodo, los tres tramos y las reglas de limpieza están en
+`config/datos.yaml` (lo lee `src.data.datos_config.load_datos()`), no en el
+código. Todo mes que toque el periodo debe estar en `meses_crudos`.
+
+- **Periodo:** 1 de julio a 29 de septiembre de 2026. Tramos: entrenamiento
+  1 jul a 31 ago, validación 1 a 14 sep, prueba final 15 a 29 sep.
+- **El 30 de septiembre queda fuera a propósito.** Los archivos de julio a
+  septiembre traen los viajes que TERMINAN en cada mes y el de octubre no
+  existe todavía: faltan los viajes que salieron el 30 por la noche y
+  terminaron el 1 de octubre (estimado: unas 750 salidas, cerca de 1 de cada 6
+  de las 23:00). Hasta el 29, salidas y llegadas están completas.
+
+Reglas de la limpieza (`src/data/build_tables.py`), cada una con su conteo en
+`data/processed/reports/limpieza.md`:
+
+1. Un viaje cuenta una sola vez (`ride_id`), aunque venga en dos archivos.
+2. Los ids son texto; solo se les quitan espacios sobrantes.
+3. **Unión de variantes (decisión 15):** dos escrituras del mismo id se unen
+   solo si tienen el mismo nombre y la misma coordenada (tolerancia en el
+   YAML). Queda la escritura con más viajes. Un id sin gemelo no se toca.
+4. **Estaciones excluidas** (lista en el YAML): Nueva Jersey (`HB`, `JC`),
+   porque aquí solo aparecen como destino y su flujo quedaría incompleto, y
+   talleres o bodegas (`SYS...`, `Shop Morgan`, `1234.56`). El otro extremo del
+   viaje sigue contando.
+5. Salidas: viajes que empiezan en el periodo, en la hora de `started_at`.
+   Llegadas: viajes que terminan en el periodo, en la hora de `ended_at`.
+6. Un viaje sin estación de inicio o de fin cuenta solo del lado que sí tiene.
+   No se adivina la estación a partir del nombre.
+7. `capacity` es la del feed GBFS de hoy, no la del periodo; hace falta al
+   menos una captura (`python scripts/capture_gbfs.py --una-vez`) o queda nula
+   en todas. Una capacidad 0 (estación que hoy no está instalada) se guarda
+   como nulo. Al revés no vale: 11 estaciones de las tablas no están
+   instaladas hoy y conservan su capacidad. Para saber cuáles ya no existen se
+   usa `is_installed` de `station_status`.
+8. `station_type` queda nulo (decisión 13).
+
+*Las reglas 4, 6 y 7 y el corte del 30 de septiembre son decisiones de
+programación: si se cambian, se cambian en el YAML o aquí y se avisa.*
+
+Resultado de la limpieza del 10 de octubre de 2026 (todo está en
+`data/processed/reports/limpieza.md`):
+
+- 15,222,228 viajes leídos, ninguno repetido ni con fechas imposibles.
+- 98 grupos de ids parecidos: **95 unidos y 3 sin unir** (`5303.06_`,
+  `6517.08_` y `6569.09_` quedan como estaciones aparte, a 16, 12 y 33 metros
+  de su gemela). Cambiaron de id 826 salidas y 205,130 llegadas.
+- `stations`: 2,398 estaciones; 2,356 con capacidad y 42 sin ella (27 con
+  capacidad 0 en el GBFS de hoy y 15 que no están en GBFS). `station_type`
+  nulo en todas.
+- `station_hour`: 5,029,327 filas, 15,017,726 salidas y 14,981,442 llegadas;
+  32.1 % de las filas están en cero.
+- `routes`: 1,163,401 pares con 14,972,447 viajes.
+- Las salidas y las llegadas no cuadran entre sí ni tienen por qué: 44,003
+  viajes no traen estación de fin y 8,706 no traen estación de inicio.
+- Zona horaria comprobada con viajes reales: el viaje `0005122465C6A4A8`
+  (inicio `2026-07-15 08:20:16`, estación `4327.09`) cae en la fila de las
+  `08:00-04:00` (12:00 UTC), y las 4 salidas de esa fila coinciden con el
+  conteo hecho aparte sobre el archivo crudo.
+- Una segunda construcción hecha solo con pandas, sin DuckDB, dio tablas
+  idénticas.
+
+Línea base (`src/models/baseline.py`): promedio histórico por estación, día de
+la semana y hora local. En `predictions`, para `model = "baseline"`, **`q50`
+guarda ese promedio (no es una mediana)** y `q10`/`q90` son los cuantiles
+empíricos de la misma celda. Para validación la historia es el entrenamiento;
+para la prueba final, entrenamiento más validación. Las filas de la prueba
+final se escriben, pero **no se calculan sus métricas**: la prueba final se
+usa una sola vez (decisión 4): `src.models.metrics.evaluate` se niega a
+evaluarla si no se le pide de forma explícita. Las métricas de validación
+quedan en `data/processed/reports/metricas_validacion.md`.
+
+Línea base en validación (1 a 14 de septiembre de 2026, 784,929 filas):
+
+| | MAE | RMSE | WAPE | Cobertura del intervalo |
+|---|---|---|---|---|
+| Salidas | 1.518 | 2.962 | 49.1 % | 80.0 % |
+| Llegadas | 1.516 | 2.957 | 49.2 % | 80.0 % |
+
+Cómo leerlo sin engañarse:
+
+- El 80 % de cobertura es un promedio: de noche sube hasta 92 % (casi todo es
+  cero y el intervalo lo cubre sin mérito) y entre las 07:00 y las 19:00 baja a
+  73–77 % en salidas y 73–79 % en llegadas. No es un intervalo calibrado: en
+  salidas, 6.1 % de las filas quedan debajo de `q10` y 13.8 % arriba de `q90`
+  (lo nominal es 10 % de cada lado), y la cobertura es 93.9 % cuando el valor
+  real es 0 contra 69.4 % cuando es mayor que 0.
+- `q50` es un promedio y el promedio no minimiza el error absoluto (eso lo hace
+  la mediana). Con la mediana de la misma celda, en salidas, el MAE bajaría de
+  1.518 a 1.476 y el RMSE subiría de 2.962 a 3.009. Al comparar MAE o WAPE con
+  el `q50` de LightGBM, parte de la diferencia viene de ahí: comparar también
+  RMSE.
+- **Filas de respaldo:** si una estación no tiene historia, su pronóstico es
+  el promedio del sistema para ese día y hora (nivel 3). No es un pronóstico de
+  esa estación, es un marcador. En validación son 4,579 filas de 26 estaciones
+  (0.6 %) y ahí el pronóstico es unas seis veces lo observado (WAPE 617 % en
+  salidas). El tramo de prueba tiene 2,485 filas así. El dashboard y el
+  simulador no deben leerlas como pronósticos normales.
+- El WAPE pasa de 100 % de madrugada, cuando casi no hay viajes. Siempre se
+  cita con su hora.
+- "Festivo" es un solo día (Labor Day, 7 de septiembre): no generaliza.
+- Solo mide demanda atendida, y las horas de una estación cerrada cuentan como
+  error.
+- Si se reconstruye `station_hour` o cambian las fechas de
+  `config/datos.yaml`, hay que volver a correr
+  `python scripts/run_baseline.py`; una prueba falla a propósito hasta
+  hacerlo. Compara las filas y la huella de la historia que la línea base deja
+  en `data/processed/reports/linea_base_entrada.json` (entrenamiento y
+  validación; de la prueba final, solo las fechas).
+- Para comparar con LightGBM se usa `evaluate(...)` sobre las mismas filas:
+  falla si a alguna fila real del tramo le falta predicción, si hay valores
+  vacíos o si `q10` es mayor que `q90`. Quien escriba las predicciones de
+  LightGBM debe conservar las filas de la línea base en `predictions.parquet`.
 
 ## Sin fuga de información, en concreto
 
@@ -356,5 +522,16 @@ el pronóstico de clima emitido antes de decidir).
 - `ocupacion_respaldo` tiene un valor por franja y la decisión 14 no dice cuál
   da el inventario inicial de la simulación. Programación usará el de la
   primera franja del día salvo que logística diga otra cosa.
-- Aún no existen: limpieza y tabla por estación y hora, línea base, LightGBM,
-  simulador y variables externas.
+- El dashboard ya lee datos reales en `stations`, `station_hour`, `routes` y
+  `predictions`. `recommendations` y `policy_curve` siguen siendo sintéticas
+  hasta que exista el simulador.
+- Aún no existen: LightGBM, simulador, regla de `station_type` y variables
+  externas.
+- El simulador tiene que decidir qué hace con las 42 estaciones sin capacidad
+  y con las estaciones sin tipo (hoy todas): `ocupacion_respaldo` se define por
+  tipo.
+- Los 3,039 viajes con nombre de estación de fin pero sin id no cuentan como
+  llegada. En 3,038 el nombre corresponde a una sola estación de las tablas,
+  así que se podrían asignar si el equipo lo decide; sería una regla nueva. El
+  otro (`Clinton St & Grand St`) no se puede: los tres pares sin unir comparten
+  nombre.

@@ -11,9 +11,11 @@ Flujo: viajes históricos en Parquet (DuckDB) → tabla por estación y hora →
 línea base contra LightGBM con cuantiles → simulación de inventario →
 recomendación de bicis a mover → dashboard en Streamlit.
 
-> **Estado actual: base del repositorio.** Todavía no hay modelos, simulador ni
-> resultados. El dashboard abre con datos **sintéticos** de `data/sample`, que
-> no representan nada real y no se deben citar.
+> **Estado actual:** existen la limpieza, la tabla por estación y hora y la
+> línea base, con viajes reales de julio a septiembre de 2026. Todavía no hay
+> LightGBM ni simulador: las recomendaciones y la curva de riesgo del dashboard
+> siguen saliendo de `data/sample`, que son datos **sintéticos** y no se deben
+> citar. El dashboard avisa qué tablas son sintéticas.
 
 El contexto completo, las decisiones del equipo y los contratos de datos están
 en [`CLAUDE.md`](CLAUDE.md).
@@ -85,7 +87,28 @@ python -c "import duckdb; print(duckdb.sql(\"SELECT count(*) FROM 'data/raw/trip
 Ese conteo es de filas, no de viajes: meses seguidos pueden repetir viajes
 (ver `CLAUDE.md`). Para contar viajes se usa `count(DISTINCT ride_id)`.
 
-### 5. Capturar el estado de las estaciones (GBFS)
+### 5. Construir las tablas reales y la línea base
+
+```bash
+python scripts/download_trips.py --desde 202607 --hasta 202609   # unos 3 GB
+python scripts/capture_gbfs.py --una-vez   # una foto de GBFS: de ahí sale la capacidad
+python scripts/build_tables.py     # limpieza: stations, station_hour y routes
+python scripts/run_baseline.py     # línea base: predictions y métricas de validación
+```
+
+El periodo, los tres tramos (entrenamiento, validación y prueba final) y las
+reglas de limpieza están en `config/datos.yaml`. Las tablas quedan en
+`data/processed` y cada paso deja un reporte legible en
+`data/processed/reports/` (`limpieza.md` y `metricas_validacion.md`).
+
+La limpieza tarda unos 15 segundos y necesita cerca de 2 GB libres mientras
+corre. La línea base tarda menos de 10 segundos. Si se reconstruyen las
+tablas, hay que volver a correr la línea base.
+
+Las métricas se calculan solo en validación. La prueba final se usa una sola
+vez, al cierre.
+
+### 6. Capturar el estado de las estaciones (GBFS)
 
 El feed en vivo no guarda historial: lo que no se captura se pierde. Conviene
 dejarlo corriendo desde el inicio del reto.
@@ -117,7 +140,7 @@ dejar la laptop abierta y conectada. Lo que pase mientras la computadora
 duerme o está apagada no se recupera. Más detalle al inicio de
 `src/data/gbfs.py`.
 
-### 6. Regenerar los datos de muestra
+### 7. Regenerar los datos de muestra
 
 ```bash
 python scripts/make_sample_data.py
@@ -131,6 +154,7 @@ dashboard, no para sacar conclusiones.
 ```
 app/            Dashboard de Streamlit
 config/         operacion.yaml: reglas de operación (hoy provisionales)
+                datos.yaml: periodo, tramos y reglas de limpieza
 data/raw/       Descargas pesadas                     (no va en Git)
 data/processed/ Salidas reales del flujo              (no va en Git)
 data/sample/    Datos sintéticos pequeños             (sí va en Git)
