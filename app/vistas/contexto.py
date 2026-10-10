@@ -7,3 +7,7 @@ import seccion_contexto
 
 datos.encabezado("Contexto de las estaciones", "viajes")
 seccion_contexto.mostrar()
+
+import seccion_clima  # demanda en horas con lluvia contra horas secas (clima observado)
+
+seccion_clima.mostrar()
