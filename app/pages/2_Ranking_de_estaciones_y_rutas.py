@@ -48,8 +48,8 @@ datos.show_simulation_note(tables_used)
 #     Nueva York, con zona horaria. El día de la fila sale de window_start:
 #     recommendations["window_start"].dt.date
 #   - policy: "none" (no intervenir), "historical" (regla histórica) o
-#     "model" (decide con el pronóstico). OJO: mientras no exista LightGBM,
-#     ese pronóstico es la línea base, no un modelo entrenado. La nota de
+#     "model" (decide con el pronóstico). Las dos usan la misma lógica;
+#     solo cambia el pronóstico (histórico o LightGBM). La nota de
 #     simulación dice cuál se usó.
 #   - bikes_to_move: bicis que esa política movió en la simulación, con el
 #     presupuesto de referencia. Positivo = llevar bicis a la estación;
@@ -63,7 +63,7 @@ datos.show_simulation_note(tables_used)
 #     el inventario de ANTES del traslado.
 #   - feasible: si es False, según el pronóstico ningún inventario inicial
 #     evita a la vez que la estación se vacíe y que se llene. Hay que
-#     avisarlo, no esconderlo. Es igual en las tres políticas.
+#     avisarlo, no esconderlo. Puede diferir entre políticas.
 #   OJO: hay estaciones sin recomendaciones. No se simularon: no tienen
 #   capacidad registrada o no tuvieron viajes en los días simulados.
 # policy_curve: curva de riesgo contra presupuesto. Sale de la misma

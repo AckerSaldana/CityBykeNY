@@ -212,38 +212,33 @@ empieza cada estación, como fracción de su capacidad (ocupación de respaldo,
 de 0 % vacía a 100 % llena).
 
 **Ojo: hoy ninguna estación tiene tipo.** Faltan los umbrales para
-clasificarlas (ver los pendientes de abajo). Mientras falten, a todas las
-estaciones se les aplica una sola fila de la tabla: la del tipo que diga
-`tipo_si_falta`. El valor provisional es mixta, así que hoy solo cuenta la
-fila "mixta" y las otras tres no se usan todavía.
+clasificarlas (ver los pendientes de abajo). Una estación sin tipo no tiene
+estrategia: no toma la de ningún otro tipo. Mientras falten los umbrales, esta
+tabla no cambia ningún resultado.
 
-La ocupación de respaldo tiene dos usos:
+La ocupación de respaldo tiene un solo uso: es el valor al que se lleva una
+estación CON tipo cuando ningún inventario evita a la vez que se vacíe y se
+llene en la franja ("franja sin solución"). El resultado se ajusta para que
+no quede bajo el umbral de riesgo (pregunta 2). Una estación sin tipo no se
+toca en una franja sin solución: ni recibe ni entrega bicis.
 
-1. Es el inventario inicial común de las tres políticas (sin intervención,
-   regla histórica y modelo predictivo): las tres empiezan con las mismas
-   bicis en cada estación, para compararlas desde el mismo punto. Solo el
-   primer día de la simulación empieza así (ver "Ya decidido").
-2. Es el valor que se usa cuando ningún inventario inicial evita a la vez que
-   la estación se vacíe y se llene.
+Ya no es el inventario inicial de la simulación. Ese sale de la ocupación
+observada en la captura de GBFS (ver "Ya decidido").
 
-La regla histórica no usa este valor para decidir.
+La prioridad ordena a quién se atiende primero cuando el presupuesto no
+alcanza. Dentro de la misma prioridad se atiende primero a la estación a la
+que le faltan o le sobran menos bicis. Las estaciones sin tipo van después de
+las que sí tienen.
 
 El significado ya está decidido; los valores siguen siendo provisionales.
 
-Queda un detalle abierto: el parámetro tiene un valor por franja y la decisión
-no dice cuál de esos valores da el inventario inicial de la simulación;
-programación usará el de la primera franja del día, salvo que logística diga
-otra cosa.
-
 **Por qué importa.** Una estación de oficinas se llena en la mañana y se vacía
 en la tarde; una residencial hace lo contrario. La misma regla no sirve para
-todas. Además, como las tres políticas empiezan desde este valor, cambiarlo
-cambiará el riesgo simulado de las tres, también el de no intervenir.
+todas.
 
 **Para pensarlo.** ¿Qué tipo de estación duele más cuando falla? ¿En qué
-franja conviene que una estación empiece con bicis y en cuál con lugares
-libres? Mientras no haya tipos, ¿qué fila representa mejor a una estación
-cualquiera?
+franja conviene dejar una estación con bicis y en cuál con lugares libres,
+cuando no se puede evitar todo?
 
 | Tipo | Prioridad (3 alta, 1 baja) | Ocupación de respaldo en la mañana | Ocupación de respaldo en la tarde | Estado |
 |---|---|---|---|---|
@@ -252,17 +247,13 @@ cualquiera?
 | recreativa | 1 | 50 % | 50 % | provisional |
 | mixta | 2 | 50 % | 50 % | provisional |
 
-| Parámetro | Valor | Estado |
-|---|---|---|
-| Tipo que se aplica a una estación sin tipo (hoy, todas) | mixta | provisional |
-
 **Respuesta de logística:** _pendiente_
 
 **Justificación:** _pendiente_
 
 **Parámetro en el YAML:** `estrategia_por_tipo`, con `prioridad` y
 `ocupacion_respaldo` para cada tipo (la ocupación se escribe como fracción:
-30 % es `0.30`), y `tipo_si_falta` (uno de los cuatro tipos, en minúsculas).
+30 % es `0.30`).
 
 ---
 
@@ -277,12 +268,11 @@ cualquiera?
   los umbrales: desde qué valor de cada indicador una estación cuenta como
   oficinas, residencial, recreativa o mixta. Los fija logística. Mientras no
   existan, `station_type` queda vacío en los datos reales.
-- **Qué estrategia usa una estación sin tipo (`tipo_si_falta`).** El simulador
-  necesita una prioridad y una ocupación de respaldo para cada estación, y hoy
-  ninguna tiene tipo. Por eso usa las del tipo que diga `tipo_si_falta`
-  (provisional: mixta). Es punto abierto: lo confirma o lo cambia logística en
-  la pregunta 5. Cuando existan los umbrales, este valor solo se aplicará a
-  las estaciones que sigan sin tipo.
+- **Qué se hace con una estación sin tipo.** Ya no existe `tipo_si_falta`.
+  Una estación sin tipo no usa ninguna ocupación de respaldo (en una franja
+  sin solución no se toca) y en el reparto va después de las que sí tienen
+  tipo. Cuando existan los umbrales, esto solo aplicará a las estaciones que
+  sigan sin tipo.
 
 Ya decidido (se anota para tenerlo presente; no hay nada que responder):
 
@@ -290,14 +280,29 @@ Ya decidido (se anota para tenerlo presente; no hay nada que responder):
   los viajes de una estación a otra, sumados en todo el periodo. Las rutas de
   camión quedan fuera por ahora: las recomendaciones dicen cuántas bicis
   llevar o retirar por estación, no de qué estación a cuál.
-- **Captura de GBFS.** No se traslapa con los meses de viajes. Se usa solo
-  para la capacidad de las estaciones, el modo en vivo y el perfil de
-  ocupación por hora. No se usa para validar la posible demanda insatisfecha.
+- **Captura de GBFS.** No se traslapa con los meses de viajes (es de octubre
+  de 2026). Se usa para la capacidad de las estaciones, el inventario inicial
+  de la simulación, el modo en vivo y el perfil de ocupación por hora. No se
+  usa para validar la posible demanda insatisfecha. La capacidad y el
+  inventario inicial quedan congelados en `config/gbfs_congelado.csv`, para
+  que los resultados no cambien cada vez que la captura crece.
 - **Arranque de la simulación.** El simulador empieza el 1 de septiembre de
-  2026 con cada estación en su ocupación de respaldo (pregunta 5). Ese primer
-  día es de calentamiento y no cuenta en los resultados. Después la simulación
-  sigue de corrido, sin reinicios: cada día empieza con las bicis que dejó el
-  anterior, y toda bici que se mueve gasta presupuesto.
+  2026 con cada estación en la ocupación que tenía en la captura de GBFS entre
+  las 00:00 y las 00:59 (una madrugada de octubre de 2026, no la de ese día:
+  es un supuesto). Ese primer día es de calentamiento y no cuenta en los
+  resultados. Después la simulación sigue de corrido, sin reinicios: cada día
+  empieza con las bicis que dejó el anterior, y toda bici que se mueve gasta
+  presupuesto.
+- **El total de bicis no cambia.** Una bici que sale en un viaje vuelve
+  siempre a una estación simulada: a la de destino o, si el viaje termina
+  fuera de las estaciones simuladas, a la simulada más cercana al punto donde
+  terminó (si el viaje no trae ese punto, a la estación de la que salió).
+- **Banda de incertidumbre.** El rango de inventario que se acepta para una
+  estación se calcula con el pronóstico y una banda alrededor. El ancho de
+  la banda se elige con los datos de validación (config/datos.yaml) y es el
+  mismo para la regla histórica y para el modelo. Si la estación ya está
+  dentro del rango no se mueve nada; si no, se lleva solo hasta el borde más
+  cercano.
 - **Qué limita un movimiento.** Un traslado de una estación a otra solo se
   hace si se cumplen cuatro cosas: la estación de origen tiene esas bicis, la
   de destino tiene lugar, las dos están dentro de la distancia máxima en línea
@@ -309,12 +314,13 @@ Ya decidido (se anota para tenerlo presente; no hay nada que responder):
   al presentar los resultados y tenerlo en cuenta al contestar la pregunta 4.
 - **Hechos de la corrida actual (10 de octubre de 2026).** El simulador deja
   fuera 42 estaciones sin capacidad y 41 que tienen capacidad pero ningún
-  viaje en los días simulados; simula las otras 2,315. Todas las estaciones
-  usan la estrategia "mixta" porque ninguna tiene tipo todavía: la ocupación
-  de respaldo es 50 % en todas y la prioridad no cambia nada hoy, porque todas
-  tienen la misma. Los resultados dependen de la ocupación de respaldo, porque
-  es el inventario inicial supuesto y el día de calentamiento no quita esa
-  dependencia; por eso hace falta confirmar ese valor (pregunta 5).
+  viaje en los días simulados; simula las otras 2,315. Ninguna tiene tipo
+  todavía: la prioridad y la ocupación de respaldo de la pregunta 5 no cambian
+  nada hoy. La red arranca con 33,889 bicis en 70,221 lugares (la ocupación
+  de la captura de GBFS) y ese total no cambia en toda la corrida. Los
+  resultados dependen mucho de ese inventario inicial, que es un supuesto: el
+  reporte de la simulación trae una tabla de sensibilidad con otros
+  inventarios. Las cifras están en `data/processed/reports/simulacion.md`.
 
 ## Registro de cambios
 
@@ -324,3 +330,4 @@ Ya decidido (se anota para tenerlo presente; no hay nada que responder):
 | 2026-10-10 | Acker (programación) | En la pregunta 5, `ocupacion_objetivo` pasa a llamarse `ocupacion_respaldo` y queda decidido su significado. Se anota cómo se asigna el tipo de estación, qué rutas muestra el dashboard y para qué se usa la captura de GBFS. Ningún valor cambió. |
 | 2026-10-10 | Acker (programación) | La pregunta 3 cambia de unidad: el presupuesto ya no es el total de bicis del día sino bicis movidas por estación por día, porque el número de estaciones simuladas puede cambiar. `presupuestos_diarios` (0, 50, 100, 200, 400, 800) se sustituye por `presupuestos_por_estacion` (0, 0.1, 0.25, 0.5, 1.0, 2.0). Se agregan tres parámetros, todos provisionales: `presupuesto_de_referencia` (0.5), `parte_del_presupuesto` por franja (50 % y 50 %) y `tipo_si_falta` (mixta). Se anota cómo arranca la simulación, qué limita un movimiento y que la línea recta ignora ríos y puentes. Los demás valores no cambiaron. |
 | 2026-10-10 | Acker (programación) | Los ejemplos de la pregunta 3 pasan de 2,300 estaciones (un número redondo) a las 2,315 que se simulan hoy: la lista provisional da 0, 232, 579, 1,158, 2,315 y 4,630 bicis al día. Se anota cómo se redondea. El umbral de riesgo (pregunta 2) ya no acepta 0: va de 1 en adelante. Se anotan tres hechos de la corrida actual en "Ya decidido". Ningún valor cambió. |
+| 2026-10-10 | Acker (programación) | Simulador v2. Se quita `tipo_si_falta`: una estación sin tipo no toma la estrategia de otro tipo. `ocupacion_respaldo` ya solo se usa en las franjas sin solución de las estaciones con tipo, y ya no es el inventario inicial: ese sale de la captura de GBFS congelada en `config/gbfs_congelado.csv`. Dentro de la misma prioridad se atiende primero la diferencia más pequeña. El total de bicis ya no cambia durante la simulación. Ningún valor de la tabla cambió. |

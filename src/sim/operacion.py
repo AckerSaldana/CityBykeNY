@@ -12,7 +12,8 @@ Unidades que conviene tener presentes al leer el resultado:
   `presupuesto_en_bicis`.
 - `parte_del_presupuesto` de cada franja es una fracción del presupuesto del
   día; las de todas las franjas suman 1.
-- `tipo_si_falta` es el tipo cuya estrategia usa una estación sin tipo.
+- Una estación sin tipo no tiene estrategia: no usa ninguna `ocupacion_respaldo`
+  y en el reparto va después de las que sí tienen tipo.
 """
 
 from __future__ import annotations
@@ -40,6 +41,11 @@ _PISTA_LISTA = (
     "como dos valores (0 y 5); escribe 0.5. Si usaste separador de miles, quítalo: 1,500 se lee como dos "
     "valores (1 y 500); además aquí van bicis por estación por día, no el total del día"
 )
+
+
+# Clave del YAML con la parte del presupuesto del día que le toca a cada franja. Es el único lugar donde
+# está escrito su nombre para LEERLA: el validador y el simulador (`Reglas.from_operacion`) usan esta constante.
+CLAVE_PARTE = "parte_del_presupuesto"
 
 
 class OperacionError(ValueError):
@@ -172,7 +178,7 @@ def validate_operacion(cfg: dict) -> list[str]:
         nombres.append(franja["nombre"])
 
         # Parte del presupuesto del día que le toca a la franja.
-        parte = franja.get("parte_del_presupuesto")
+        parte = franja.get(CLAVE_PARTE)
         if _es_numero(parte) and 0 < parte <= 1:
             partes.append((franja["nombre"], parte))
         elif parte is None:
@@ -298,13 +304,10 @@ def validate_operacion(cfg: dict) -> list[str]:
                         f"{_pista_coma(valor)}"
                     )
 
-    # Tipo cuya estrategia usa una estación sin tipo (hoy, todas).
-    tipo_si_falta = cfg.get("tipo_si_falta")
-    if not isinstance(tipo_si_falta, str) or tipo_si_falta not in STATION_TYPES:
-        dice = "falta" if tipo_si_falta is None else f"dice {tipo_si_falta!r}"
+    if "tipo_si_falta" in cfg:
         problems.append(
-            f"tipo_si_falta: debe ser uno de {list(STATION_TYPES)}, escrito igual y en minúsculas ({dice}). "
-            "Es el tipo cuya estrategia usan las estaciones que no tienen tipo"
+            "tipo_si_falta: esta clave ya no se usa, bórrala. Una estación sin tipo ya no toma la estrategia de "
+            "otro tipo: en las franjas sin solución no se toca, y el inventario inicial sale de la captura de GBFS"
         )
     return problems
 

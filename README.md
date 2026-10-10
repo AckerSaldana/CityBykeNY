@@ -16,7 +16,7 @@ recomendación de bicis a mover → dashboard en Streamlit.
 > 2026. Las seis tablas del dashboard ya salen de datos reales. Las
 > recomendaciones y la curva de riesgo son resultados **simulados** sobre los
 > días de validación, con reglas de operación todavía provisionales. Todavía
-> no hay LightGBM: la política "modelo" usa hoy el pronóstico de la línea base.
+> no hay tipo de estación ni variables externas. La política "modelo" usa LightGBM.
 
 El contexto completo, las decisiones del equipo y los contratos de datos están
 en [`CLAUDE.md`](CLAUDE.md).
@@ -92,9 +92,10 @@ Ese conteo es de filas, no de viajes: meses seguidos pueden repetir viajes
 
 ```bash
 python scripts/download_trips.py --desde 202607 --hasta 202609   # unos 3 GB
-python scripts/capture_gbfs.py --una-vez   # una foto de GBFS: de ahí sale la capacidad
+python scripts/freeze_gbfs.py      # solo si no existe config/gbfs_congelado.csv
 python scripts/build_tables.py     # limpieza: stations, station_hour y routes
 python scripts/run_baseline.py     # línea base: predictions y métricas de validación
+python scripts/run_lgbm.py         # LightGBM: predictions y métricas de validación
 python scripts/run_simulation.py   # simulador: recommendations y policy_curve
 ```
 

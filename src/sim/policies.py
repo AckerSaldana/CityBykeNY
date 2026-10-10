@@ -3,41 +3,49 @@
 Una política recibe en cada intervención un `InterventionContext` (instante,
 franja, inventario simulado de su propia corrida y presupuesto disponible) y
 devuelve traslados. Los datos fijos de las estaciones, las reglas de
-config/operacion.yaml y su fuente de información los tiene desde que se crea.
-Ninguna recibe viajes.
+config/operacion.yaml y su pronóstico los tiene desde que se crea. Ninguna
+recibe viajes.
 
-Fuente de información de cada una:
+**La regla histórica y el modelo son la misma maquinaria** (`ForecastPolicy`).
+Lo único que cambia entre ellas es el pronóstico que reciben:
 
-- "none": ninguna. No mueve bicis.
-- "historical" (regla histórica): el flujo neto medio por hora (llegadas menos
-  salidas) de cada estación, por franja y tipo de día (laborable = lunes a
-  viernes, o fin de semana), calculado solo con la historia anterior al tramo
-  simulado. No usa `ocupacion_respaldo` (decisión 14).
-- "model": el pronóstico de cada hora (cuantiles 10, 50 y 90 de salidas y
-  llegadas), hecho también solo con historia anterior.
+- "none": ninguno. No mueve bicis.
+- "historical" (regla histórica): los cuantiles históricos, es decir, las
+  filas de `predictions` con `model = "baseline"` (promedio histórico en q50 y
+  cuantiles empíricos en q10 y q90).
+- "model": las filas de `predictions` con `model = "lgbm"`.
 
-Las dos últimas hacen lo mismo con su información:
+Qué hacen con su pronóstico, las dos igual:
 
 1. Trayectoria esperada del inventario entre la intervención y el fin de la
-   franja, acumulando el flujo neto hora por hora.
+   franja, acumulando el flujo neto hora por hora, con una banda de
+   incertidumbre alrededor. La banda es la dispersión del pronóstico por un
+   multiplicador (`band`): 0 es sin banda, 1 es de q10 a q90. El multiplicador
+   se elige con validación y es el mismo para las dos políticas.
 2. Rango seguro del inventario al intervenir. `lo` es el mínimo de bicis para
    no bajar de `bicis_minimas` en ningún momento; `hi` es el máximo para no
    dejar menos de `lugares_libres_minimos`.
-3. Si `lo <= hi`, el inventario deseado es el actual llevado a ese rango. Si
-   no hay solución (`lo > hi`): la regla histórica usa el punto medio y el
-   modelo usa `ocupacion_respaldo` de la franja por la capacidad.
-4. Los inventarios deseados se convierten en traslados con `match_moves`.
+3. Rango aceptado. Si `lo <= hi`, los enteros dentro de [lo, hi]: una estación
+   que ya está dentro no se mueve, y una que está fuera va solo hasta el borde
+   más cercano. Si no hay solución (`lo > hi`), una estación CON tipo va a
+   `ocupacion_respaldo` de su tipo por su capacidad, sin quedar bajo ningún
+   umbral; una estación SIN tipo no se toca en esa franja.
+4. Los rangos se convierten en traslados con `match_moves`, que reparte el
+   presupuesto: primero el tipo con más prioridad y, dentro de la misma
+   prioridad, la estación a la que le falta o le sobra menos. Solo se mueven
+   bicis entre una estación a la que le sobran y una a la que le faltan: la
+   que ya está dentro de su rango no se toca.
 
 Una estación sin información no pide ni presta bicis.
 
-Supuestos del modelo (declarados en el reporte): las horas son independientes
+Supuestos de la banda (declarados en el reporte): las horas son independientes
 entre sí y las salidas son independientes de las llegadas, así que las
 dispersiones se suman en cuadratura.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 import numpy as np
@@ -47,17 +55,13 @@ from src.contracts import QUANTILE_COLUMNS
 from src.paths import TZ
 from src.sim.engine import EPS, InterventionContext, Move, Network, Reglas, SimulacionError, round_half_up
 
-WEEKDAY, WEEKEND = "laborable", "fin de semana"
-DAY_TYPES = (WEEKDAY, WEEKEND)
-
-
-def day_type(day: date) -> str:
-    """Laborable de lunes a viernes; sábado y domingo, fin de semana."""
-    return WEEKDAY if day.weekday() < 5 else WEEKEND
+# Prioridad de una estación sin tipo en el reparto: va después de todas las que tienen tipo
+# (las prioridades de config/operacion.yaml son 1, 2 o 3).
+UNTYPED_PRIORITY = 0
 
 
 # --------------------------------------------------------------------------- #
-# Del flujo esperado al inventario deseado
+# Del flujo esperado al rango aceptado
 # --------------------------------------------------------------------------- #
 
 def safe_range(network: Network, reglas: Reglas, dip, rise) -> tuple[np.ndarray, np.ndarray]:
@@ -71,34 +75,67 @@ def safe_range(network: Network, reglas: Reglas, dip, rise) -> tuple[np.ndarray,
     return low, high
 
 
-def integer_range(inventory, low, high, has_info, fallback, capacity) -> tuple[np.ndarray, np.ndarray]:
-    """Rango de inventarios enteros que una estación acepta, por estación.
+def respaldo_inventory(network: Network, reglas: Reglas, franja: str) -> np.ndarray:
+    """Inventario de respaldo de cada estación en una franja; -1 en las estaciones sin tipo.
 
-    - Con solución: los enteros dentro de [lo, hi].
-    - Sin solución, o sin ningún entero dentro: un solo valor, `fallback`,
-      recortado a [0, capacidad].
-    - Sin información: su inventario actual. No pide ni presta.
+    Es `ocupacion_respaldo` del tipo de la estación por su capacidad, llevado
+    a [bicis_minimas, capacidad - lugares_libres_minimos] para no dejar la
+    estación bajo un umbral. Si la estación es tan chica que ese rango no
+    existe, manda bicis_minimas, sin pasar de la capacidad.
     """
+    out = np.full(network.size, -1, dtype=np.int64)
+    for s, kind in enumerate(network.station_type):
+        if kind is None:
+            continue
+        places = int(network.capacity[s])
+        value = int(round_half_up(reglas.ocupacion_respaldo[kind][franja] * places))
+        value = max(reglas.bicis_minimas, min(value, places - reglas.lugares_libres_minimos))
+        out[s] = max(0, min(value, places))
+    return out
+
+
+def accepted_range(inventory, low, high, has_info, respaldo, capacity) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rango de inventarios enteros que acepta cada estación, y si tiene solución.
+
+    - Con solución (lo <= hi): los enteros dentro de [lo, hi]. Si no cabe
+      ningún entero, el punto medio redondeado.
+    - Sin solución y con tipo (`respaldo` >= 0): un solo valor, `respaldo`.
+    - Sin solución y sin tipo (`respaldo` < 0): su inventario actual. No se toca.
+    - Sin información: su inventario actual. No pide ni presta.
+
+    Devuelve (mínimo, máximo, tiene solución). Una estación sin información
+    cuenta como "con solución".
+    """
+    inventory = np.asarray(inventory, dtype=np.int64)
+    capacity = np.asarray(capacity, dtype=np.int64)
+    feasible = ~has_info | (low <= high + EPS)
     low_int = np.ceil(np.where(has_info, low, 0.0) - EPS).astype(np.int64)
     high_int = np.floor(np.where(has_info, high, 0.0) + EPS).astype(np.int64)
-    point = has_info & (low_int > high_int)
-    target = np.clip(fallback, 0, capacity).astype(np.int64)
-    low_int = np.where(point, target, low_int)
-    high_int = np.where(point, target, high_int)
-    inventory = np.asarray(inventory, dtype=np.int64)
-    return np.where(has_info, low_int, inventory), np.where(has_info, high_int, inventory)
+    middle = np.clip(round_half_up(np.where(has_info, (low + high) / 2, 0.0)), 0, capacity)
+    narrow = feasible & (low_int > high_int)
+    low_int = np.where(narrow, middle, low_int)
+    high_int = np.where(narrow, middle, high_int)
+    # Sin solución: respaldo si la estación tiene tipo; si no, se queda como está.
+    point = np.where(np.asarray(respaldo) >= 0, respaldo, inventory)
+    low_int = np.where(feasible, low_int, point)
+    high_int = np.where(feasible, high_int, point)
+    return np.where(has_info, low_int, inventory), np.where(has_info, high_int, inventory), feasible
 
 
 def match_moves(inventory, low_int, high_int, priority, neighbors, budget: int) -> list[Move]:
-    """Convierte inventarios deseados en traslados, sin pasar del presupuesto.
+    """Convierte rangos aceptados en traslados, sin pasar del presupuesto.
 
     A una estación le faltan bicis si está debajo de su rango y le sobran si
-    está arriba. Se atienden por prioridad (la más alta primero), después por
-    la diferencia más grande y después por id. Para cada una se buscan
-    contrapartes entre sus vecinas, de la más cercana a la más lejana:
+    está arriba; lo que le falta o le sobra es su diferencia con el borde más
+    cercano. Se atienden por prioridad (la más alta primero), después por la
+    diferencia MÁS PEQUEÑA y después por id.
 
-    1. primero las que tienen la necesidad contraria;
-    2. después las que pueden prestar bicis o recibirlas sin salir de su rango.
+    La contraparte de cada una es una estación vecina con la necesidad
+    contraria (a una le faltan y a la otra le sobran), de la más cercana a la
+    más lejana. **Una estación que ya está dentro de su rango no se mueve**:
+    ni recibe ni presta. Y ninguna pasa del borde más cercano de su rango: la
+    que recibe llega como mucho a su mínimo y la que entrega baja como mucho a
+    su máximo.
 
     `neighbors[s]` ya trae solo las estaciones dentro de la distancia máxima.
     Mover una bici cuesta 1. Se detiene cuando se acaba el presupuesto.
@@ -106,7 +143,7 @@ def match_moves(inventory, low_int, high_int, priority, neighbors, budget: int) 
     current = np.asarray(inventory, dtype=np.int64).copy()
     gap = np.where(current < low_int, low_int - current, np.where(current > high_int, current - high_int, 0))
     pending = np.nonzero(gap)[0]
-    order = pending[np.lexsort((pending, -gap[pending], -np.asarray(priority)[pending]))]
+    order = pending[np.lexsort((pending, gap[pending], -np.asarray(priority)[pending]))]
     moves: list[Move] = []
     left = int(budget)
     for s in order.tolist():
@@ -117,34 +154,30 @@ def match_moves(inventory, low_int, high_int, priority, neighbors, budget: int) 
             continue
         if current[s] < low_int[s]:
             receives = True
+            need = int(low_int[s] - current[s])
+            spare = current[near] - high_int[near]   # bicis que le sobran a cada vecina
         elif current[s] > high_int[s]:
             receives = False
+            need = int(current[s] - high_int[s])
+            spare = low_int[near] - current[near]    # bicis que le faltan a cada vecina
         else:
             continue  # quedó dentro de su rango al atender a otra
-        for step in (1, 2):
-            need = int(low_int[s] - current[s]) if receives else int(current[s] - high_int[s])
-            if need <= 0 or left <= 0:
+        for position in np.nonzero(spare > 0)[0].tolist():
+            other = int(near[position])
+            bikes = min(need, int(spare[position]), left)
+            origin, destination = (other, s) if receives else (s, other)
+            moves.append(Move(origin, destination, bikes))
+            current[origin] -= bikes
+            current[destination] += bikes
+            need -= bikes
+            left -= bikes
+            if need == 0 or left == 0:
                 break
-            if receives:  # bicis que cada vecina puede dar
-                spare = current[near] - (high_int if step == 1 else low_int)[near]
-            else:         # lugares que cada vecina puede ocupar
-                spare = (low_int if step == 1 else high_int)[near] - current[near]
-            for position in np.nonzero(spare > 0)[0].tolist():
-                other = int(near[position])
-                bikes = min(need, int(spare[position]), left)
-                origin, destination = (other, s) if receives else (s, other)
-                moves.append(Move(origin, destination, bikes))
-                current[origin] -= bikes
-                current[destination] += bikes
-                need -= bikes
-                left -= bikes
-                if need == 0 or left == 0:
-                    break
     return moves
 
 
 # --------------------------------------------------------------------------- #
-# Fuentes de información
+# Pronóstico
 # --------------------------------------------------------------------------- #
 
 def _local(ts_hour: pd.Series) -> pd.Series:
@@ -159,63 +192,28 @@ def _extremes(cumulative: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.minimum(0.0, cumulative.min(axis=0)), np.maximum(0.0, cumulative.max(axis=0))
 
 
-@dataclass(frozen=True)
-class HistoricalProfile:
-    """Información de la regla histórica: flujo neto medio por hora.
+def stations_with_history(history: pd.DataFrame, network: Network, before: pd.Timestamp) -> np.ndarray:
+    """Qué estaciones de la red tienen al menos una fila de `station_hour` anterior a `before`.
 
-    Por franja y tipo de día guarda, por estación, lo más que baja y lo más
-    que sube la trayectoria acumulada de la intervención al fin de la franja.
+    `before` es el primer instante del tramo simulado. Si llega una fila de
+    ese instante o posterior, falla: sería ver el futuro. Una estación sin
+    historia no tiene pronóstico propio (el de `predictions` es un marcador:
+    el promedio del sistema), así que las políticas no la tocan.
     """
-
-    dip: dict        # (franja, tipo de día) -> lo más que baja, por estación
-    rise: dict       # (franja, tipo de día) -> lo más que sube, por estación
-    has_info: dict   # (franja, tipo de día) -> la estación tiene media en todas las horas
-    with_history: np.ndarray  # la estación tiene al menos una fila en la historia
-
-    @classmethod
-    def from_station_hour(
-        cls, history: pd.DataFrame, network: Network, reglas: Reglas, before: pd.Timestamp
-    ) -> "HistoricalProfile":
-        """Calcula el perfil con filas de `station_hour` anteriores a `before`.
-
-        `before` es el primer instante del tramo simulado. Si llega una fila de
-        ese instante o posterior, falla: sería ver el futuro.
-        """
-        if len(history) and (history["ts_hour"] >= before).any():
-            raise SimulacionError(
-                "La historia de la regla histórica trae filas del tramo simulado o posteriores. "
-                "Solo puede usar filas anteriores (decisión 8)."
-            )
-        n = network.size
-        station = network.index.get_indexer(history["station_id"].astype("object"))
-        keep = station >= 0
-        station = station[keep]
-        local = _local(history["ts_hour"])[keep]
-        hour = local.dt.hour.to_numpy()
-        weekend = (local.dt.dayofweek.to_numpy() >= 5).astype(np.int64)
-        net = history["net_flow"].to_numpy(dtype="float64")[keep]
-        with_history = np.zeros(n, dtype=bool)
-        with_history[station] = True
-
-        cell = (weekend * 24 + hour) * n + station
-        total = np.bincount(cell, weights=net, minlength=2 * 24 * n).reshape(2, 24, n)
-        count = np.bincount(cell, minlength=2 * 24 * n).reshape(2, 24, n)
-        dip, rise, has_info = {}, {}, {}
-        for franja in reglas.franjas:
-            hours = list(franja.hours)
-            for kind_index, kind in enumerate(DAY_TYPES):
-                seen = count[kind_index][hours]
-                known = (seen > 0).all(axis=0)
-                mean = np.where(seen > 0, total[kind_index][hours] / np.maximum(seen, 1.0), 0.0)
-                low, high = _extremes(np.cumsum(mean, axis=0))
-                key = (franja.nombre, kind)
-                dip[key], rise[key], has_info[key] = low, high, known
-        return cls(dip=dip, rise=rise, has_info=has_info, with_history=with_history)
+    if len(history) and (history["ts_hour"] >= before).any():
+        raise SimulacionError(
+            "La historia trae filas del tramo simulado o posteriores. Solo puede usar filas anteriores "
+            "(decisión 8)."
+        )
+    known = np.zeros(network.size, dtype=bool)
+    station = network.index.get_indexer(history["station_id"].astype("object"))
+    known[station[station >= 0]] = True
+    return known
 
 
 @dataclass(frozen=True)
 class ForecastWindow:
-    """Pronóstico de una fecha y una franja, por estación."""
+    """Pronóstico de una fecha y una franja con una banda, por estación."""
 
     has_info: np.ndarray     # hay pronóstico de todas las horas y la estación tiene historia
     center_dip: np.ndarray   # lo más que baja la trayectoria central
@@ -226,15 +224,24 @@ class ForecastWindow:
 
 @dataclass(frozen=True)
 class ForecastInfo:
-    """Información de la política "model": el pronóstico de cada franja de cada día."""
+    """El pronóstico de cada franja de cada día, listo para aplicarle cualquier banda."""
 
-    windows: dict  # (fecha, franja) -> ForecastWindow
+    paths: dict   # (fecha, franja) -> (tiene información, trayectoria central, dispersión abajo, dispersión arriba)
+    _cache: dict = field(default_factory=dict, compare=False, repr=False)
 
-    def window(self, day: date, franja: str) -> ForecastWindow:
-        try:
-            return self.windows[(day, franja)]
-        except KeyError:
-            raise SimulacionError(f"No hay pronóstico preparado para {day} {franja}.") from None
+    def window(self, day: date, franja: str, band: float = 1.0) -> ForecastWindow:
+        """La franja de ese día con la banda `band` (multiplicador de la dispersión)."""
+        key = (day, franja, float(band))
+        if key not in self._cache:
+            try:
+                known, path, down, up = self.paths[(day, franja)]
+            except KeyError:
+                raise SimulacionError(f"No hay pronóstico preparado para {day} {franja}.") from None
+            center_dip, center_rise = _extremes(path)
+            lower_dip, _ = _extremes(path - float(band) * down)
+            _, upper_rise = _extremes(path + float(band) * up)
+            self._cache[key] = ForecastWindow(known, center_dip, center_rise, lower_dip, upper_rise)
+        return self._cache[key]
 
     @classmethod
     def from_predictions(
@@ -245,13 +252,13 @@ class ForecastInfo:
         days: tuple[date, ...],
         with_history: np.ndarray,
     ) -> "ForecastInfo":
-        """Prepara las envolventes con las filas de `predictions` de un solo modelo y tramo.
+        """Prepara las trayectorias con las filas de `predictions` de un solo modelo y tramo.
 
         Por hora: centro m = arr_q50 - dep_q50; dispersión hacia abajo
         d = raíz((arr_q50 - arr_q10)² + (dep_q90 - dep_q50)²); hacia arriba
         u = raíz((arr_q90 - arr_q50)² + (dep_q50 - dep_q10)²). Acumulado hasta
-        la hora t: inferior = suma de m - raíz(suma de d²); superior = suma de
-        m + raíz(suma de u²).
+        la hora t, con la banda b: inferior = suma de m - b x raíz(suma de d²);
+        superior = suma de m + b x raíz(suma de u²).
 
         Una estación sin historia (`with_history` falso) queda sin información
         aunque tenga filas: su pronóstico es un marcador, no un pronóstico suyo.
@@ -259,9 +266,11 @@ class ForecastInfo:
         Limitación conocida: `predictions` solo trae filas hasta la hora del
         último viaje de cada estación. Desde la franja en que falta alguna hora
         la estación queda sin información, así que ahí la decisión depende de
-        qué filas existen. El reporte de la simulación cuenta esos casos
-        (`informacion.con_historia_y_sin_pronostico`) y lo declara.
+        qué filas existen. El reporte de la simulación cuenta esos casos y lo
+        declara.
         """
+        if predictions["model"].nunique() > 1:
+            raise SimulacionError("El pronóstico de una política debe traer filas de un solo modelo.")
         n, n_days = network.size, len(days)
         station = network.index.get_indexer(predictions["station_id"].astype("object"))
         local = _local(predictions["ts_hour"])
@@ -283,26 +292,16 @@ class ForecastInfo:
             "up2": np.bincount(cell, weights=up2, minlength=size).reshape(shape),
             "count": np.bincount(cell, minlength=size).reshape(shape),
         }
-
-        windows = {}
+        paths = {}
         for franja in reglas.franjas:
             hours = list(franja.hours)
             for d, current in enumerate(days):
                 known = (cube["count"][d][hours] > 0).all(axis=0) & with_history
                 path = np.cumsum(cube["center"][d][hours], axis=0)
-                lower = path - np.sqrt(np.cumsum(cube["down2"][d][hours], axis=0))
-                upper = path + np.sqrt(np.cumsum(cube["up2"][d][hours], axis=0))
-                center_dip, center_rise = _extremes(path)
-                lower_dip, _ = _extremes(lower)
-                _, upper_rise = _extremes(upper)
-                windows[(current, franja.nombre)] = ForecastWindow(
-                    has_info=known,
-                    center_dip=center_dip,
-                    center_rise=center_rise,
-                    lower_dip=lower_dip,
-                    upper_rise=upper_rise,
-                )
-        return cls(windows=windows)
+                down = np.sqrt(np.cumsum(cube["down2"][d][hours], axis=0))
+                up = np.sqrt(np.cumsum(cube["up2"][d][hours], axis=0))
+                paths[(current, franja.nombre)] = (known, path, down, up)
+        return cls(paths=paths)
 
 
 # --------------------------------------------------------------------------- #
@@ -319,20 +318,7 @@ class Targets:
     feasible: np.ndarray   # lo <= hi; verdadero si no hay información
     low_int: np.ndarray    # rango entero aceptado
     high_int: np.ndarray
-    desired: np.ndarray    # inventario deseado: el actual llevado al rango entero
-
-
-def _targets(inventory, low, high, has_info, fallback, capacity) -> Targets:
-    low_int, high_int = integer_range(inventory, low, high, has_info, fallback, capacity)
-    return Targets(
-        low=low,
-        high=high,
-        has_info=has_info,
-        feasible=~has_info | (low <= high + EPS),
-        low_int=low_int,
-        high_int=high_int,
-        desired=np.clip(np.asarray(inventory, dtype=np.int64), low_int, high_int),
-    )
+    desired: np.ndarray    # inventario deseado: el actual llevado al borde más cercano del rango
 
 
 class NoIntervention:
@@ -344,19 +330,52 @@ class NoIntervention:
         return []
 
 
-class _RangePolicy:
-    """Lo común de la regla histórica y el modelo: del rango deseado a los traslados."""
+class ForecastPolicy:
+    """Regla histórica o modelo: rango aceptado con la banda del pronóstico y reparto del presupuesto.
 
-    name = ""
+    `name` es "historical" o "model"; lo único que las distingue es el
+    `forecast` que reciben. `band` es el multiplicador de la dispersión.
+    """
 
-    def __init__(self, network: Network, reglas: Reglas, neighbors: list | None = None):
+    def __init__(
+        self,
+        name: str,
+        network: Network,
+        reglas: Reglas,
+        forecast: ForecastInfo,
+        band: float,
+        neighbors: list | None = None,
+    ):
+        self.name = name
         self.network = network
         self.reglas = reglas
+        self.forecast = forecast
+        self.band = float(band)
         self.neighbors = neighbors if neighbors is not None else network.neighbors_within(reglas.distancia_maxima_km)
-        self.priority = np.array([reglas.prioridad[kind] for kind in network.station_type], dtype=np.int64)
+        self.priority = np.array(
+            [UNTYPED_PRIORITY if kind is None else reglas.prioridad[kind] for kind in network.station_type],
+            dtype=np.int64,
+        )
+        self._respaldo = {
+            franja.nombre: respaldo_inventory(network, reglas, franja.nombre) for franja in reglas.franjas
+        }
 
     def targets(self, context: InterventionContext) -> Targets:
-        raise NotImplementedError
+        window = self.forecast.window(context.day, context.franja.nombre, self.band)
+        low, high = safe_range(self.network, self.reglas, window.lower_dip, window.upper_rise)
+        low_int, high_int, feasible = accepted_range(
+            context.inventory, low, high, window.has_info, self._respaldo[context.franja.nombre],
+            self.network.capacity,
+        )
+        return Targets(
+            low=low,
+            high=high,
+            has_info=window.has_info,
+            feasible=feasible,
+            low_int=low_int,
+            high_int=high_int,
+            desired=np.clip(np.asarray(context.inventory, dtype=np.int64), low_int, high_int),
+        )
 
     def decide(self, context: InterventionContext) -> list[Move]:
         if context.budget <= 0:
@@ -365,48 +384,3 @@ class _RangePolicy:
         return match_moves(
             context.inventory, targets.low_int, targets.high_int, self.priority, self.neighbors, context.budget
         )
-
-
-class HistoricalPolicy(_RangePolicy):
-    """Regla histórica: rango seguro con el flujo neto medio de la historia.
-
-    Sin solución usa el punto medio de `lo` y `hi`, recortado a [0, capacidad].
-    No usa `ocupacion_respaldo`.
-    """
-
-    name = "historical"
-
-    def __init__(self, network: Network, reglas: Reglas, profile: HistoricalProfile, neighbors: list | None = None):
-        super().__init__(network, reglas, neighbors)
-        self.profile = profile
-
-    def targets(self, context: InterventionContext) -> Targets:
-        key = (context.franja.nombre, day_type(context.day))
-        low, high = safe_range(self.network, self.reglas, self.profile.dip[key], self.profile.rise[key])
-        midpoint = round_half_up((low + high) / 2)
-        return _targets(context.inventory, low, high, self.profile.has_info[key], midpoint, self.network.capacity)
-
-
-class ModelPolicy(_RangePolicy):
-    """Modelo: rango seguro con la envolvente del pronóstico.
-
-    Sin solución usa `ocupacion_respaldo` de la franja, según el tipo de la
-    estación (o `tipo_si_falta`), por la capacidad. Con solución pero sin
-    ningún entero dentro del rango usa el punto medio.
-    """
-
-    name = "model"
-
-    def __init__(self, network: Network, reglas: Reglas, forecast: ForecastInfo, neighbors: list | None = None):
-        super().__init__(network, reglas, neighbors)
-        self.forecast = forecast
-
-    def targets(self, context: InterventionContext) -> Targets:
-        window = self.forecast.window(context.day, context.franja.nombre)
-        low, high = safe_range(self.network, self.reglas, window.lower_dip, window.upper_rise)
-        occupancy = np.array(
-            [self.reglas.ocupacion_respaldo[kind][context.franja.nombre] for kind in self.network.station_type]
-        )
-        respaldo = round_half_up(occupancy * self.network.capacity)
-        fallback = np.where(low <= high + EPS, round_half_up((low + high) / 2), respaldo)
-        return _targets(context.inventory, low, high, window.has_info, fallback, self.network.capacity)

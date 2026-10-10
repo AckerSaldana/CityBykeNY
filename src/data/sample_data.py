@@ -54,6 +54,7 @@ VAL_START = pd.Timestamp("2025-10-27", tz=TZ)   # antes de esto: historia del ba
 TEST_START = pd.Timestamp("2025-11-03", tz=TZ)  # val = 27 oct a 2 nov, test = 3 a 9 nov
 
 DEFAULT_CAPACITY = 20        # capacidad que se supone cuando capacity viene vacío
+UNTYPED_OCCUPANCY = 0.5      # ocupación inventada de una estación sin tipo (no tiene estrategia en el YAML)
 MAX_TOTAL_BYTES = 1_500_000  # la carpeta va en Git: debe seguir siendo pequeña
 
 # Estaciones que no cubren todo el periodo: (primer día con viajes, último día
@@ -212,9 +213,9 @@ columnas.
   - En estos datos inventados, las tres políticas empiezan cada franja con el
     mismo inventario: la `ocupacion_respaldo` de esa franja (según el tipo de
     la estación) por su capacidad, redondeado. Es una simplificación de la
-    muestra. En la simulación real solo el primer día empieza con la
-    ocupación de respaldo, y ese día es de calentamiento; después cada día
-    empieza con las bicis que dejó el anterior.
+    muestra. En la simulación real el inventario del primer día sale de la
+    ocupación observada en la captura de GBFS (ese día es de calentamiento) y
+    después cada día empieza con las bicis que dejó el anterior.
   - Con `policy = "none"` no se mueve nada: `start_inventory_target` es ese
     inventario de respaldo.
   - En las otras dos, lo que reciben unas estaciones es lo que entregan
@@ -222,9 +223,9 @@ columnas.
     inventario que busca se inventa aparte.
   - Unas pocas filas tienen `feasible` en falso. En ellas las tres políticas
     se quedan con el inventario de respaldo y `bikes_to_move` es 0.
-  - Donde falta `capacity` se supuso {default_capacity}. Donde falta `station_type` se usa
-    la estrategia del tipo que dice `tipo_si_falta` en
-    `config/operacion.yaml` (hoy `{default_type}`).
+  - Donde falta `capacity` se supuso {default_capacity}. Una estación sin `station_type` no
+    tiene estrategia en `config/operacion.yaml`: aquí empieza con una
+    ocupación inventada de {untyped_occupancy:g}.
   - Los traslados de la muestra no respetan ningún presupuesto ni el reparto
     por franja (`parte_del_presupuesto`): son inventados. Aquí se llevan
     entre {moved_min} y {moved_max} bicis al día, según el día y la política; el
@@ -248,7 +249,7 @@ columnas.
 El resultado es siempre el mismo (la semilla es fija). Hay que volver a
 correrlo si en `config/operacion.yaml` cambian las franjas (cuántas son, sus
 nombres o sus horas), `presupuestos_por_estacion`,
-`presupuesto_de_referencia`, `tipo_si_falta` o la `ocupacion_respaldo`.
+`presupuesto_de_referencia` o la `ocupacion_respaldo`.
 Cambiar solo `parte_del_presupuesto` no cambia la muestra.
 
 No edites estos archivos a mano. Este LEEME lo escribe el mismo script.
@@ -518,18 +519,18 @@ def build_recommendations(
 ) -> pd.DataFrame:
     """Recomendaciones inventadas: día de test x franja x estación x política.
 
-    `ocupacion_respaldo` de config/operacion.yaml se usa como quedó decidido:
+    Cómo usa la muestra `ocupacion_respaldo` de config/operacion.yaml (es una
+    simplificación inventada, no lo que hace el simulador real):
 
-    - Es el inventario inicial común de las tres políticas. Aquí, las tres
-      empiezan cada franja con ocupacion_respaldo x capacidad, redondeado.
-      Es una simplificación de la muestra: en la simulación real solo el
-      primer día empieza así y después el inventario pasa de un día al otro.
+    - Aquí las tres políticas empiezan cada franja con ocupacion_respaldo x
+      capacidad, redondeado. En la simulación real el inventario inicial sale
+      de la captura de GBFS y después pasa de un día al otro.
     - Es el valor que se usa cuando no hay solución factible. Aquí, en las
       filas con feasible en falso las tres políticas se quedan con ese
       inventario y no mueven nada.
     - La regla histórica NO lo usa: el inventario que busca se inventa aparte.
 
-    Una estación sin tipo usa la estrategia del tipo que dice `tipo_si_falta`.
+    Una estación sin tipo no tiene estrategia: usa UNTYPED_OCCUPANCY, inventada.
 
     Los traslados NO respetan ningún presupuesto ni el reparto por franja: son
     inventados. Los reales salen de la simulación con el presupuesto de
@@ -549,11 +550,11 @@ def build_recommendations(
             n, cap = int(present.sum()), capacity[present]
 
             # Ocupación de respaldo de la franja según el tipo de la estación.
-            # Una estación sin tipo usa la del tipo que dice tipo_si_falta.
+            # Una estación sin tipo no tiene estrategia: usa una ocupación inventada.
             rules = cfg["estrategia_por_tipo"]
             by_type = {kind: rule["ocupacion_respaldo"][franja["nombre"]] for kind, rule in rules.items()}
             kinds = stations.loc[present, "station_type"]
-            occupancy = np.array([by_type.get(kind, by_type[cfg["tipo_si_falta"]]) for kind in kinds])
+            occupancy = np.array([by_type.get(kind, UNTYPED_OCCUPANCY) for kind in kinds])
             # Inventario de respaldo: con él empiezan la franja las tres políticas.
             fallback = np.rint(cap * occupancy).astype(int)
             # Inventario que de verdad convendría ese día. Inventado: no sale del respaldo.
@@ -712,7 +713,7 @@ def write_leeme(tables: dict[str, pd.DataFrame], out_dir: Path, cfg: dict) -> Pa
         routes=len(routes),
         pairs=len(stations) ** 2,
         default_capacity=DEFAULT_CAPACITY,
-        default_type=cfg["tipo_si_falta"],
+        untyped_occupancy=UNTYPED_OCCUPANCY,
         per_station=_number_list(cfg["presupuestos_por_estacion"]),
         stations=len(stations),
         budgets=_number_list(budgets),

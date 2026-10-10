@@ -71,9 +71,9 @@ columnas.
   - En estos datos inventados, las tres políticas empiezan cada franja con el
     mismo inventario: la `ocupacion_respaldo` de esa franja (según el tipo de
     la estación) por su capacidad, redondeado. Es una simplificación de la
-    muestra. En la simulación real solo el primer día empieza con la
-    ocupación de respaldo, y ese día es de calentamiento; después cada día
-    empieza con las bicis que dejó el anterior.
+    muestra. En la simulación real el inventario del primer día sale de la
+    ocupación observada en la captura de GBFS (ese día es de calentamiento) y
+    después cada día empieza con las bicis que dejó el anterior.
   - Con `policy = "none"` no se mueve nada: `start_inventory_target` es ese
     inventario de respaldo.
   - En las otras dos, lo que reciben unas estaciones es lo que entregan
@@ -81,9 +81,9 @@ columnas.
     inventario que busca se inventa aparte.
   - Unas pocas filas tienen `feasible` en falso. En ellas las tres políticas
     se quedan con el inventario de respaldo y `bikes_to_move` es 0.
-  - Donde falta `capacity` se supuso 20. Donde falta `station_type` se usa
-    la estrategia del tipo que dice `tipo_si_falta` en
-    `config/operacion.yaml` (hoy `mixta`).
+  - Donde falta `capacity` se supuso 20. Una estación sin `station_type` no
+    tiene estrategia en `config/operacion.yaml`: aquí empieza con una
+    ocupación inventada de 0.5.
   - Los traslados de la muestra no respetan ningún presupuesto ni el reparto
     por franja (`parte_del_presupuesto`): son inventados. Aquí se llevan
     entre 202 y 310 bicis al día, según el día y la política; el
@@ -107,7 +107,7 @@ columnas.
 El resultado es siempre el mismo (la semilla es fija). Hay que volver a
 correrlo si en `config/operacion.yaml` cambian las franjas (cuántas son, sus
 nombres o sus horas), `presupuestos_por_estacion`,
-`presupuesto_de_referencia`, `tipo_si_falta` o la `ocupacion_respaldo`.
+`presupuesto_de_referencia` o la `ocupacion_respaldo`.
 Cambiar solo `parte_del_presupuesto` no cambia la muestra.
 
 No edites estos archivos a mano. Este LEEME lo escribe el mismo script.

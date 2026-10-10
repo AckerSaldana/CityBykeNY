@@ -118,26 +118,21 @@ distancia_maxima_km: 3.0           # PROVISIONAL
 # -----------------------------------------------------------------------------
 # prioridad: a quién se atiende primero cuando el presupuesto no alcanza
 #   (3 = alta, 2 = media, 1 = baja).
-# ocupacion_respaldo: qué tan llena empieza cada estación, como fracción de su
-#   capacidad (0.0 = vacía, 1.0 = llena). Tiene dos usos:
-#   1. Es el inventario inicial común de las tres políticas (sin intervención,
-#      regla histórica y modelo predictivo): las tres empiezan con las mismas
-#      bicis en cada estación, para compararlas desde el mismo punto.
-#      Solo el primer día de la simulación empieza así. Ese día es de
-#      calentamiento y no cuenta en los resultados. Después cada día empieza
-#      con las bicis que dejó el día anterior.
-#      OJO: el calentamiento no quita la dependencia de este valor. Fija con
-#      cuántas bicis arranca la red, y el nivel de riesgo simulado y el riesgo
-#      simulado evitado cambian con él.
-#   2. Es el valor que se usa cuando ningún inventario inicial evita a la vez
-#      que la estación se vacíe y se llene.
-#   La regla histórica no usa este valor para decidir.
-#   El significado ya está decidido; los valores siguen siendo provisionales.
-#   Queda un detalle abierto: el parámetro tiene un valor por franja y la
-#   decisión no dice cuál de esos valores da el inventario inicial de la
-#   simulación; programación usará el de la primera franja del día, salvo que
-#   logística diga otra cosa.
-#   Debe haber un valor por cada franja definida arriba.
+# ocupacion_respaldo: qué tan llena se deja una estación cuando ningún
+#   inventario evita a la vez que se vacíe y se llene en la franja ("franja
+#   sin solución"). Es una fracción de su capacidad (0.0 = vacía, 1.0 =
+#   llena) y hay un valor por cada franja definida arriba.
+#   Solo se aplica a las estaciones que SÍ tienen tipo. El resultado nunca
+#   deja la estación bajo el umbral de riesgo: se ajusta para que queden al
+#   menos bicis_minimas bicis y lugares_libres_minimos lugares libres.
+#   Una estación SIN tipo no tiene estrategia: en una franja sin solución no
+#   se toca (ni recibe ni entrega bicis) y, cuando el presupuesto no alcanza,
+#   se atiende después de las que sí tienen tipo.
+#   OJO: hoy NINGUNA estación tiene tipo, porque faltan los umbrales para
+#   clasificarlas (ver "Pendientes" en docs/reglas_operacion.md). Mientras
+#   falten, este bloque no cambia ningún resultado.
+#   Ya NO es el inventario inicial de la simulación: ese sale de la ocupación
+#   observada en la captura de GBFS (config/gbfs_congelado.csv).
 estrategia_por_tipo:
   oficinas:
     prioridad: 3                   # PROVISIONAL
@@ -159,14 +154,3 @@ estrategia_por_tipo:
     ocupacion_respaldo:
       manana: 0.50                 # PROVISIONAL
       tarde: 0.50                  # PROVISIONAL
-
-# tipo_si_falta: qué tipo de arriba se le aplica a una estación que no tiene
-#   tipo. La estación usa la prioridad y la ocupacion_respaldo de ese tipo.
-#   Sin unidad: es uno de los cuatro nombres de arriba (oficinas, residencial,
-#   recreativa, mixta), en minúsculas.
-#   OJO: hoy NINGUNA estación tiene tipo, porque faltan los umbrales para
-#   clasificarlas (ver "Pendientes" en docs/reglas_operacion.md). Mientras
-#   falten, este valor decide la estrategia de TODAS las estaciones.
-#   Ejemplo: con mixta, las estaciones sin tipo usan la prioridad y la
-#   ocupacion_respaldo del bloque "mixta"; los otros tres bloques no se usan.
-tipo_si_falta: mixta               # PROVISIONAL

@@ -83,6 +83,12 @@ FORECAST_TEXT = {
         "(promedio histórico): no es un modelo entrenado."
     ),
     "lgbm": "La política `model` se alimentó del pronóstico de LightGBM.",
+    # Sin pronóstico de LightGBM la simulación no corre la política `model`:
+    # las tablas simuladas salen sin sus filas.
+    "ninguno": (
+        "La política `model` **no se simuló** en esa corrida, porque todavía no "
+        "había pronóstico de LightGBM: estas tablas no traen filas de `model`."
+    ),
 }
 
 MONTHS = [
@@ -200,8 +206,9 @@ def simulation_run() -> dict:
 
     - "rules": "provisional" o "confirmado". Es el estado que tenían las
       reglas de operación (config/operacion.yaml) cuando se simuló.
-    - "forecast": "baseline" o "lgbm". Es el pronóstico que alimentó a la
-      política "model".
+    - "forecast": "lgbm" o "ninguno". Es el pronóstico que alimentó a la
+      política "model"; "ninguno" quiere decir que esa política no se simuló
+      (la simulación ya no la alimenta con la línea base).
 
     Si el reporte no está o no se puede leer, los dos valen None y la nota
     dice que no se sabe. Nunca se supone.

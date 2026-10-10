@@ -181,8 +181,7 @@ presupuesto (`parte_del_presupuesto`, suman 1); umbral de riesgo (bicis o
 lugares libres mínimos); `presupuestos_por_estacion`, en bicis por estación por
 día; `presupuesto_de_referencia`, el que alimenta `recommendations`; distancia
 máxima en línea recta; estrategia por tipo de estación (`prioridad` y
-`ocupacion_respaldo`); y `tipo_si_falta`, la estrategia que se aplica a una
-estación sin tipo (hoy todas).
+`ocupacion_respaldo`).
 
 **Hoy todos los valores son provisionales** (`estado: provisional`). No se
 citan como reglas de operación hasta que el compañero los confirme.
@@ -198,8 +197,10 @@ pip install -r requirements.txt -c constraints.txt
 pytest                                    # contratos, fuga, config, scripts y app
 python scripts/make_sample_data.py        # regenera data/sample (sintético)
 
+python scripts/freeze_gbfs.py             # congela capacidad e inventario inicial de GBFS
 python scripts/build_tables.py            # limpieza: stations, station_hour y routes reales
 python scripts/run_baseline.py            # línea base: predictions y métricas de validación
+python scripts/run_lgbm.py                # LightGBM con cuantiles: predictions y métricas
 python scripts/run_simulation.py          # simulador: recommendations y policy_curve reales
 streamlit run app/Inicio.py               # dashboard
 
@@ -521,99 +522,86 @@ Reglas que fijó el usuario:
 - `recommendations` y `policy_curve` salen de validación, con intervalos por
   remuestreo de días.
 
-Cómo se implementó lo que la especificación dejaba abierto (decisiones de
-programación; avisar si se cambian):
+Segunda versión (decisiones del usuario del 10 de octubre de 2026):
 
-- **Conjunto simulado:** estaciones con capacidad y con al menos un viaje en el
-  tramo. Hoy 2,315 de 2,398 (fuera: 42 sin capacidad y 41 sin viajes).
-- **"El mismo inventario":** las tres políticas parten del mismo inventario y
-  enfrentan los mismos viajes; cada una ve el inventario de su propia corrida
-  al intervenir.
-- **Regla histórica:** flujo neto promedio por estación, franja y tipo de día
-  (laborable o fin de semana) del tramo de entrenamiento. Calcula el rango de
-  inventario que no cruza ningún umbral y lleva la estación al punto más
-  cercano de ese rango. No usa `ocupacion_respaldo`.
-- **Modelo:** lo mismo con el pronóstico de cada hora y una banda de
-  incertidumbre hecha con `q10` y `q90` (horas tratadas como independientes).
-  Si ningún inventario evita los dos umbrales bajo la banda (`feasible` falso),
-  lleva la estación a `ocupacion_respaldo`. **Hoy el pronóstico es la línea
-  base**, porque LightGBM no existe.
-- **Reparto de bicis:** primero el tipo con más prioridad, luego la estación
-  con mayor diferencia; la contraparte es la más cercana dentro de la distancia
-  máxima.
-- Las estaciones sin historia de entrenamiento no se tocan.
-- Los movimientos son instantáneos en el momento de intervención.
-- `recommendations`: una fila por estación simulada, día evaluado, franja y
-  política, de la corrida con el presupuesto de referencia.
-  `start_inventory_target` es el inventario simulado justo después del
-  traslado (el que tenía más `bikes_to_move`), no un inventario ideal.
-  `risk_level` es el riesgo previsto de la franja antes de mover.
+- **Una sola maquinaria para las dos políticas; solo cambia el pronóstico.**
+  La regla histórica usa los cuantiles históricos (filas `baseline` de
+  `predictions`) y el modelo los de LightGBM (filas `lgbm`). Si no hay filas
+  `lgbm`, "model" no se simula.
+- **Banda de incertidumbre:** multiplicador de la dispersión (candidatos en
+  `config/datos.yaml`, hoy 0, 0.5 y 1). Se elige en validación, con el
+  presupuesto de referencia, y aplica igual a las dos. Si el inventario ya
+  está en el rango aceptado no se mueve nada; si no, va al borde más cercano.
+- **Reparto:** primero la diferencia más pequeña. El reparto por riesgo
+  evitado por bici no se implementó: necesita un modelo de riesgo esperado por
+  estación y franja. Las bicis solo van de una estación sobre su rango a una
+  bajo su rango; una estación dentro de su rango ni presta ni recibe.
+- **Franjas sin solución:** `ocupacion_respaldo` del tipo solo si la estación
+  tiene tipo, acotado entre el umbral y la capacidad menos el umbral. Sin tipo
+  (hoy todas) no se tocan. `tipo_si_falta` ya no existe.
+- **Conservación:** el total de bicis (en estación más en tránsito) no cambia.
+  Una bici cuyo destino queda fuera del conjunto vuelve a la estación simulada
+  más cercana a su punto final, o a la de origen si no hay coordenadas. *Regla
+  simétrica, interpretación de programación:* un viaje que empieza fuera sale
+  de la estación simulada más cercana a su punto de inicio, o se ignora si no
+  trae coordenadas.
+- **Capacidad e inventario inicial congelados** en `config/gbfs_congelado.csv`
+  (`python scripts/freeze_gbfs.py`): la capacidad más frecuente entre las
+  fotos de GBFS y la ocupación observada por estación en la hora 00 local.
+  **La captura es del 10 de octubre de 2026, no de los días simulados**, y la
+  ocupación sale de solo 7 fotos de una noche.
+- `feasible` usa la banda elegida y el pronóstico de cada política, así que
+  puede diferir entre políticas. `start_inventory_target` es el inventario
+  simulado justo después del traslado, no un ideal.
 - `policy_curve`: `budget` es el total diario de bicis y `risk_station_hours`
-  el promedio por día evaluado de las horas de estación en riesgo.
-- La prueba final no se simula: el script se niega salvo que se pida de forma
-  explícita (decisión 4).
+  el promedio por día evaluado.
+- La prueba final no se simula salvo petición explícita (decisión 4).
 
-Resultado en validación (2 a 14 de septiembre de 2026, 13 días, reglas
-provisionales). Horas de estación en riesgo por día:
+Resultado en validación (2 a 14 de septiembre de 2026, 13 días, 2,315
+estaciones, reglas provisionales, banda elegida 0.5). Horas de estación en
+riesgo por día; sin intervención son 10,328.5:
 
-| Bicis al día | Sin intervención | Regla histórica | Modelo |
-|---|---|---|---|
-| 0 | 5,977.8 | 5,977.8 | 5,977.8 |
-| 232 | 5,977.8 | 5,767.8 | 5,975.3 |
-| 579 | 5,977.8 | 5,162.0 | 5,923.5 |
-| 1,158 (referencia) | 5,977.8 | 4,312.8 | 5,875.1 |
-| 2,315 | 5,977.8 | 3,542.1 | 5,675.0 |
-| 4,630 | 5,977.8 | 3,320.9 | 5,176.4 |
+| Bicis al día | Regla histórica | Modelo (LightGBM) |
+|---|---|---|
+| 232 | 8,276.1 | 8,384.5 |
+| 579 | 6,112.9 | 6,149.0 |
+| 1,158 (referencia) | 4,757.7 | 4,752.7 |
+| 2,315 | 4,259.2 | 4,230.0 |
+| 4,630 | 4,193.2 | 4,160.1 |
 
-Con el presupuesto de referencia, el riesgo simulado evitado es 1,665.0 horas
-de estación al día para la regla histórica (intervalo 1,430.9 a 1,889.4) y
-102.7 para el modelo (10.2 a 190.1). Sin intervención hay 4,105 viajes
-bloqueados y 2,273 llegadas desviadas al día; son resultados de la simulación,
-no demanda insatisfecha medida.
+**El modelo no supera a la regla histórica: son indistinguibles.** Con el
+presupuesto de referencia el riesgo simulado evitado es 5,570.8 (intervalo
+5,141.6 a 5,989.8) contra 5,575.8 (5,135.2 a 5,989.8). Por día, el modelo
+queda mejor del 7 al 11 de septiembre (el festivo y los cuatro laborables
+siguientes) y peor los otros ocho días; las diferencias son de decenas de
+horas sobre miles. No hay desglose por tipo de estación porque ninguna tiene
+tipo.
 
-Una reimplementación independiente del motor reprodujo estos números sin
-diferencias, y todos los movimientos respetan sus cuatro límites.
+Por banda, con el presupuesto de referencia (histórica / modelo): banda 0,
+5,116.9 / 5,250.6; banda 0.5, 4,757.7 / 4,752.7; banda 1, 4,989.5 / 5,215.8.
+La banda se eligió en los mismos días en que se reporta.
 
-**Por qué el modelo evita menos** (medido en validación con variantes de
-diagnóstico; no son resultados del proyecto):
+Por franja, con el presupuesto de referencia (sin intervención / histórica /
+modelo): mañana 2,511 / 1,002 / 1,007; tarde 2,524 / 1,101 / 1,109; noche de
+22 a 06, 3,495 / 1,826 / 1,805; resto 1,798 / 829 / 832.
 
-- No es por la información: las dos políticas usan promedios del
-  entrenamiento. Con la banda en cero, el modelo llega a 1,605–1,624 contra
-  1,665 de la regla histórica.
-- Exigir seguridad contra la banda baja y la alta a la vez deja el rango
-  aceptado en un tercio de su ancho: 20.9 % de las franjas de estación quedan
-  sin solución factible (0.3 % con la regla histórica) y el modelo pide 20,823
-  bicis al día contra un presupuesto de 1,158.
-- El orden "mayor diferencia primero" entrega el presupuesto a estaciones
-  grandes que se llevan al 50 % y casi no alcanza a las que ya están bajo el
-  umbral: el modelo toca 2,065 franjas de estación con 14.6 bicis por franja;
-  la regla histórica, 6,157 con 4.9.
-- Variantes a 1,158 bicis al día: dejar sin tocar las franjas sin solución da
-  722; atender primero la diferencia más pequeña da 1,988 para el modelo y
-  2,592 para la regla histórica.
-
-Esto no dice nada sobre LightGBM. Cambiar el orden de reparto o qué se hace
-con las franjas sin solución es una decisión abierta (ver pendientes).
+**Sensibilidad al inventario inicial** (presupuesto de referencia, riesgo sin
+intervención y riesgo evitado por la regla histórica): observado en GBFS,
+10,328.5 y 5,570.8; parejo al 40 %, 6,335.9 y 1,967.5; al 50 %, 6,213.2 y
+2,792.5; al 60 %, 8,169.4 y 3,180.1. El arranque observado es disparejo:
+muchas estaciones empiezan vacías o llenas, y de ahí sale buena parte del
+riesgo y del riesgo evitado. **El nivel de los resultados depende más del
+inventario inicial que de la política.**
 
 Lo que hay que saber antes de citar un número:
 
-- **Depende del inventario inicial supuesto.** El día de calentamiento no quita
-  esa dependencia. Con `ocupacion_respaldo` en 0.4, 0.5 y 0.6, el riesgo sin
-  intervención es 6,771, 5,978 y 7,241 horas de estación al día, y el riesgo
-  simulado evitado por la regla histórica con el presupuesto de referencia es
-  775, 1,665 y 2,067.
-- **El conjunto simulado pierde bicis:** de 35,854 a 30,729 en 14 días, porque
-  los viajes sin estación de fin sacan bicis y el rebalanceo real del operador
-  no está en los datos. El riesgo sin intervención sube de 4,128 horas el
-  primer día evaluado a 8,113 el último.
-- Los días no son independientes (el riesgo de un día se parece al del día
-  anterior): los intervalos son indicativos y con remuestreo por bloques salen
-  40 a 48 % más anchos.
-- La línea recta ignora ríos y puentes. Los movimientos son instantáneos y sin
-  límite de camiones.
-- Solo se conoce la demanda atendida: los viajes bloqueados son simulados, y
-  quien no encuentra bici no busca en otra estación.
-- La capacidad es la del GBFS de hoy y cambia entre fotos (ver pendientes).
+- El motor de la primera versión se reprodujo con una reimplementación
+  independiente. **La segunda versión no tiene esa verificación**; solo sus
+  pruebas con redes pequeñas y la identidad del total de bicis.
+- Los días no son independientes: los intervalos son indicativos.
+- La línea recta ignora ríos y puentes. Los movimientos son instantáneos y
+  sin límite de camiones.
+- Solo se conoce la demanda atendida: los viajes bloqueados son simulados.
 - Las reglas de operación son provisionales.
 
 ## Sin fuga de información, en concreto
@@ -654,18 +642,17 @@ el pronóstico de clima emitido antes de decidir).
 - `ocupacion_respaldo` tiene un valor por franja y la decisión 14 no dice cuál
   da el inventario inicial de la simulación. Programación usará el de la
   primera franja del día salvo que logística diga otra cosa.
-- **Reparto de bicis y franjas sin solución (decide el usuario):** el orden
-  "mayor diferencia primero" y llevar a `ocupacion_respaldo` las franjas sin
-  solución factible (decisión 14) explican que el modelo evite poco. Las
-  variantes medidas están en la sección del simulador.
-- **Capacidad inestable:** la limpieza usa la foto más reciente de GBFS y la
-  capacidad cambia entre fotos (una estación reportó 54, 18, 24, 52, 24 y 54
-  el mismo día). Cada reconstrucción puede cambiar algunas capacidades y, con
-  ellas, la simulación. Falta decidir si se fija una foto o se usa la capacidad
-  más frecuente.
+- **Rama de Rodrigo:** falta fusionarla. De ella dependen la clave única
+  `reparto_presupuesto`, `excepciones_valet` y `grupos_aislados` en el
+  validador, y `notebooks/b/tipo_estacion.sql` para llenar `station_type`.
+- **Prueba final y rezagos:** las filas de prueba de LightGBM usan como rezago
+  lo observado en días de prueba anteriores. Ningún valor de prueba se usó como
+  etiqueta ni en una métrica. Falta que el usuario diga si eso es aceptable.
+- **Contrapartes:** permitir que una estación dentro de su rango preste o
+  reciba mejora unas 190 horas al día (medido); hoy no se permite.
 - Las seis tablas del dashboard ya son reales. `recommendations` y
   `policy_curve` son resultados simulados con reglas provisionales.
-- Aún no existen: LightGBM, regla de `station_type` y variables externas.
+- Aún no existen: regla de `station_type` y variables externas.
 - La prueba final (15 a 29 de septiembre) no se ha simulado ni calificado.
 - Los 3,039 viajes con nombre de estación de fin pero sin id no cuentan como
   llegada. En 3,038 el nombre corresponde a una sola estación de las tablas,

@@ -37,6 +37,9 @@ simulacion:
   remuestreos: 500
   nivel_del_intervalo: 0.80
   semilla: 7
+  bandas: [0, 0.5, 1]
+  franja_noche: {inicio: "22:00", fin: "06:00"}
+  sensibilidad_ocupacion_inicial: [0.4, 0.6]
 """
 
 # El bloque de simulación de TEXTO_BASE, para las pruebas que lo quitan o lo cambian entero.
@@ -119,7 +122,10 @@ def test_un_archivo_valido_se_carga_con_sus_valores(tmp_path):
     assert datos.distancia_maxima_m == 1.0 and isinstance(datos.distancia_maxima_m, float)
     assert datos.prefijos_excluidos == ("HB", "JC")
     assert datos.ids_excluidos == ("1234.56", "Shop Morgan")  # texto: un id nunca es un número
-    assert datos.simulacion == Simulacion(dias_de_calentamiento=2, remuestreos=500, nivel_del_intervalo=0.8, semilla=7)
+    assert datos.simulacion == Simulacion(
+        dias_de_calentamiento=2, remuestreos=500, nivel_del_intervalo=0.8, semilla=7,
+        bandas=(0.0, 0.5, 1.0), franja_noche=("22:00", "06:00"), sensibilidad_ocupacion_inicial=(0.4, 0.6),
+    )
     assert isinstance(datos.simulacion.nivel_del_intervalo, float)
 
 
@@ -274,8 +280,39 @@ def test_el_mensaje_junta_todos_los_problemas_de_la_simulacion(tmp_path):
     texto = _editado(BLOQUE_SIMULACION, "simulacion: {dias_de_calentamiento: 99, remuestreos: 5}\n")
     with pytest.raises(DatosError) as error:
         load_datos(_archivo(tmp_path, texto))
-    for clave in ("dias_de_calentamiento", "remuestreos", "nivel_del_intervalo", "semilla"):
-        assert f"simulacion.{clave}: debe ser" in str(error.value), clave
+    for clave in ("dias_de_calentamiento", "remuestreos", "nivel_del_intervalo", "semilla", "bandas",
+                  "franja_noche", "sensibilidad_ocupacion_inicial"):
+        assert f"simulacion.{clave}: debe" in str(error.value), clave
+
+
+@pytest.mark.parametrize(
+    "viejo, nuevo, mensaje",
+    [
+        ("bandas: [0, 0.5, 1]", "bandas: []", "simulacion.bandas: debe ser una lista"),
+        ("bandas: [0, 0.5, 1]", "bandas: 0.5", "simulacion.bandas: debe ser una lista"),
+        ("bandas: [0, 0.5, 1]", "bandas: [0, -1]", "simulacion.bandas: debe ser una lista"),
+        ("bandas: [0, 0.5, 1]", "bandas: [0.5, 0.5]", "simulacion.bandas: debe ser una lista"),
+        ("  bandas: [0, 0.5, 1]\n", "", "simulacion.bandas: debe ser una lista"),
+        ('inicio: "22:00", fin: "06:00"', 'inicio: "22:00", fin: "22:00"', "simulacion.franja_noche: debe tener"),
+        ('inicio: "22:00", fin: "06:00"', 'inicio: 22, fin: "06:00"', "simulacion.franja_noche: debe tener"),
+        ('inicio: "22:00", fin: "06:00"', 'inicio: "25:00", fin: "06:00"', "simulacion.franja_noche: debe tener"),
+        ("sensibilidad_ocupacion_inicial: [0.4, 0.6]", "sensibilidad_ocupacion_inicial: [0.4, 1.5]",
+         "simulacion.sensibilidad_ocupacion_inicial: debe ser una lista"),
+        ("  sensibilidad_ocupacion_inicial: [0.4, 0.6]\n", "",
+         "simulacion.sensibilidad_ocupacion_inicial: debe ser una lista"),
+    ],
+)
+def test_las_bandas_la_noche_y_la_sensibilidad_mal_escritas_se_rechazan(tmp_path, viejo, nuevo, mensaje):
+    with pytest.raises(DatosError) as error:
+        load_datos(_archivo(tmp_path, _editado(viejo, nuevo)))
+    assert mensaje in str(error.value)
+
+
+def test_la_sensibilidad_puede_ir_vacia_y_la_noche_puede_no_cruzar_la_medianoche(tmp_path):
+    texto = _editado("sensibilidad_ocupacion_inicial: [0.4, 0.6]", "sensibilidad_ocupacion_inicial: []")
+    texto = texto.replace('inicio: "22:00", fin: "06:00"', 'inicio: "00:00", fin: "05:00"')
+    simulacion = load_datos(_archivo(tmp_path, texto)).simulacion
+    assert simulacion.sensibilidad_ocupacion_inicial == () and simulacion.franja_noche == ("00:00", "05:00")
 
 
 # --------------------------------------------------------------------------- #

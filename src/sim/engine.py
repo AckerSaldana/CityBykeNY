@@ -20,10 +20,20 @@ Reglas del recorrido (puntos 11 a 16 de la especificación):
   (los datos solo registran demanda atendida).
 - Una llegada a una estación llena se cuenta como desviada y la bici va a la
   estación con lugar más cercana, en línea recta.
-- Entran bicis al conjunto cuando llega un viaje cuya salida no se simuló
-  (salió de fuera del conjunto, sin estación o antes del tramo). Salen cuando
-  una salida simulada no tiene llegada simulada (va fuera del conjunto, sin
-  estación o termina después del tramo).
+- El total de bicis no cambia: las que están en estaciones más las que van en
+  un viaje dan siempre el total inicial. Se comprueba en cada intervención,
+  en cada cambio de día y al final. Para eso:
+  - un viaje que termina fuera del conjunto simulado (sin estación de fin, o
+    con una estación que no se simula) devuelve la bici, a la hora en que
+    terminó, a la estación simulada más cercana al punto donde terminó; si no
+    trae ese punto, a su estación de origen. Si está llena, se desvía como
+    cualquier llegada;
+  - un viaje que empieza fuera del conjunto y trae el punto de inicio sale de
+    la estación simulada más cercana a ese punto (bloqueado si está vacía);
+    sin punto de inicio, el viaje se ignora y se cuenta;
+  - un viaje que ya iba en camino al empezar el tramo se ignora y se cuenta;
+  - un viaje que sigue en camino al terminar el tramo deja su bici "en
+    tránsito", dentro del total. De su llegada no se mira nada.
 - En instantes iguales van primero las llegadas y después las salidas; el
   desempate es el `ride_id`. La llegada de un viaje de duración cero va
   después de su propia salida.
@@ -51,21 +61,22 @@ import pandas as pd
 
 from src.contracts import STATION_TYPES
 from src.paths import TZ
-from src.sim.operacion import presupuesto_en_bicis
+from src.sim.operacion import CLAVE_PARTE, presupuesto_en_bicis
 
 US_PER_HOUR = 3_600_000_000
 EARTH_RADIUS_KM = 6371.0088
 
-# Etiqueta del tiempo que no cae en ninguna franja.
-OUTSIDE = "fuera de franja"
+# Etiquetas del reporte para el tiempo fuera de las franjas de operación: la franja de noche
+# (config/datos.yaml) y lo que no cae en ninguna.
+NIGHT = "noche"
+OUTSIDE = "resto"
 # Tipos de riesgo que se reportan. "total" es estar en cualquiera de los dos.
 KINDS = ("total", "pocas_bicis", "pocos_lugares")
 
-# Códigos de evento.
-ARRIVAL_INTERNAL = 0   # llegada de un viaje cuya salida también se simula
-ARRIVAL_ENTERS = 1     # llegada de un viaje que viene de fuera: entra una bici
-DEPARTURE_INTERNAL = 2  # salida de un viaje cuya llegada también se simula
-DEPARTURE_LEAVES = 3   # salida de un viaje que termina fuera: sale una bici
+# Códigos de evento. Toda llegada es de un viaje cuya salida también se simula.
+ARRIVAL = 0         # la bici de un viaje vuelve a una estación
+DEPARTURE = 2       # salida de un viaje que termina dentro del tramo
+DEPARTURE_OPEN = 3  # salida de un viaje que termina después del tramo: la bici queda en tránsito
 
 # Estaciones vecinas que se guardan como lista para desviar llegadas rápido.
 # Si ninguna tiene lugar se revisa la fila completa.
@@ -73,6 +84,7 @@ _NEAR = 16
 # Holgura para comparar decimales que deberían ser iguales.
 EPS = 1e-9
 _CHUNK = 20_000
+_POINTS_CHUNK = 2_000  # puntos por tanda al buscar la estación más cercana
 
 
 class SimulacionError(ValueError):
@@ -109,7 +121,7 @@ class Franja:
     momento_intervencion: str
     inicio: str
     fin: str
-    parte_del_presupuesto: float
+    share: float   # parte del presupuesto del día que le toca (las de todas las franjas suman 1)
 
     @property
     def intervencion_min(self) -> int:
@@ -143,7 +155,6 @@ class Reglas:
     distancia_maxima_km: float
     prioridad: dict                      # tipo -> 1, 2 o 3
     ocupacion_respaldo: dict             # tipo -> franja -> fracción de la capacidad
-    tipo_si_falta: str
     presupuestos_por_estacion: tuple[float, ...]
     presupuesto_de_referencia: float
     estado: str = "provisional"
@@ -153,12 +164,12 @@ class Reglas:
         """Arma las reglas con lo que devuelve `load_operacion()`."""
         needed = (
             "franjas", "umbral_riesgo", "distancia_maxima_km", "estrategia_por_tipo",
-            "tipo_si_falta", "presupuestos_por_estacion", "presupuesto_de_referencia",
+            "presupuestos_por_estacion", "presupuesto_de_referencia",
         )
         missing = [key for key in needed if key not in cfg]
         for i, franja in enumerate(cfg.get("franjas") or []):
-            if "parte_del_presupuesto" not in franja:
-                missing.append(f"franjas[{i}].parte_del_presupuesto")
+            if CLAVE_PARTE not in franja:
+                missing.append(f"franjas[{i}].{CLAVE_PARTE}")
         if missing:
             raise SimulacionError(
                 f"A las reglas de operación les falta: {', '.join(missing)}. El simulador lo necesita."
@@ -171,7 +182,7 @@ class Reglas:
                         momento_intervencion=f["momento_intervencion"],
                         inicio=f["inicio"],
                         fin=f["fin"],
-                        parte_del_presupuesto=float(f["parte_del_presupuesto"]),
+                        share=float(f[CLAVE_PARTE]),
                     )
                     for f in cfg["franjas"]
                 ),
@@ -180,8 +191,6 @@ class Reglas:
         )
         if not franjas:
             raise SimulacionError("Las reglas de operación no traen ninguna franja.")
-        if cfg["tipo_si_falta"] not in STATION_TYPES:
-            raise SimulacionError(f"tipo_si_falta debe ser uno de {list(STATION_TYPES)}.")
         budgets = tuple(float(value) for value in cfg["presupuestos_por_estacion"])
         reference = float(cfg["presupuesto_de_referencia"])
         if reference not in budgets:
@@ -197,17 +206,10 @@ class Reglas:
                 tipo: {name: float(value) for name, value in rule["ocupacion_respaldo"].items()}
                 for tipo, rule in strategy.items()
             },
-            tipo_si_falta=cfg["tipo_si_falta"],
             presupuestos_por_estacion=budgets,
             presupuesto_de_referencia=reference,
             estado=str(cfg.get("estado", "provisional")),
         )
-
-    @property
-    def first_franja(self) -> Franja:
-        """La primera franja del día: la que empieza antes."""
-        return min(self.franjas, key=lambda f: (f.inicio_min, f.intervencion_min))
-
 
 def daily_budget(per_station: float, stations: int) -> int:
     """Presupuesto del día en bicis: bicis por estación por día por estaciones simuladas."""
@@ -222,8 +224,8 @@ def split_budget(daily: int, franjas: tuple[Franja, ...]) -> tuple[int, ...]:
     fracción más grande; si empatan, a la que interviene primero. La suma
     siempre es `daily`.
     """
-    total = math.fsum(f.parte_del_presupuesto for f in franjas)
-    exact = [daily * f.parte_del_presupuesto / total for f in franjas]
+    total = math.fsum(f.share for f in franjas)
+    exact = [daily * f.share / total for f in franjas]
     parts = [int(math.floor(value + EPS)) for value in exact]
     pending = daily - sum(parts)
     order = sorted(range(len(franjas)), key=lambda i: (-(exact[i] - parts[i]), i))
@@ -251,8 +253,8 @@ class Network:
     capacity: np.ndarray           # lugares (int64)
     lat: np.ndarray
     lon: np.ndarray
-    station_type: tuple[str, ...]  # tipo de cada estación, ya con `tipo_si_falta`
-    typed: np.ndarray              # True si la estación traía tipo
+    station_type: tuple            # tipo de cada estación; None si no tiene
+    typed: np.ndarray              # True si la estación tiene tipo
     dist_km: np.ndarray            # distancia en línea recta entre cada par
     nearest: np.ndarray            # por estación, las demás de la más cercana a la más lejana
 
@@ -270,7 +272,7 @@ class Network:
         return [self.nearest[s, : within[s]].astype(np.int64) for s in range(self.size)]
 
 
-def build_network(stations: pd.DataFrame, tipo_si_falta: str) -> Network:
+def build_network(stations: pd.DataFrame) -> Network:
     """Arma la red con las filas de `stations` que se van a simular.
 
     Todas deben traer capacidad mayor que 0. El orden es el de `station_id`,
@@ -305,18 +307,46 @@ def build_network(stations: pd.DataFrame, tipo_si_falta: str) -> Network:
         capacity=capacity,
         lat=lat,
         lon=lon,
-        station_type=tuple(value if value is not None else tipo_si_falta for value in raw_type),
+        station_type=tuple(raw_type),
         typed=typed,
         dist_km=dist,
         nearest=nearest,
     )
 
 
-def initial_inventory(network: Network, reglas: Reglas) -> np.ndarray:
-    """Inventario del primer instante: ocupacion_respaldo de la primera franja del día por capacidad."""
-    name = reglas.first_franja.nombre
-    occupancy = np.array([reglas.ocupacion_respaldo[kind][name] for kind in network.station_type])
+def initial_inventory(network: Network, occupancy) -> np.ndarray:
+    """Inventario del primer instante: ocupación (fracción de la capacidad) por capacidad, redondeado.
+
+    `occupancy` es un número para todas las estaciones o uno por estación.
+    """
+    occupancy = np.broadcast_to(np.asarray(occupancy, dtype="float64"), (network.size,))
+    if not np.isfinite(occupancy).all() or (occupancy < 0).any() or (occupancy > 1).any():
+        raise SimulacionError("La ocupación inicial debe estar entre 0 y 1 en todas las estaciones.")
     return np.clip(round_half_up(occupancy * network.capacity), 0, network.capacity)
+
+
+def nearest_station(network: Network, lat, lon) -> tuple[np.ndarray, np.ndarray]:
+    """Estación de la red más cercana a cada punto, en línea recta, y su distancia en km.
+
+    Si dos estaciones quedan a la misma distancia gana la de id menor.
+    """
+    lat = np.asarray(lat, dtype="float64")
+    lon = np.asarray(lon, dtype="float64")
+    index = np.empty(len(lat), dtype=np.int64)
+    km = np.empty(len(lat), dtype="float64")
+    if not len(lat):
+        return index, km
+    points, inverse = np.unique(np.stack([lat, lon], axis=1), axis=0, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    best = np.empty(len(points), dtype=np.int64)
+    best_km = np.empty(len(points), dtype="float64")
+    for first in range(0, len(points), _POINTS_CHUNK):
+        chunk = points[first : first + _POINTS_CHUNK]
+        dist = haversine_km(chunk[:, 0, None], chunk[:, 1, None], network.lat[None, :], network.lon[None, :])
+        choice = np.argmin(dist, axis=1)  # el primero de los empatados: la red va ordenada por id
+        best[first : first + len(chunk)] = choice
+        best_km[first : first + len(chunk)] = dist[np.arange(len(chunk)), choice]
+    return best[inverse], best_km[inverse]
 
 
 # --------------------------------------------------------------------------- #
@@ -354,7 +384,7 @@ class Calendar:
     slots: tuple[Slot, ...]          # intervenciones en orden
     window_start_us: np.ndarray      # [día, franja]: inicio de la franja
     window_end_us: np.ndarray        # [día, franja]: fin de la franja
-    labels: tuple[str, ...]          # nombres de las franjas y, al final, OUTSIDE
+    labels: tuple[str, ...]          # nombres de las franjas, NIGHT (si hay franja de noche) y OUTSIDE
     bin_edges_us: np.ndarray         # cortes de tiempo: días y bordes de franja
     bin_day: np.ndarray              # día de cada tramo de tiempo
     bin_label: np.ndarray            # etiqueta de cada tramo de tiempo
@@ -365,8 +395,55 @@ class Calendar:
         return np.arange(self.warmup_days, len(self.days))
 
 
-def build_calendar(first_day: date, last_day: date, franjas: tuple[Franja, ...], warmup_days: int = 0) -> Calendar:
-    """Calendario del tramo, del primer día al último, los dos incluidos."""
+def _day_segments(franjas: tuple[Franja, ...], noche: tuple[str, str] | None) -> list[tuple[int, int, int]]:
+    """Reparte las 24 horas en tramos (minuto de inicio, minuto de fin, etiqueta).
+
+    La etiqueta es el índice de la franja de operación; si el minuto no cae en
+    ninguna, la franja de noche (puede cruzar la medianoche); si tampoco, el
+    resto. Donde la noche se encima con una franja de operación gana la franja.
+    """
+    n = len(franjas)
+    night, outside = (n, n + 1) if noche else (None, n)
+    cuts = {0, 24 * 60}
+    for franja in franjas:
+        cuts |= {franja.inicio_min, franja.fin_min}
+    if noche:
+        night_start, night_end = _minutes(noche[0]), _minutes(noche[1])
+        if night_start == night_end:
+            raise SimulacionError("La franja de noche debe tener inicio y fin distintos.")
+        cuts |= {night_start, night_end}
+    ordered = sorted(cuts)
+    segments: list[tuple[int, int, int]] = []
+    for low, high in zip(ordered, ordered[1:]):
+        label = outside
+        for f, franja in enumerate(franjas):
+            if franja.inicio_min <= low < franja.fin_min:
+                label = f
+                break
+        else:
+            if noche and (
+                night_start <= low < night_end if night_start < night_end else low >= night_start or low < night_end
+            ):
+                label = night
+        if segments and segments[-1][2] == label:
+            segments[-1] = (segments[-1][0], high, label)
+        else:
+            segments.append((low, high, label))
+    return segments
+
+
+def build_calendar(
+    first_day: date,
+    last_day: date,
+    franjas: tuple[Franja, ...],
+    warmup_days: int = 0,
+    noche: tuple[str, str] | None = None,
+) -> Calendar:
+    """Calendario del tramo, del primer día al último, los dos incluidos.
+
+    `noche` es la franja de noche del reporte, ("HH:MM", "HH:MM"). Sin ella el
+    tiempo fuera de las franjas de operación va todo a OUTSIDE.
+    """
     n_days = (last_day - first_day).days + 1
     if n_days < 1:
         raise SimulacionError("El tramo simulado no tiene días.")
@@ -377,30 +454,22 @@ def build_calendar(first_day: date, last_day: date, franjas: tuple[Franja, ...],
         )
     days = tuple(first_day + timedelta(days=i) for i in range(n_days))
     day_start = tuple(local_us(day) for day in days) + (local_us(last_day + timedelta(days=1)),)
-    outside = len(franjas)
-    by_start = sorted(range(len(franjas)), key=lambda i: franjas[i].inicio_min)
+    segments = _day_segments(franjas, noche)
 
     slots, edges, bin_day, bin_label = [], [day_start[0]], [], []
     window_start = np.zeros((n_days, len(franjas)), dtype=np.int64)
     window_end = np.zeros((n_days, len(franjas)), dtype=np.int64)
     for d, day in enumerate(days):
         cursor = day_start[d]
-
-        def add(until: int, label: int) -> None:
-            nonlocal cursor
+        for _, high, label in segments:
+            until = day_start[d + 1] if high == 24 * 60 else local_us(day, f"{high // 60:02d}:{high % 60:02d}")
             if until > cursor:
                 edges.append(until)
                 bin_day.append(d)
                 bin_label.append(label)
                 cursor = until
-
-        for f in by_start:
-            start, end = local_us(day, franjas[f].inicio), local_us(day, franjas[f].fin)
-            window_start[d, f], window_end[d, f] = start, end
-            add(start, outside)
-            add(end, f)
-        add(day_start[d + 1], outside)
         for f, franja in enumerate(franjas):
+            window_start[d, f], window_end[d, f] = local_us(day, franja.inicio), local_us(day, franja.fin)
             slots.append(Slot(local_us(day, franja.momento_intervencion), d, f))
     slots.sort(key=lambda slot: (slot.instant_us, slot.franja_index))
     return Calendar(
@@ -412,7 +481,7 @@ def build_calendar(first_day: date, last_day: date, franjas: tuple[Franja, ...],
         slots=tuple(slots),
         window_start_us=window_start,
         window_end_us=window_end,
-        labels=tuple(f.nombre for f in franjas) + (OUTSIDE,),
+        labels=tuple(f.nombre for f in franjas) + ((NIGHT,) if noche else ()) + (OUTSIDE,),
         bin_edges_us=np.array(edges, dtype=np.int64),
         bin_day=np.array(bin_day, dtype=np.int64),
         bin_label=np.array(bin_label, dtype=np.int64),
@@ -424,6 +493,8 @@ def build_calendar(first_day: date, last_day: date, franjas: tuple[Franja, ...],
 # --------------------------------------------------------------------------- #
 
 TRIP_COLUMNS = ("ride_id", "started_at", "ended_at", "start_station_id", "end_station_id")
+# Coordenadas crudas de cada punta del viaje. Si la tabla no las trae se toman como vacías.
+POINT_COLUMNS = ("start_lat", "start_lng", "end_lat", "end_lng")
 
 
 @dataclass(frozen=True)
@@ -450,11 +521,44 @@ def _epoch_us(column: pd.Series, name: str) -> np.ndarray:
     return pd.DatetimeIndex(column).as_unit("us").asi8
 
 
+def _point(trips: pd.DataFrame, lat: str, lon: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Coordenadas de una punta y cuáles filas las traen completas."""
+    if lat not in trips.columns or lon not in trips.columns:
+        empty = np.full(len(trips), np.nan)
+        return empty, empty, np.zeros(len(trips), dtype=bool)
+    y = pd.to_numeric(trips[lat], errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
+    x = pd.to_numeric(trips[lon], errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
+    return y, x, np.isfinite(y) & np.isfinite(x)
+
+
+def _distance_summary(km: np.ndarray) -> dict:
+    if not len(km):
+        return {"viajes": 0, "mediana_km": None, "p90_km": None, "p99_km": None, "maximo_km": None}
+    p50, p90, p99 = np.quantile(km, [0.5, 0.9, 0.99])
+    return {
+        "viajes": int(len(km)),
+        "mediana_km": float(p50),
+        "p90_km": float(p90),
+        "p99_km": float(p99),
+        "maximo_km": float(km.max()),
+    }
+
+
 def prepare_events(trips: pd.DataFrame, network: Network, start_us: int, end_us: int) -> Events:
     """Convierte los viajes en eventos de las estaciones simuladas dentro de [start_us, end_us).
 
-    Salida: la estación de inicio está en la red y `started_at` cae en el tramo.
-    Llegada: la estación de fin está en la red y `ended_at` cae en el tramo.
+    Solo cuentan los viajes que EMPIEZAN dentro del tramo. Cada uno saca una
+    bici de una estación simulada y, si termina dentro del tramo, la devuelve
+    a otra (o a la misma): así el total de bicis no cambia.
+
+    - Estación de salida: la del viaje si se simula; si no, la simulada más
+      cercana al punto de inicio; sin punto de inicio, el viaje se ignora.
+    - Estación de llegada: la del viaje si se simula; si no, la simulada más
+      cercana al punto de fin; sin punto de fin, la estación de salida.
+    - Un viaje que termina después del tramo solo tiene salida. De su llegada
+      no se mira ni la estación ni el punto: así ningún dato posterior al
+      tramo simulado (la prueba final) entra en la cuenta.
+    - Un viaje que empezó antes del tramo se ignora.
     """
     missing = [column for column in TRIP_COLUMNS if column not in trips.columns]
     if missing:
@@ -465,15 +569,37 @@ def prepare_events(trips: pd.DataFrame, network: Network, start_us: int, end_us:
     started = _epoch_us(trips["started_at"], "started_at")
     ended = _epoch_us(trips["ended_at"], "ended_at")
     index = network.index
-    origin = index.get_indexer(trips["start_station_id"].astype("object"))
-    destination = index.get_indexer(trips["end_station_id"].astype("object"))
+    origin = index.get_indexer(trips["start_station_id"].astype("object")).astype(np.int64)
+    destination = index.get_indexer(trips["end_station_id"].astype("object")).astype(np.int64)
+    no_start = trips["start_station_id"].isna().to_numpy()
+    no_end = trips["end_station_id"].isna().to_numpy()
 
-    departs = (origin >= 0) & (started >= start_us) & (started < end_us)
-    arrives = (destination >= 0) & (ended >= start_us) & (ended < end_us)
-    both = departs & arrives
-    if (ended[both] < started[both]).any():
+    starts_inside = (started >= start_us) & (started < end_us)
+    ends_inside = ended < end_us  # junto con `starts_inside`: el viaje termina dentro del tramo
+    if (ended[starts_inside] < started[starts_inside]).any():
         raise SimulacionError("Hay viajes que terminan antes de empezar: la limpieza debió quitarlos.")
-    zero = both & (ended == started)
+
+    # Salida: de su estación o de la simulada más cercana al punto de inicio.
+    start_lat, start_lon, start_point = _point(trips, "start_lat", "start_lng")
+    moved_origin = starts_inside & (origin < 0) & start_point
+    origin_km = np.zeros(0)
+    if moved_origin.any():
+        origin[moved_origin], origin_km = nearest_station(network, start_lat[moved_origin], start_lon[moved_origin])
+    departs = starts_inside & (origin >= 0)
+    ignored_start = starts_inside & ~departs
+
+    # Llegada: a su estación, a la simulada más cercana al punto de fin o de vuelta a la de salida.
+    arrives = departs & ends_inside
+    end_lat, end_lon, end_point = _point(trips, "end_lat", "end_lng")
+    outside_end = arrives & (destination < 0)
+    moved_end = outside_end & end_point
+    back_home = outside_end & ~end_point
+    end_km = np.zeros(0)
+    if moved_end.any():
+        destination[moved_end], end_km = nearest_station(network, end_lat[moved_end], end_lon[moved_end])
+    destination[back_home] = origin[back_home]
+    open_trip = departs & ~ends_inside
+    zero = arrives & (ended == started)
 
     rank = np.empty(n, dtype=np.int64)
     rank[np.argsort(trips["ride_id"].to_numpy(dtype=object), kind="stable")] = np.arange(n)
@@ -485,8 +611,8 @@ def prepare_events(trips: pd.DataFrame, network: Network, start_us: int, end_us:
     turn = np.concatenate([np.where(zero[arrives], 2, 0), np.ones(int(departs.sum()), dtype=np.int64)])
     code = np.concatenate(
         [
-            np.where(departs[arrives], ARRIVAL_INTERNAL, ARRIVAL_ENTERS),
-            np.where(arrives[departs], DEPARTURE_INTERNAL, DEPARTURE_LEAVES),
+            np.full(int(arrives.sum()), ARRIVAL, dtype=np.int64),
+            np.where(arrives[departs], DEPARTURE, DEPARTURE_OPEN),
         ]
     )
     station = np.concatenate([destination[arrives], origin[departs]])
@@ -494,32 +620,34 @@ def prepare_events(trips: pd.DataFrame, network: Network, start_us: int, end_us:
     tiebreak = np.concatenate([rank[arrives], rank[departs]])
     order = np.lexsort((tiebreak, turn, time))
     time = time[order]
-    # Por qué entra o sale cada bici del conjunto. Son los viajes tal como pasaron: una salida que la
-    # simulación bloquea no saca la bici, y eso se cuenta aparte, en cada corrida.
-    # De la punta que cae fuera del tramo solo se mira que cae fuera, no su estación: así ningún dato con
-    # fecha posterior al tramo simulado (la prueba final) entra en la cuenta.
-    enters, leaves = arrives & ~departs, departs & ~arrives
-    starts_inside = (started >= start_us) & (started < end_us)
-    ends_inside = (ended >= start_us) & (ended < end_us)
-    no_start = trips["start_station_id"].isna().to_numpy()
-    no_end = trips["end_station_id"].isna().to_numpy()
+    # Los viajes tal como pasaron. Una salida que la simulación bloquea no saca la bici ni genera llegada:
+    # eso se cuenta aparte, en cada corrida.
     counts = {
         "viajes_leidos": int(n),
         "salidas": int(departs.sum()),
         "llegadas": int(arrives.sum()),
-        "viajes_internos": int(both.sum()),
-        "llegadas_que_entran": int(enters.sum()),
-        "salidas_que_salen": int(leaves.sum()),
-        "viajes_sin_ningun_evento": int((~departs & ~arrives).sum()),
-        "llegadas_que_entran_por_motivo": {
-            "salieron_antes_del_tramo": int((enters & ~starts_inside).sum()),
-            "sin_estacion_de_inicio": int((enters & starts_inside & no_start).sum()),
-            "de_una_estacion_fuera_del_conjunto": int((enters & starts_inside & ~no_start).sum()),
+        "salidas_por_origen": {
+            "de_su_estacion": int((departs & ~moved_origin).sum()),
+            "de_la_estacion_mas_cercana_al_punto_de_inicio": int(moved_origin.sum()),
+            "de_ellas_sin_estacion_en_la_tabla": int((moved_origin & no_start).sum()),
+            "de_ellas_con_estacion_que_no_se_simula": int((moved_origin & ~no_start).sum()),
         },
-        "salidas_que_salen_por_motivo": {
-            "terminan_despues_del_tramo": int((leaves & ~ends_inside).sum()),
-            "sin_estacion_de_fin": int((leaves & ends_inside & no_end).sum()),
-            "a_una_estacion_fuera_del_conjunto": int((leaves & ends_inside & ~no_end).sum()),
+        "llegadas_por_destino": {
+            "a_su_estacion": int((arrives & ~outside_end).sum()),
+            "a_la_estacion_mas_cercana_al_punto_de_fin": int(moved_end.sum()),
+            "de_vuelta_a_la_estacion_de_salida": int(back_home.sum()),
+            "fuera_del_conjunto_sin_estacion_en_la_tabla": int((outside_end & no_end).sum()),
+            "fuera_del_conjunto_con_estacion_que_no_se_simula": int((outside_end & ~no_end).sum()),
+        },
+        "ignorados": {
+            "ya_iban_en_camino_al_empezar_el_tramo": int((started < start_us).sum()),
+            "empiezan_fuera_del_conjunto_y_sin_punto_de_inicio": int(ignored_start.sum()),
+            "empiezan_despues_del_tramo": int((started >= end_us).sum()),
+        },
+        "siguen_en_camino_al_terminar_el_tramo": int(open_trip.sum()),
+        "distancia_a_la_estacion_mas_cercana": {
+            "punto_de_inicio": _distance_summary(origin_km),
+            "punto_de_fin": _distance_summary(end_km),
         },
     }
     return Events(
@@ -592,9 +720,8 @@ class RunResult:
     final_inventory: np.ndarray
     blocked: np.ndarray            # por día: salidas con inventario cero (viajes bloqueados)
     diverted: np.ndarray           # por día: llegadas a estación llena
-    no_room: np.ndarray            # por día: llegadas sin lugar en ninguna estación
-    entered: np.ndarray            # por día: bicis que entran al conjunto
-    left: np.ndarray               # por día: bicis que salen del conjunto
+    no_room: np.ndarray            # por día: llegadas sin lugar en ninguna estación (la bici queda en tránsito)
+    in_transit: np.ndarray         # bicis en un viaje al terminar cada día
     budget_available: np.ndarray   # [día, franja]
     budget_used: np.ndarray        # [día, franja]
     risk_us: np.ndarray            # [día, etiqueta, tipo de riesgo] en microsegundos
@@ -606,15 +733,26 @@ class RunResult:
         return self.risk_us / US_PER_HOUR
 
     @property
-    def final_total(self) -> int:
+    def final_docked(self) -> int:
+        """Bicis en estaciones al final del tramo."""
         return int(self.final_inventory.sum())
+
+    @property
+    def final_in_transit(self) -> int:
+        """Bicis en un viaje al final del tramo."""
+        return int(self.in_transit[-1])
+
+    @property
+    def final_total(self) -> int:
+        """Bicis en estaciones más bicis en tránsito al final: siempre el total inicial."""
+        return self.final_docked + self.final_in_transit
 
     def digest(self) -> str:
         """Huella del resultado completo: dos corridas iguales dan la misma."""
         h = hashlib.sha256()
         h.update(f"{self.policy}|{self.daily_budget}|{self.initial_total}".encode())
         for array in (
-            self.final_inventory, self.blocked, self.diverted, self.no_room, self.entered, self.left,
+            self.final_inventory, self.blocked, self.diverted, self.no_room, self.in_transit,
             self.budget_available, self.budget_used, self.risk_us,
         ):
             h.update(np.ascontiguousarray(array, dtype=np.int64).tobytes())
@@ -658,19 +796,20 @@ def bin_risk(intervals: list, calendar: Calendar) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 def _process(times, codes, stations, trips, inv, cap, hi, bmin, state, since, intervals, is_blocked, near, nearest):
-    """Aplica un bloque de eventos seguidos. Devuelve (bloqueados, desviadas, sin lugar, entran, salen).
+    """Aplica un bloque de eventos seguidos. Devuelve (bloqueados, desviadas, sin lugar, cambio de bicis en tránsito).
 
     `state` es el riesgo de cada estación (0 = ninguno, 1 = pocas bicis,
     2 = pocos lugares, 3 = los dos) y `since` desde cuándo está así. Cada vez
     que una estación cambia de estado se cierra su intervalo en `intervals`.
     """
-    blocked = diverted = no_room = entered = left = 0
+    blocked = diverted = no_room = transit = 0
     below = bmin - 1
     for t, code, s, trip in zip(times, codes, stations, trips):
-        if code >= DEPARTURE_INTERNAL:
+        if code >= DEPARTURE:
             v = inv[s]
             if v:
                 inv[s] = v - 1
+                transit += 1
                 top = hi[s]
                 if v == bmin or v == top + 1:
                     old = state[s]
@@ -678,14 +817,11 @@ def _process(times, codes, stations, trips, inv, cap, hi, bmin, state, since, in
                         intervals.append((s, since[s], t, old))
                     state[s] = (1 if v - 1 < bmin else 0) | (2 if v - 1 > top else 0)
                     since[s] = t
-                if code == DEPARTURE_LEAVES:
-                    left += 1
             else:
                 blocked += 1
-                if code == DEPARTURE_INTERNAL:
-                    is_blocked[trip] = 1
+                is_blocked[trip] = 1
         else:
-            if code == ARRIVAL_INTERNAL and is_blocked[trip]:
+            if is_blocked[trip]:
                 continue  # el viaje se bloqueó al salir: no hay llegada
             v = inv[s]
             if v >= cap[s]:
@@ -698,14 +834,13 @@ def _process(times, codes, stations, trips, inv, cap, hi, bmin, state, since, in
                         if inv[j] < cap[j]:
                             break
                     else:
-                        # Ninguna estación tiene lugar: la bici queda fuera del conjunto.
+                        # Ninguna estación tiene lugar: la bici se queda en tránsito, dentro del total.
                         no_room += 1
-                        if code == ARRIVAL_INTERNAL:
-                            left += 1
                         continue
                 s = j
                 v = inv[s]
             inv[s] = v + 1
+            transit -= 1
             top = hi[s]
             if v == below or v == top:
                 old = state[s]
@@ -713,9 +848,7 @@ def _process(times, codes, stations, trips, inv, cap, hi, bmin, state, since, in
                     intervals.append((s, since[s], t, old))
                 state[s] = (1 if v + 1 < bmin else 0) | (2 if v + 1 > top else 0)
                 since[s] = t
-            if code == ARRIVAL_ENTERS:
-                entered += 1
-    return blocked, diverted, no_room, entered, left
+    return blocked, diverted, no_room, transit
 
 
 def _as_index(value, size: int, what: str) -> int:
@@ -792,8 +925,9 @@ def simulate(
     cada cambio de día y al final; entre revisiones solo cambia de una bici en
     una y nunca por debajo de 0 ni por encima de la capacidad), cada traslado
     dentro de sus cuatro límites, los traslados no crean ni destruyen bicis,
-    el presupuesto de cada franja no se rebasa y el total final de bicis es
-    el inicial más las que entran menos las que salen.
+    el presupuesto de cada franja no se rebasa y el total de bicis (en
+    estaciones más en tránsito) es el inicial en cada intervención, en cada
+    cambio de día y al final.
     """
     n = network.size
     n_days, n_franjas = len(calendar.days), len(reglas.franjas)
@@ -813,7 +947,16 @@ def simulate(
     initial_total = sum(inv)
     shares = split_budget(int(budget), reglas.franjas)
 
-    blocked, diverted, no_room, entered, left = (np.zeros(n_days, dtype=np.int64) for _ in range(5))
+    blocked, diverted, no_room, in_transit = (np.zeros(n_days, dtype=np.int64) for _ in range(4))
+    transit = 0  # bicis que van en un viaje en este momento
+
+    def check_total(when: str) -> None:
+        if sum(inv) + transit != initial_total or transit < 0:
+            raise CheckError(
+                f"El total de bicis cambió {when}: hay {sum(inv):,} en estaciones y {transit:,} en tránsito, "
+                f"y el total inicial es {initial_total:,}."
+            )
+
     available_by = np.zeros((n_days, n_franjas), dtype=np.int64)
     used_by = np.zeros((n_days, n_franjas), dtype=np.int64)
     records: list[InterventionRecord] = []
@@ -832,17 +975,21 @@ def simulate(
                 events.time_us[k:k_end], events.code[k:k_end], events.station[k:k_end], events.trip[k:k_end],
                 inv, cap, hi, bmin, state, since, intervals, is_blocked, near, nearest,
             )
-            for total, value in zip((blocked, diverted, no_room, entered, left), counts):
+            for total, value in zip((blocked, diverted, no_room), counts):
                 total[day] += value
+            transit += counts[3]
             k = k_end
         if kind == 0:
+            in_transit[day] = transit  # `day` todavía es el día que termina
             day, carry = payload, 0  # lo que sobró del día anterior no pasa
             _check_bounds(inv, cap, f"al empezar el día {calendar.days[day]}")
+            check_total(f"al empezar el día {calendar.days[day]}")
         elif kind == 1:
             slot = calendar.slots[payload]
             if slot.day_index != day:
                 raise CheckError("Una intervención quedó en un día que no es el suyo.")
             f = slot.franja_index
+            check_total(f"antes de la intervención de {calendar.days[day]} {reglas.franjas[f].nombre}")
             available = shares[f] + carry
             before = np.array(inv, dtype=np.int64)
             before.setflags(write=False)
@@ -873,13 +1020,9 @@ def simulate(
             intervals.append((s, since[s], calendar.end_us, state[s]))
 
     _check_bounds(inv, cap, "al final")
+    check_total("al final del tramo")
+    in_transit[n_days - 1] = transit
     final = np.array(inv, dtype=np.int64)
-    expected = initial_total + int(entered.sum()) - int(left.sum())
-    if int(final.sum()) != expected:
-        raise CheckError(
-            f"El total de bicis no cuadra: hay {int(final.sum())} y debían ser {expected} "
-            "(inicial + entran - salen)."
-        )
     risk_us = bin_risk(intervals, calendar)
     lengths = np.zeros((n_days, len(calendar.labels)), dtype=np.int64)
     np.add.at(lengths, (calendar.bin_day, calendar.bin_label), np.diff(calendar.bin_edges_us))
@@ -893,8 +1036,7 @@ def simulate(
         blocked=blocked,
         diverted=diverted,
         no_room=no_room,
-        entered=entered,
-        left=left,
+        in_transit=in_transit,
         budget_available=available_by,
         budget_used=used_by,
         risk_us=risk_us,

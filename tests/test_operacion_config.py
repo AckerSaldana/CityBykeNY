@@ -41,7 +41,6 @@ umbral_riesgo:
 presupuestos_por_estacion: [0, 0.5, 1.0]
 presupuesto_de_referencia: 0.5
 distancia_maxima_km: 3.0
-tipo_si_falta: mixta
 estrategia_por_tipo:
 """ + "".join(
     f"  {tipo}:\n    prioridad: 2\n    ocupacion_respaldo:\n      manana: 0.5\n      tarde: 0.5\n"
@@ -72,11 +71,11 @@ def test_estan_los_parametros_de_las_cinco_preguntas(cfg):
         "presupuesto_de_referencia",
         "distancia_maxima_km",
         "estrategia_por_tipo",
-        "tipo_si_falta",
     ):
         assert parametro in cfg
     assert all("parte_del_presupuesto" in franja for franja in cfg["franjas"])
     assert "presupuestos_diarios" not in cfg  # el nombre anterior, con otra unidad
+    assert "tipo_si_falta" not in cfg  # ya no se usa: una estación sin tipo no toma la estrategia de otro
 
 
 # --- De aquí en adelante ninguna prueba lee config/operacion.yaml ---
@@ -338,34 +337,18 @@ def test_una_sola_franja_se_lleva_todo_el_presupuesto():
     assert any("deben sumar 1 y suman 0.5 (manana 0.5)" in problem for problem in validate_operacion(cfg))
 
 
-# --- Pregunta 5: tipo que se aplica a una estación sin tipo ---
+# --- Pregunta 5: `tipo_si_falta` ya no existe ---
 
 
-@pytest.mark.parametrize("tipo", STATION_TYPES)
-def test_tipo_si_falta_acepta_cualquiera_de_los_tipos(tipo):
-    bueno = copy.deepcopy(BASE)
-    bueno["tipo_si_falta"] = tipo
-    assert validate_operacion(bueno) == []
-
-
-@pytest.mark.parametrize(
-    "cambio, texto_esperado",
-    [
-        (lambda c: c.pop("tipo_si_falta"), "(falta)"),
-        (lambda c: c.update(tipo_si_falta=None), "(falta)"),
-        (lambda c: c.update(tipo_si_falta="comercial"), "(dice 'comercial')"),
-        (lambda c: c.update(tipo_si_falta="Mixta"), "(dice 'Mixta')"),
-        (lambda c: c.update(tipo_si_falta=2), "(dice 2)"),
-        (lambda c: c.update(tipo_si_falta=["mixta"]), "(dice ['mixta'])"),
-    ],
-)
-def test_detecta_un_tipo_si_falta_imposible(cambio, texto_esperado):
-    roto = copy.deepcopy(BASE)
-    cambio(roto)
-    problems = validate_operacion(roto)
+@pytest.mark.parametrize("valor", ["mixta", "oficinas", None, 2])
+def test_tipo_si_falta_ya_no_se_acepta_y_el_mensaje_dice_que_se_borre(valor):
+    """Una estación sin tipo ya no toma la estrategia de otro tipo: la clave vieja no debe quedar en el archivo."""
+    viejo = copy.deepcopy(BASE)
+    viejo["tipo_si_falta"] = valor
+    problems = validate_operacion(viejo)
     assert len(problems) == 1, problems
-    assert problems[0].startswith(f"tipo_si_falta: debe ser uno de {list(STATION_TYPES)}")
-    assert texto_esperado in problems[0]
+    assert problems[0].startswith("tipo_si_falta: esta clave ya no se usa, bórrala")
+    assert "sin tipo" in problems[0]
 
 
 # --- Leer el archivo: errores de escritura ---
@@ -417,7 +400,6 @@ def test_un_archivo_con_un_umbral_en_0_no_se_carga(tmp_path):
         ("[0, 0.5, 1.0]", "[0, 0.5, 1.0", "Revisa de la línea 18 a la 19,"),
         ("parte_del_presupuesto: 0.5", "parte_del_presupuesto:0.5", "Revisa de la línea 9 a la 10,"),
         ("presupuesto_de_referencia: 0.5", "presupuesto_de_referencia:0.5", "Revisa de la línea 19 a la 20,"),
-        ("tipo_si_falta: mixta", "tipo_si_falta:mixta", "Revisa de la línea 21 a la 22,"),
     ],
     ids=[
         "tabulador",
@@ -428,7 +410,6 @@ def test_un_archivo_con_un_umbral_en_0_no_se_carga(tmp_path):
         "corchete_sin_cerrar",
         "falta_espacio_en_la_parte_del_presupuesto",
         "falta_espacio_en_el_presupuesto_de_referencia",
-        "falta_espacio_en_tipo_si_falta",
     ],
 )
 def test_un_archivo_mal_escrito_se_explica_sin_traza_de_yaml(tmp_path, viejo, nuevo, donde):

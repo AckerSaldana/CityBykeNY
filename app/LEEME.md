@@ -274,7 +274,7 @@ final.
 | `start_inventory_target` | Bicis con las que la estación queda en la simulación justo después del traslado de esa política (las que tenía más `bikes_to_move`). **No es el inventario ideal:** si el presupuesto no alcanzó, es el mismo que ya tenía y puede estar bajo el umbral de riesgo. |
 | `bikes_to_move` | Bicis que la política movió con el presupuesto de referencia. **Positivo es llevar bicis a la estación. Negativo es retirarlas.** Cero con riesgo alto casi siempre quiere decir que el presupuesto no alcanzó, no que la estación esté bien. |
 | `risk_level` | `alto`, `medio` o `bajo`. Se calcula con el pronóstico y con el inventario de ANTES del traslado. Puede cambiar de una política a otra. |
-| `feasible` | Verdadero o falso. **Falso: según el pronóstico, ningún inventario inicial evita a la vez que la estación se vacíe y que se llene.** Es igual en las tres políticas. |
+| `feasible` | Verdadero o falso. **Falso: según el pronóstico, ningún inventario inicial evita a la vez que la estación se vacíe y que se llene.** Puede diferir entre políticas, porque cada una usa su pronóstico. |
 
 El traslado se hace a la hora de intervención de la franja
 (`momento_intervencion` en `config/operacion.yaml`): antes de que empiece la

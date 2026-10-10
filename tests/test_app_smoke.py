@@ -662,11 +662,12 @@ def test_ante_la_duda_la_nota_de_simulacion(datos, processed, used, named):
     [
         (("provisional", "baseline"), ["son **provisionales**", "línea base", "no es un modelo entrenado"], ["LightGBM"]),
         (("confirmado", "lgbm"), ["ya estaban confirmadas", "LightGBM"], ["provisionales", "línea base"]),
+        (("provisional", "ninguno"), ["son **provisionales**", "**no se simuló**"], ["línea base", "se alimentó"]),
         (("otro_estado", "otro_modelo"), ["`otro_estado`", "`otro_modelo`"], ["son **provisionales**", "línea base"]),
         (None, ["No se pudo leer el reporte", "no se sabe"], ["son **provisionales**", "línea base", "LightGBM"]),
         ("roto", ["No se pudo leer el reporte", "no se sabe"], ["son **provisionales**", "línea base", "LightGBM"]),
     ],
-    ids=["provisional_y_linea_base", "confirmado_y_lgbm", "valores_desconocidos", "sin_reporte", "reporte_roto"],
+    ids=["provisional_y_linea_base", "confirmado_y_lgbm", "model_no_se_simulo", "valores_desconocidos", "sin_reporte", "reporte_roto"],
 )
 def test_la_nota_dice_lo_que_trae_el_reporte_de_la_corrida(datos, processed, report, present, absent):
     """El estado de las reglas y el pronóstico de "model" no vienen en las tablas: salen del reporte.
@@ -830,7 +831,9 @@ def test_el_reporte_real_de_la_simulacion_trae_lo_que_lee_la_app(datos):
     run = datos.simulation_run()
 
     assert run["rules"] in ("provisional", "confirmado"), run
-    assert run["forecast"] in ("baseline", "lgbm"), run
+    # "ninguno": la política "model" no se simuló porque no había filas "lgbm" en predictions.
+    assert run["forecast"] in ("lgbm", "ninguno"), run
+    assert run["forecast"] in datos.FORECAST_TEXT, run
 
 
 # --------------------------------------------------------------------------- #

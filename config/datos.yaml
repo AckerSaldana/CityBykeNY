@@ -57,15 +57,16 @@ estaciones_excluidas:
 # presupuestos, distancia) están en config/operacion.yaml.
 simulacion:
   # Días de calentamiento. La simulación empieza el primer día del tramo de
-  # validación con un inventario supuesto (ocupacion_respaldo, en
-  # operacion.yaml). Estos primeros días se simulan igual que los demás, pero
-  # NO cuentan en las métricas: sirven para que las estaciones dejen de estar
-  # todas igual de llenas, como en el arranque.
-  # OJO: el calentamiento NO quita la dependencia de ese supuesto.
-  # ocupacion_respaldo fija con cuántas bicis arranca la red. Los traslados no
-  # agregan ni quitan bicis, y un viaje solo cambia el total cuando entra o
-  # sale del conjunto simulado. Por eso el nivel de riesgo simulado y el
-  # riesgo simulado evitado cambian con ese valor, también en el último día.
+  # validación con un inventario supuesto: la ocupación observada en la
+  # captura de GBFS a esa hora (config/gbfs_congelado.csv, de octubre de 2026,
+  # no de los días simulados). Estos primeros días se simulan igual que los
+  # demás, pero NO cuentan en las métricas.
+  # OJO: el calentamiento NO quita la dependencia de ese supuesto. El
+  # inventario inicial fija con cuántas bicis arranca la red y ese total ya
+  # no cambia en toda la corrida (bicis en estaciones más bicis en viaje).
+  # Por eso el nivel de riesgo simulado y el riesgo simulado evitado cambian
+  # con ese inventario, también en el último día (ver
+  # sensibilidad_ocupacion_inicial, abajo).
   # Entero, mayor o igual a 0 y menor que los días del tramo de validación
   # (tiene que quedar al menos un día que sí cuente).
   dias_de_calentamiento: 1
@@ -85,3 +86,28 @@ simulacion:
 
   # Semilla del sorteo: con la misma semilla sale el mismo intervalo.
   semilla: 20260901
+
+  # Banda de incertidumbre: multiplicadores candidatos de la dispersión del
+  # pronóstico. 0 es sin banda (solo el valor central), 1 es la banda completa
+  # de q10 a q90 y 0.5 la mitad. Con el presupuesto de referencia se simulan
+  # TODOS los candidatos en validación y se usa el que da menos riesgo
+  # simulado, promediado entre las políticas con pronóstico. Ese mismo valor
+  # se aplica igual a la regla histórica y al modelo. Si empatan, gana el que
+  # está antes en la lista.
+  # Lista de números entre 0 y 10, sin repetir, con al menos uno.
+  bandas: [0, 0.5, 1]
+
+  # Franja de noche del REPORTE (no es una franja de operación: ahí no se
+  # interviene). El riesgo se reporta por las franjas de operacion.yaml, por
+  # esta franja de noche y por "resto" (lo que no cae en ninguna). Puede
+  # cruzar la medianoche. Si se encima con una franja de operación, ese
+  # tiempo cuenta en la franja de operación. Horas "HH:MM", de Nueva York.
+  franja_noche: {inicio: "22:00", fin: "06:00"}
+
+  # Sensibilidad al inventario inicial. Además del inventario observado en la
+  # captura de GBFS, la corrida con el presupuesto de referencia se repite
+  # con todas las estaciones a esta fracción de su capacidad (0.5 = a la
+  # mitad). Sirve para ver cuánto cambian los resultados con ese supuesto.
+  # No alimenta las recomendaciones ni la curva.
+  # Lista de números entre 0 y 1, sin repetir. Puede ir vacía: [].
+  sensibilidad_ocupacion_inicial: [0.4, 0.5, 0.6]

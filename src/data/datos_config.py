@@ -5,7 +5,8 @@ tramos (entrenamiento, validación y prueba) están en un solo lugar y no
 escritos en el código.
 
 El bloque `simulacion` trae los ajustes del simulador que no son reglas de
-operación (calentamiento y remuestreo). Solo lo usa el simulador: un archivo
+operación (calentamiento, remuestreo, bandas de incertidumbre candidatas,
+franja de noche del reporte y ocupaciones de la prueba de sensibilidad). Solo lo usa el simulador: un archivo
 sin ese bloque es válido para la limpieza y la línea base, y entonces
 `datos.simulacion` es None.
 """
@@ -16,6 +17,9 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
+import math
+import re
+
 import pandas as pd
 import yaml
 
@@ -24,6 +28,9 @@ from src.paths import DATOS_YAML, TZ
 # Nombre del tramo en el YAML -> nombre en el contrato de predictions.
 SPLIT_NAMES = {"validacion": "val", "prueba": "test"}
 TRAMOS = ("entrenamiento", "validacion", "prueba")
+
+
+_HORA = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
 class DatosError(ValueError):
@@ -59,6 +66,14 @@ class Simulacion:
     remuestreos: int             # veces que se sortean los días para calcular el intervalo
     nivel_del_intervalo: float   # 0.90 es un intervalo del 90 %
     semilla: int                 # semilla del sorteo: misma semilla, mismo intervalo
+    # Multiplicadores candidatos de la banda de incertidumbre (0 = sin banda, 1 = q10 a q90). Se elige uno
+    # con validación y se aplica igual a todas las políticas con pronóstico.
+    bandas: tuple[float, ...]
+    # Franja de noche del reporte, ("HH:MM", "HH:MM"); puede cruzar la medianoche. No es una franja de operación.
+    franja_noche: tuple[str, str]
+    # Ocupaciones planas (fracción de la capacidad) con las que se repite la corrida de referencia para ver
+    # cuánto depende el resultado del inventario inicial. Puede ir vacía.
+    sensibilidad_ocupacion_inicial: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -94,7 +109,8 @@ def _simulacion(raw, validacion: Tramo | None, problems: list[str]) -> Simulacio
     """Valida el bloque `simulacion`. `validacion` es None si los tramos ya traen algún problema."""
     if not isinstance(raw, dict):
         problems.append(
-            "simulacion: debe ser un bloque con dias_de_calentamiento, remuestreos, nivel_del_intervalo y semilla"
+            "simulacion: debe ser un bloque con dias_de_calentamiento, remuestreos, nivel_del_intervalo, semilla, "
+            "bandas, franja_noche y sensibilidad_ocupacion_inicial"
         )
         return None
     antes = len(problems)
@@ -126,6 +142,37 @@ def _simulacion(raw, validacion: Tramo | None, problems: list[str]) -> Simulacio
     if not _es_entero(semilla) or semilla < 0:
         problems.append("simulacion.semilla: debe ser un número entero mayor o igual a 0")
 
+    def numeros(valor, minimo: float, maximo: float) -> bool:
+        return isinstance(valor, list) and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and minimo <= v <= maximo
+            for v in valor
+        ) and len(set(valor)) == len(valor)
+
+    bandas = raw.get("bandas")
+    if not numeros(bandas, 0, 10) or not bandas:
+        problems.append(
+            "simulacion.bandas: debe ser una lista con al menos un multiplicador de la banda de incertidumbre, "
+            "entre 0 y 10 y sin repetir (por ejemplo [0, 0.5, 1]; 0 es sin banda y 1 es de q10 a q90)"
+        )
+
+    noche = raw.get("franja_noche")
+    if (
+        not isinstance(noche, dict)
+        or not all(isinstance(noche.get(k), str) and _HORA.match(noche[k]) for k in ("inicio", "fin"))
+        or noche["inicio"] == noche["fin"]
+    ):
+        problems.append(
+            'simulacion.franja_noche: debe tener inicio y fin como horas "HH:MM" entre comillas y distintas '
+            '(puede cruzar la medianoche: inicio "22:00", fin "06:00")'
+        )
+
+    sensibilidad = raw.get("sensibilidad_ocupacion_inicial")
+    if not numeros(sensibilidad, 0, 1):
+        problems.append(
+            "simulacion.sensibilidad_ocupacion_inicial: debe ser una lista de fracciones de la capacidad entre "
+            "0 y 1, sin repetir (por ejemplo [0.4, 0.5, 0.6]; puede ir vacía: [])"
+        )
+
     if len(problems) > antes:
         return None
     return Simulacion(
@@ -133,6 +180,9 @@ def _simulacion(raw, validacion: Tramo | None, problems: list[str]) -> Simulacio
         remuestreos=remuestreos,
         nivel_del_intervalo=float(nivel),
         semilla=semilla,
+        bandas=tuple(float(v) for v in bandas),
+        franja_noche=(noche["inicio"], noche["fin"]),
+        sensibilidad_ocupacion_inicial=tuple(float(v) for v in sensibilidad),
     )
 
 
