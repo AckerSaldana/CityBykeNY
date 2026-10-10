@@ -99,6 +99,28 @@ def como_se_calculo(lineas) -> None:
         with st.expander(TITULO_DESPLEGABLE):
             st.markdown("\n".join(f"- {linea}" for linea in lineas))
 
+
+def redondo(x) -> str:
+    """Cifra grande en palabras llanas: 15,017,726 -> "15 millones"; 784,929 -> "785 mil"; 2,398 -> "2,400".
+    La cifra exacta va aparte, en la nota del indicador."""
+    if _falta(x):
+        return SIN_DATO
+    x = float(x)
+    if abs(x) >= 1e6:
+        millones = x / 1e6
+        escrito = num(millones, 0 if millones >= 10 or round(millones, 1) == round(millones) else 1)
+        return f"{escrito} {'millón' if escrito == '1' else 'millones'}"
+    if abs(x) >= 1e4:
+        return f"{num(x / 1000)} mil"
+    if abs(x) >= 1000:
+        return num(round(x, -2))
+    return num(x)
+
+
+def explica_riesgo() -> str:
+    """La línea que explica "horas de estación en riesgo" la primera vez que aparece en una página."""
+    return f"Hora de estación en riesgo: {QUE_ES_RIESGO}."
+
 _MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
           "septiembre", "octubre", "noviembre", "diciembre"]
 _DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -765,3 +787,9 @@ def hallazgos() -> list[str]:
     ind = indicadores()
     return [_hallazgo_del_riesgo(ind), _hallazgo_del_presupuesto(ind), _hallazgo_del_modelo(ind),
             _hallazgo_de_contexto(ind)]
+
+
+def recomendaciones() -> pd.DataFrame:
+    """Lo que hizo cada política en TODAS las estaciones, con el presupuesto de referencia
+    (la usa "Plan de la ronda"). Las mismas columnas que `recomendaciones_estacion()`."""
+    return _leer("recomendaciones")

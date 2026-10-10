@@ -11,8 +11,8 @@ import streamlit as st
 import datos  # app/datos.py: el único archivo que sabe dónde están los datos
 
 CUANTAS = 15
-COLOR_BARRA = datos.COLOR_SE_LLENA
-ALTO_FILA = 28
+COLOR_BARRA = "#1B7F8C"  # neutro: ni los colores de las políticas ni los del mapa
+ALTO_FILA = 32
 CORTA_KM = 1.0  # con una mediana menor, las rutas más usadas se describen como tramos cortos
 
 
@@ -35,7 +35,7 @@ def _barras(tabla: pd.DataFrame, valor: str, titulo_valor: str, titulo_eje: str,
     base = alt.Chart(tabla).encode(
         y=alt.Y("nombre:N", sort=orden, title=titulo_eje,
                 # El título va arriba y horizontal: en vertical se encima con los nombres largos.
-                axis=alt.Axis(labelLimit=380, labelPadding=6, ticks=False, titleAngle=0,
+                axis=alt.Axis(labelLimit=460, labelPadding=6, ticks=False, titleAngle=0,
                               titleAnchor="start", titleAlign="right", titleX=-6, titleY=-10)),
         x=alt.X(f"{valor}:Q", title=titulo_valor, scale=alt.Scale(domain=[0, tope], nice=False),
                 axis=alt.Axis(format=",.0f", tickCount=5)),
@@ -44,9 +44,9 @@ def _barras(tabla: pd.DataFrame, valor: str, titulo_valor: str, titulo_eje: str,
     )
     barras = base.mark_bar(color=COLOR_BARRA, cornerRadiusEnd=3)
     # La cifra va dentro de la barra, en blanco: se lee igual con tema claro u oscuro.
-    cifras = base.mark_text(align="right", baseline="middle", dx=-6, fontSize=12, fontWeight="bold",
+    cifras = base.mark_text(align="right", baseline="middle", dx=-6, fontSize=datos.FUENTE_EJE - 1, fontWeight="bold",
                             color="white").encode(text="cifra:N")
-    return (barras + cifras).properties(height=ALTO_FILA * len(tabla) + 50, padding={"top": 22})
+    return datos.estilo_grafica((barras + cifras).properties(height=ALTO_FILA * len(tabla) + 50, padding={"top": 22}))
 
 
 def _distancia(resumen: dict) -> str:
@@ -67,24 +67,25 @@ datos.encabezado("Estaciones y rutas", "viajes")
 ind = datos.indicadores()  # cifras ya calculadas; si faltan las tablas, avisa y se detiene
 periodo = ind.get("periodo") or {}
 
-st.markdown(
-    "Viajes hechos por usuarios entre estaciones durante todo el periodo analizado "
-    f"({datos.fecha(periodo.get('inicio'), con_dia=False)} a {datos.fecha(periodo.get('fin'), con_dia=False)}). "
-    "Solo se cuenta la demanda atendida; no son recorridos de camiones."
-)
-
 a, b, c = st.columns(3)
-a.metric("Viajes analizados", datos.num(ind.get("viajes_analizados")))
-b.metric("Estaciones", datos.num(ind.get("estaciones")))
-c.metric("Pares de estaciones con viajes", datos.num(ind.get("pares_de_estaciones")))
+for columna, titulo, valor in ((a, "Viajes analizados", ind.get("viajes_analizados")),
+                               (b, "Estaciones", ind.get("estaciones")),
+                               (c, "Pares de estaciones con viajes", ind.get("pares_de_estaciones"))):
+    columna.metric(titulo, datos.redondo(valor))
+    if datos.redondo(valor) != datos.num(valor):
+        columna.caption(datos.num(valor))
 
 # --------------------------------------------------------------------------- #
 # Estaciones con más salidas
 # --------------------------------------------------------------------------- #
 
-st.subheader(f"Las {CUANTAS} estaciones con más salidas")
-
 est = datos.top_estaciones(CUANTAS)
+if est.empty or datos.texto(est["nombre"].iloc[0]) == datos.SIN_DATO:
+    st.subheader(f"Las {CUANTAS} estaciones con más salidas")
+else:  # la tabla ya viene de mayor a menor
+    primera = est.sort_values("salidas", ascending=False).iloc[0]
+    st.subheader(f"{datos.texto(primera['nombre'])} es la estación con más salidas")
+
 if est.empty:
     st.info(f"Estaciones con más salidas: {datos.SIN_DATO}.")
 else:
@@ -107,7 +108,9 @@ else:
 # Rutas con más viajes
 # --------------------------------------------------------------------------- #
 
-st.subheader(f"Las {CUANTAS} rutas con más viajes")
+resumen_rutas = ind.get("rutas_mas_usadas") or {}
+mediana_km = resumen_rutas.get("distancia_mediana_km")
+titular_rutas = st.empty()  # se escribe abajo, cuando ya se sabe qué rutas se muestran
 
 con_vueltas = st.toggle(
     "Incluir viajes que salen y vuelven a la misma estación", value=False,
@@ -129,10 +132,23 @@ else:
         _barras(rutas, "viajes", "Viajes en el periodo", "Ruta (origen → destino)",
                 [("origen_txt", "Origen"), ("destino_txt", "Destino")]),
         width="stretch")
-    st.markdown(_distancia(ind.get("rutas_mas_usadas") or {}))
 
+# El titular solo afirma lo que midió el constructor: rutas entre estaciones distintas.
+if not rutas.empty and not con_vueltas and not datos._falta(mediana_km) and mediana_km < CORTA_KM:
+    titular_rutas.subheader("Las rutas más usadas son tramos cortos entre estaciones vecinas")
+else:
+    titular_rutas.subheader(f"Las {CUANTAS} rutas con más viajes")
+
+notas = [
+    "Viajes hechos por usuarios entre estaciones durante todo el periodo analizado "
+    f"({datos.fecha(periodo.get('inicio'), con_dia=False)} a {datos.fecha(periodo.get('fin'), con_dia=False)}).",
+    "Solo se cuenta la demanda atendida; no son recorridos de camiones.",
+]
+if not rutas.empty:
+    notas.append(_distancia(resumen_rutas))
     total = ind.get("viajes_en_rutas")
     if total:
         suma = rutas["viajes"].sum()
-        st.caption(f"Estas {datos.num(len(rutas))} rutas suman {datos.num(suma)} viajes, "
-                   f"{datos.pct(suma / total)} de todos los viajes del periodo.")
+        notas.append(f"Las {datos.num(len(rutas))} rutas de la gráfica suman {datos.num(suma)} viajes, "
+                     f"{datos.pct(suma / total)} de todos los viajes del periodo.")
+datos.como_se_calculo(notas)

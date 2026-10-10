@@ -17,7 +17,8 @@ import streamlit as st
 
 TIPOS_ESTACION = {"oficinas": "Oficinas", "residencial": "Residencial", "recreativa": "Recreativa",
                   "mixta": "Mixta"}
-COLORES_TIPO = {"oficinas": "#0072B2", "residencial": "#D55E00", "recreativa": "#009E73", "mixta": "#8A8F98"}
+# Colores propios de los tipos de estación: no repiten los de las políticas (gris, naranja, azul, rosa).
+COLORES_TIPO = {"oficinas": "#1B7F8C", "residencial": "#A0522D", "recreativa": "#DDCC77", "mixta": "#C4C7CC"}
 FALTA = "Esta sección todavía no tiene datos: falta preparar la información de empleos y residentes."
 
 
@@ -34,14 +35,16 @@ def mostrar(ruta: str | Path | None = None) -> None:
     import datos  # el único archivo de la app que lee tablas
 
     ruta = Path(ruta) if ruta else datos.ruta_de_contexto()
-    st.subheader("¿El tipo de estación coincide con lo que hay alrededor?")
+    neutro = "¿El tipo de estación coincide con lo que hay alrededor?"
     if not ruta.exists():
+        st.subheader(neutro)
         st.info(FALTA)
         return
     df = datos.tabla_pequena(ruta)
     anio = int(df["anio_datos"].iloc[0]) if "anio_datos" in df.columns and len(df) else None
     df = df[df["proporcion_empleos"].notna() & df["am_indice"].notna() & df["tipo"].notna()].copy()
     if len(df) < 3:
+        st.subheader(neutro)
         st.info(FALTA)
         return
     for col in ["proporcion_empleos", "am_indice", "empleos", "residentes"]:
@@ -57,19 +60,20 @@ def mostrar(ruta: str | Path | None = None) -> None:
     else:
         lectura = ("donde hay más empleos que trabajadores residentes, en la mañana entre semana "
                    "tienden a salir más bicis de las que llegan")
-    st.markdown(
-        f"En {datos.num(len(df))} estaciones, la proporción de empleos a 300 metros y el flujo neto de la "
-        f"mañana tienen una correlación de {datos.num(orden, 1)} (de -1 a 1; 0 es sin relación): {lectura}."
-    )
-    st.markdown(
-        "El tipo de cada estación sale solo de su patrón de uso (a qué horas salen y llegan bicis). Los datos "
-        "de empleo del Censo no se usaron para asignarlo: lo confirman por separado."
-    )
+    # El titular solo afirma una dirección cuando la correlación la sostiene.
+    if math.isnan(orden) or abs(orden) < 0.1:
+        st.subheader(neutro)
+    elif orden > 0:
+        st.subheader("Las estaciones rodeadas de empleos se llenan en la mañana")
+    else:
+        st.subheader("Las estaciones rodeadas de empleos se vacían en la mañana")
+    st.caption("Cada punto es una estación: a la derecha, más empleos alrededor; arriba, llegan más bicis de las "
+               "que salen en la mañana.")
 
     orden_tipos = [TIPOS_ESTACION[t] for t in TIPOS_ESTACION]
     grafica = (
         alt.Chart(df)
-        .mark_circle(size=28, opacity=0.55)
+        .mark_circle(size=45, opacity=0.6)
         .encode(
             x=alt.X("proporcion_empleos:Q", title="Proporción de empleos a 300 metros",
                     axis=alt.Axis(values=[0, 0.2, 0.4, 0.6, 0.8, 1],
@@ -88,20 +92,24 @@ def mostrar(ruta: str | Path | None = None) -> None:
                 alt.Tooltip("residentes:Q", title="Trabajadores residentes a 300 metros", format=",.0f"),
             ],
         )
-        .properties(height=380)
+        .properties(height=400)
     )
-    st.altair_chart(grafica, width="stretch")
+    st.altair_chart(datos.estilo_grafica(grafica), width="stretch")
 
     medianas = df.groupby("tipo")["proporcion_empleos"].median()
     partes = [f"{TIPOS_ESTACION[t]} {datos.pct(medianas[t])}" for t in TIPOS_ESTACION if t in medianas.index]
-    st.markdown("Proporción de empleos en la estación típica de cada tipo (mediana): " + "; ".join(partes) + ".")
     meses = datos.meses_de_historia()
     cuando = "antes de los días de validación" if meses == datos.SIN_DATO else f"de {meses}"
-    st.caption(
+    datos.como_se_calculo([
+        f"En {datos.num(len(df))} estaciones, la proporción de empleos a 300 metros y el flujo neto de la "
+        f"mañana tienen una correlación de {datos.num(orden, 1)} (de -1 a 1; 0 es sin relación): {lectura}.",
+        "El tipo de cada estación sale solo de su patrón de uso (a qué horas salen y llegan bicis). Los datos "
+        "de empleo del Censo no se usaron para asignarlo: lo confirman por separado.",
+        "Proporción de empleos en la estación típica de cada tipo (mediana): " + "; ".join(partes) + ".",
         "Flujo neto de la mañana: llegadas menos salidas entre llegadas más salidas, de 7 a 10 entre semana, "
-        f"{cuando}. Positivo: llegan más bicis de las que salen. "
+        f"{cuando}. Positivo: llegan más bicis de las que salen.",
         "Proporción de empleos: empleos entre empleos más trabajadores residentes. "
-        "Los residentes son trabajadores (personas con empleo, contadas donde viven), no población total. "
+        "Los residentes son trabajadores (personas con empleo, contadas donde viven), no población total.",
         f"Fuente: Oficina del Censo de Estados Unidos (LODES), datos de {anio if anio else 'un año anterior'}, "
-        "anteriores a los viajes de 2026; el Censo agrega ruido a propósito para proteger la confidencialidad."
-    )
+        "anteriores a los viajes de 2026; el Censo agrega ruido a propósito para proteger la confidencialidad.",
+    ])

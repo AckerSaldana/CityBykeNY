@@ -16,11 +16,12 @@ import streamlit as st
 import datos  # app/datos.py: el único archivo que sabe dónde están los datos
 
 SERIE_MODELO = "Modelo"
-SERIE_RANGO = "Rango 10 a 90 del modelo"
+SERIE_RANGO = "Rango esperado"
 SERIE_PROMEDIO = datos.MODELOS["baseline"]
 SERIE_OBSERVADO = "Observado"
 COLOR_TEXTO_RIESGO = {"alto": "#FFFFFF", "medio": "#1A1A1A", "bajo": "#FFFFFF"}
 POLITICAS_CON_TRASLADO = ("historical", "model")  # la primera es la que se muestra al abrir
+COMO_LEER = "La franja es el rango esperado; los puntos, lo que pasó."
 
 datos.encabezado("Pronóstico por estación")
 
@@ -48,7 +49,7 @@ def grafica(modelo: pd.DataFrame, promedio: pd.DataFrame, titulo_y: str) -> alt.
     colores = [datos.COLORES_MODELO["lgbm"], "#9CC7E4", datos.COLORES_MODELO["baseline"], color_observado()]
     color = alt.Color("Serie:N", scale=alt.Scale(domain=series, range=colores),
                       legend=alt.Legend(title=None, orient="top", symbolType="stroke", symbolStrokeWidth=4,
-                                        symbolSize=300, symbolOpacity=1, labelFontSize=13))
+                                        symbolSize=300, symbolOpacity=1))
     eje_x = alt.X("Hora:Q", title="Hora del día", scale=alt.Scale(domain=[0, 23], nice=False),
                   axis=alt.Axis(values=list(range(24)), grid=False,
                                 labelExpr="datum.value < 10 ? '0' + datum.value : '' + datum.value"))
@@ -69,7 +70,7 @@ def grafica(modelo: pd.DataFrame, promedio: pd.DataFrame, titulo_y: str) -> alt.
     capas.append(alt.Chart(serie(modelo, "q50", SERIE_MODELO)).mark_line(strokeWidth=3).encode(
         x=eje_x, y=eje_y, color=color))
     capas.append(alt.Chart(serie(modelo, "observado", SERIE_OBSERVADO)).mark_point(
-        filled=True, size=70, opacity=1, stroke="#808080", strokeWidth=1).encode(x=eje_x, y=eje_y, color=color))
+        filled=True, size=110, opacity=1, stroke="#808080", strokeWidth=1).encode(x=eje_x, y=eje_y, color=color))
 
     # Una franja invisible por hora que muestra todos los valores al pasar el cursor.
     detalle = pd.DataFrame({
@@ -87,25 +88,28 @@ def grafica(modelo: pd.DataFrame, promedio: pd.DataFrame, titulo_y: str) -> alt.
     capas.append(alt.Chart(detalle).mark_rect(opacity=0).encode(
         x=alt.X("Desde:Q", title="Hora del día"), x2="Hasta:Q",
         tooltip=[alt.Tooltip(f"{c}:N") for c in campos]))
-    return alt.layer(*capas).properties(height=380)
+    return datos.estilo_grafica(alt.layer(*capas).properties(height=380))
 
 
 def tarjeta(fila: pd.Series, riesgo_sin_mover, ronda: dict | None = None) -> None:
-    """Lo que hizo una política en una franja: acción, nivel de riesgo e inventario simulado."""
+    """Lo que hizo una política en una franja: la acción en grande y, en un renglón, los niveles de riesgo.
+
+    El nivel de la tabla es el previsto con el inventario ANTES del traslado de esa política (no el que
+    queda después): por eso se escribe "Riesgo previsto" y no "Riesgo tras el traslado".
+    """
     nivel = fila["nivel_riesgo"]
     with st.container(border=True):
         st.caption(f"{datos.etiqueta(datos.FRANJAS, fila['franja'])} · "
                    f"{datos.hora(fila['hora_inicio'])} a {datos.hora(fila['hora_fin'])}")
-        st.markdown(f"#### {datos.accion(fila['bicis'], fila['hora_inicio'], ronda)}")
+        st.markdown(f"### {datos.accion(fila['bicis'], fila['hora_inicio'], ronda)}")
         fondo = datos.COLORES_RIESGO.get(nivel, "#8A8F98")
         letra = COLOR_TEXTO_RIESGO.get(nivel, "#FFFFFF")
         st.markdown(
             f'<span style="background:{fondo};color:{letra};padding:3px 12px;border-radius:12px;'
-            f'font-weight:600">Riesgo simulado: {datos.etiqueta(datos.RIESGOS, nivel)}</span>',
+            f'font-weight:600">Riesgo previsto: {datos.etiqueta(datos.RIESGOS, nivel).lower()}.</span> '
+            f"Sin intervenir: {datos.etiqueta(datos.RIESGOS, riesgo_sin_mover).lower()}",
             unsafe_allow_html=True)
         st.markdown(f"En la estación: **{datos.inventario(fila['inventario_antes'], fila['inventario'])}**")
-        st.caption(f"{datos.POLITICAS['none']}: riesgo simulado "
-                   f"{datos.etiqueta(datos.RIESGOS, riesgo_sin_mover).lower()}")
         if not datos._falta(fila["factible"]) and not bool(fila["factible"]):
             st.markdown("Ningún inventario inicial evita los dos riesgos (quedar casi vacía y quedar casi "
                         "llena) en esta franja: conviene una segunda visita durante la franja.")
@@ -174,28 +178,40 @@ m4.metric(f"{nombre_objetivo} observadas en el día",
 if ficha.get("sin_historia"):
     st.caption("Esta estación no tiene historia propia: su pronóstico es el promedio del sistema, no el suyo.")
 
-st.subheader(f"{nombre_objetivo} por hora")
 if modelo_dia.empty:
+    st.subheader(f"{nombre_objetivo} por hora")
     st.info("No hay pronóstico del modelo para esta estación en este día.")
 else:
-    st.altair_chart(grafica(por_hora(modelo_dia), por_hora(promedio_dia) if not promedio_dia.empty else promedio_dia,
+    horas_del_dia = por_hora(modelo_dia)
+    con_dato = horas_del_dia.dropna(subset=["q10", "q90", "observado"])
+    dentro = int(((con_dato["observado"] >= con_dato["q10"]) & (con_dato["observado"] <= con_dato["q90"])).sum())
+    if len(con_dato):
+        st.subheader(f"Lo que pasó cayó dentro del rango esperado en {datos.num(dentro)} de "
+                     f"{datos.num(len(con_dato))} horas")
+    else:
+        st.subheader(f"{nombre_objetivo} por hora")
+    st.caption(COMO_LEER)
+    st.altair_chart(grafica(horas_del_dia, por_hora(promedio_dia) if not promedio_dia.empty else promedio_dia,
                             f"{nombre_objetivo} por hora"), width="stretch")
-    st.caption("Los datos solo registran la demanda atendida: un viaje que no se pudo hacer porque la "
-               "estación estaba vacía o llena no aparece en lo observado.")
+    datos.como_se_calculo([
+        "El rango esperado va del percentil 10 al 90 del pronóstico del modelo.",
+        "Los datos solo registran la demanda atendida: un viaje que no se pudo hacer porque la "
+        "estación estaba vacía o llena no aparece en lo observado.",
+    ])
 
 # --------------------------------------------------------------------------- #
 # Tarjetas de acción
 # --------------------------------------------------------------------------- #
 
-st.subheader("Traslados simulados por franja")
 rec_dia = rec[pd.to_datetime(rec["fecha"]).dt.normalize() == dia] if not rec.empty else rec
+titular_traslados = st.empty()  # se escribe abajo, cuando ya se eligió la política
+titular_traslados.subheader("Traslados simulados por franja")
 if rec.empty or not ficha.get("simulada", True):
     st.info("Esta estación no se simuló: no tiene capacidad conocida o no tuvo viajes en esos días.")
 elif rec_dia.empty:
     st.info("Este día no entró en la simulación para esta estación.")
 else:
     presupuesto = (ind.get("referencia") or {}).get("presupuesto")
-    st.caption(f"Presupuesto de referencia: {datos.num(presupuesto)} bicis al día en todo el sistema.")
     # Las opciones son los textos en pantalla; aquí se regresan a su clave.
     por_texto = {datos.POLITICAS[p]: p for p in POLITICAS_CON_TRASLADO}
     politica = por_texto[st.radio("Política", list(por_texto), horizontal=True, key="pron_politica")]
@@ -205,6 +221,19 @@ else:
     if filas.empty:
         st.caption(datos.SIN_DATO)
     else:
+        movidas = int(filas["bicis"].dropna().abs().sum())
+        nombre_politica = datos.POLITICAS[politica]
+        titular_traslados.subheader(
+            f"{nombre_politica}: sin traslados en esta estación ese día" if movidas == 0 else
+            f"{nombre_politica}: {datos.num(movidas)} {'bici movida' if movidas == 1 else 'bicis movidas'} "
+            "en esta estación ese día")
+        st.caption(f"Riesgo: {datos.QUE_ES_RIESGO}.")
         for columna, (_, fila) in zip(st.columns(len(filas)), filas.iterrows()):
             with columna:
                 tarjeta(fila, sin_mover.get(fila["franja"]), rondas.get(fila["franja"]))
+    datos.como_se_calculo([
+        f"Presupuesto de referencia: {datos.num(presupuesto)} bicis al día en todo el sistema.",
+        "El riesgo previsto es el nivel de riesgo simulado con las bicis que hay en la estación antes del "
+        "traslado de esa franja, siguiendo la política elegida; no es el nivel que queda después de moverlas.",
+        f"«{datos.POLITICAS['none']}» es el mismo nivel en la simulación en la que no se mueve ninguna bici.",
+    ])

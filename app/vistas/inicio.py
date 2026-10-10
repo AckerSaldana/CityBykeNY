@@ -1,6 +1,6 @@
-"""Página "Inicio": el problema, cuatro indicadores, la curva de riesgo contra
-presupuesto (con el punto de mover al azar), cuatro hallazgos y, cuando ya se corrió la prueba final, la
-comparación de validación contra prueba final. Ninguna cifra está escrita a
+"""Página "Inicio": el problema, cuatro indicadores, cuatro hallazgos, la curva de riesgo contra
+presupuesto (con el punto de mover al azar) y, cuando ya se corrió la prueba final, la
+comparación de validación contra prueba final. Cada sección abre con una frase que dice el hallazgo. Ninguna cifra está escrita a
 mano: todas salen de app/datos.py, así que cambian solas al reconstruir las tablas."""
 
 import altair as alt
@@ -11,7 +11,7 @@ import datos  # app/datos.py: el único archivo que sabe dónde están los datos
 EJE_X = "Bicis movidas por día"
 EJE_Y = "Horas de estación en riesgo por día"
 COLOR_REFERENCIA = "#8A8F98"
-ALTO = 340  # alto del área de la gráfica, en pixeles
+ALTO = 360  # alto del área de la gráfica, en pixeles
 
 datos.encabezado("Rebalanceo de Citi Bike en Nueva York", "inicio")
 
@@ -54,41 +54,85 @@ else:
     nota_viajes = f"Periodo: {datos.SIN_DATO}"
 
 # Riesgo simulado evitado: el rango entre los inventarios iniciales supuestos, no solo el valor más alto.
-valor_evitado, nota_evitado = datos.pct(evitado.get("pct_evitado")), datos.SIN_DATO
+# Bajo cada indicador va una sola línea; el detalle baja al desplegable del final de la página.
+valor_evitado, nota_evitado = datos.pct(evitado.get("pct_evitado"), 0), datos.SIN_DATO
+detalle_evitado = []
 if clave is not None:
     rango = ((ind.get("sensibilidad") or {}).get("rango") or {}).get(clave) or {}
     nota_evitado = f"{datos.POLITICAS[clave]}, con {datos.num(presupuesto)} bicis movidas al día"
+    detalle_evitado.append(f"Riesgo simulado evitado con la {datos.POLITICAS[clave].lower()} y el presupuesto de "
+                           f"referencia: {datos.pct(evitado.get('pct_evitado'))}.")
     if rango.get("pct_min") is not None and rango.get("pct_max") is not None:
         valor_evitado = datos.rango_pct(rango["pct_min"], rango["pct_max"])
-        nota_evitado += ", según el inventario inicial que se suponga"
-    nota_evitado += "."
+        detalle_evitado.append("El rango del indicador depende del inventario inicial que se suponga.")
     if clave == "historical" and politicas.get("model"):
-        nota_evitado += (f" El {datos.POLITICAS['model'].lower()} da prácticamente el mismo resultado."
-                         if mismo_resultado else
-                         f" Con el {datos.POLITICAS['model'].lower()}: {datos.pct(politicas['model'].get('pct_evitado'))}.")
+        detalle_evitado.append(f"El {datos.POLITICAS['model'].lower()} da prácticamente el mismo resultado."
+                               if mismo_resultado else
+                               f"Con el {datos.POLITICAS['model'].lower()}: {datos.pct(politicas['model'].get('pct_evitado'))}.")
     al_azar = (ind.get("piso_de_azar") or {}).get("pct_evitado")
     if al_azar is not None:
-        nota_evitado += f" Mover las mismas bicis al azar evita {datos.pct(al_azar)}."
+        detalle_evitado.append(f"Mover las mismas bicis al azar evita {datos.pct(al_azar)}.")
 
-nota_error = f"Salidas, con el {datos.MODELOS['lgbm'].lower()}."
+nota_error = f"Salidas, con el {datos.MODELOS['lgbm'].lower()}: {datos.pct(error.get('wape'))}"
+detalle_error = []
 if error_promedio.get("wape") is not None:
-    nota_error += f" Con el {datos.MODELOS['baseline'].lower()}: {datos.pct(error_promedio['wape'])}."
+    detalle_error.append(f"Error del pronóstico de salidas con el {datos.MODELOS['baseline'].lower()}: "
+                         f"{datos.pct(error_promedio['wape'])}.")
 if error_media_global.get("wape") is not None:
-    nota_error += f" Con una sola media para todo el sistema: {datos.pct(error_media_global['wape'])}."
+    detalle_error.append("Error del pronóstico de salidas con una sola media para todo el sistema: "
+                         f"{datos.pct(error_media_global['wape'])}.")
 
-c1, c2, c3, c4 = st.columns([4, 3, 4, 5])  # el último título es largo
-indicador(c1, "Viajes analizados", datos.num(ind.get("viajes_analizados")), nota_viajes)
-indicador(c2, "Estaciones", datos.num(ind.get("estaciones")),
-          f"{datos.num(simulacion.get('estaciones_simuladas'))} en la simulación")
+c1, c2, c3, c4 = st.columns(4)
+indicador(c1, "Viajes analizados", datos.redondo(ind.get("viajes_analizados")),
+          f"{datos.num(ind.get('viajes_analizados'))} viajes")
+indicador(c2, "Estaciones", datos.redondo(ind.get("estaciones")),
+          f"{datos.num(ind.get('estaciones'))} en total; {datos.num(simulacion.get('estaciones_simuladas'))} en la simulación")
 indicador(c3, "Riesgo simulado evitado", valor_evitado, nota_evitado)
-indicador(c4, "Error del pronóstico por hora y estación", datos.pct(error.get("wape")), nota_error)
+indicador(c4, "Error del pronóstico", datos.pct(error.get("wape"), 0), nota_error)
+
+
+# --------------------------------------------------------------------------- #
+# Cuatro hallazgos (a la vista sin bajar)
+# --------------------------------------------------------------------------- #
+
+def titular_de_hallazgos() -> str:
+    """El hallazgo principal, con la cifra de los datos; sin cifra, un título neutro."""
+    fraccion = evitado.get("pct_evitado")
+    if clave is None or datos._falta(fraccion) or fraccion <= 0:
+        return "Hallazgos"
+    if fraccion > 0.5:
+        return "Planear los traslados evita más de la mitad del riesgo simulado"
+    return f"Planear los traslados evita {datos.pct(fraccion, 0)} del riesgo simulado"
+
+
+st.subheader(titular_de_hallazgos())
+frases = datos.hallazgos()
+izquierda, derecha = st.columns(2, gap="large")
+for numero, frase in enumerate(frases, start=1):
+    with (izquierda if numero % 2 else derecha):
+        st.markdown(f"**{numero}.** {frase}")
 
 
 # --------------------------------------------------------------------------- #
 # Curva de riesgo contra presupuesto
 # --------------------------------------------------------------------------- #
 
-st.subheader("Riesgo simulado contra presupuesto")
+def titular_de_la_curva() -> str:
+    """Qué dice la curva sobre el modelo y la regla histórica en validación; sin veredicto, un título neutro."""
+    if not (politicas.get("historical") and politicas.get("model")):
+        return "Riesgo simulado contra presupuesto"
+    veredicto = datos.modelo_contra_regla(ind)["referencia"].get("validacion")
+    historica, modelo = datos.POLITICAS["historical"], datos.POLITICAS["model"]
+    if veredicto == "igual":
+        return f"{historica} y {modelo} evitan casi el mismo riesgo simulado"
+    if veredicto == "mas":
+        return f"El {modelo.lower()} evita más riesgo simulado que la {historica.lower()}"
+    if veredicto == "menos":
+        return f"La {historica.lower()} evita más riesgo simulado que el {modelo.lower()}"
+    return "Riesgo simulado contra presupuesto"
+
+
+st.subheader(titular_de_la_curva())
 
 curva = datos.curva().dropna(subset=["presupuesto", "riesgo"])
 curva = curva[curva["politica"].isin(datos.POLITICAS)].sort_values(["politica", "presupuesto"])
@@ -96,10 +140,7 @@ curva = curva[curva["politica"].isin(datos.POLITICAS)].sort_values(["politica", 
 if curva.empty:
     st.info(f"Curva de riesgo contra presupuesto: {datos.SIN_DATO}.")
 else:
-    st.markdown(
-        "Cada línea es una forma de decidir los traslados. Mientras más baja, menos horas pasan las "
-        "estaciones casi vacías o casi llenas. La banda es el intervalo de la simulación."
-    )
+    st.caption(f"{datos.explica_riesgo()} Mientras más baja la línea, mejor.")
     claves = [p for p in datos.POLITICAS if p in set(curva["politica"])]
     nombres = [datos.POLITICAS[p] for p in claves]
     colores = [datos.COLORES_POLITICA[p] for p in claves]
@@ -117,7 +158,7 @@ else:
     escala = alt.Scale(domain=nombres, range=colores)
     color = alt.Color("Política:N", scale=escala,
                       legend=alt.Legend(title=None, orient="top", symbolType="stroke", symbolStrokeWidth=3,
-                                        symbolOpacity=1, labelFontSize=13))
+                                        symbolOpacity=1))
     x = alt.X("presupuesto:Q", title=EJE_X, axis=alt.Axis(format=",.0f", grid=False, tickCount=6))
     y = alt.Y("riesgo:Q", title=EJE_Y, axis=alt.Axis(format=",.0f", tickCount=6), scale=alt.Scale(zero=True))
     base = alt.Chart(curva)
@@ -152,7 +193,7 @@ else:
                                       alt.Tooltip("bicis_txt:N", title=EJE_X),
                                       alt.Tooltip("riesgo_txt:N", title=EJE_Y),
                                       alt.Tooltip("evitado_txt:N", title="Riesgo simulado evitado")]))
-        capas.append(punto_azar.mark_text(color=datos.COLOR_AZAR, fontSize=12, fontWeight="bold", baseline="top",
+        capas.append(punto_azar.mark_text(color=datos.COLOR_AZAR, fontSize=datos.FUENTE_EJE, fontWeight="bold", baseline="top",
                                           align="right" if a_la_izquierda else "left",
                                           dx=-9 if a_la_izquierda else 9, dy=5)
                      .encode(x="presupuesto:Q", y="riesgo:Q", text="nombre:N"))
@@ -170,24 +211,22 @@ else:
         }]))
         capas.append(marca.mark_rule(color=COLOR_REFERENCIA, strokeDash=[4, 4], strokeWidth=1.5)
                      .encode(x="presupuesto:Q"))
-        capas.append(marca.mark_text(color=COLOR_REFERENCIA, fontSize=12, baseline="middle",
+        capas.append(marca.mark_text(color=COLOR_REFERENCIA, fontSize=datos.FUENTE_EJE, baseline="middle",
                                      align="left" if a_la_derecha else "right",
                                      dx=6 if a_la_derecha else -6)
                      .encode(x="presupuesto:Q", y="altura:Q", text="texto:N"))
 
-    st.altair_chart(alt.layer(*capas).properties(height=ALTO), width="stretch", height=ALTO + 110)
+    st.altair_chart(datos.estilo_grafica(alt.layer(*capas).properties(height=ALTO)), width="stretch",
+                    height=ALTO + 130)
     frase = datos.frase_de_la_curva() if {"historical", "model"} <= set(claves) else ""
-    if frase:
-        st.caption(frase)
-
-
-# --------------------------------------------------------------------------- #
-# Cuatro hallazgos
-# --------------------------------------------------------------------------- #
-
-st.subheader("Hallazgos")
-for numero, frase in enumerate(datos.hallazgos(), start=1):
-    st.markdown(f"**{numero}.** {frase}")
+    datos.como_se_calculo([
+        "Cada línea es una forma de decidir los traslados; la banda es el intervalo de la simulación.",
+        frase,
+        nota_viajes + "." if not nota_viajes.endswith(".") else nota_viajes,
+        *detalle_evitado,
+        "El error del pronóstico es el error relativo por hora y estación, en validación.",
+        *detalle_error,
+    ])
 
 
 # --------------------------------------------------------------------------- #
@@ -211,5 +250,4 @@ if comparacion["filas"]:
         notas.append(f"Con {datos.num(comparacion['presupuesto'])} bicis movidas al día.")
     if any("(" in f["validacion"] or "(" in f["prueba"] for f in comparacion["filas"]):
         notas.append("Entre paréntesis, el intervalo.")
-    if notas:
-        st.caption(" ".join(notas))
+    datos.como_se_calculo(notas)

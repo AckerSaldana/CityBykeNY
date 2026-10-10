@@ -82,14 +82,16 @@ def test_abre_con_el_mapa_y_los_tres_selectores(datos):
     puntos = puntos_del_mapa(at)
     assert len(puntos) == len(datos.demanda_mapa(8, "laborable", "todos"))
     assert len(at.get("vega_lite_chart")) == 1  # demanda por hora del día
-    notas = " ".join(c.value for c in at.caption)
+    notas = " ".join(m.value for m in at.markdown)  # las aclaraciones van en "Cómo se calculó"
     assert "demanda atendida" in notas and "no separan las llegadas" in notas
 
     # Una frase en lugar de dos cifras sueltas, con las cuentas de la selección.
     flujo = datos.demanda_mapa(8, "laborable", "todos")["flujo_neto"]
     se_vacian, se_llenan = int((flujo <= -0.05).sum()), int((flujo >= 0.05).sum())
-    frase = next(m.value for m in at.markdown if "a llenarse" in m.value)
-    assert f"{datos.num(se_vacian)} estaciones tienden a vaciarse y {datos.num(se_llenan)} a llenarse" in frase
+    # El titular del mapa dice el hallazgo con las cuentas de la selección, y la leyenda va antes del mapa.
+    frase = next(s.value for s in at.subheader if "08:00" in s.value)
+    assert f"{datos.num(se_vacian)} estaciones se vacían y {datos.num(se_llenan)} se llenan" in frase
+    assert any("Se vacía" in m.value and "Se llena" in m.value for m in at.markdown)
     assert [m.label for m in at.metric] == ["Salidas en esa hora"]
 
 

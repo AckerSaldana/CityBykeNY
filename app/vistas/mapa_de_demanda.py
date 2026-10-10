@@ -23,8 +23,8 @@ ESTADOS = {
     "se_llena": ("Se llena", datos.COLOR_SE_LLENA, "llegan más bicis de las que salen"),
     "equilibrio": ("En equilibrio", COLOR_EQUILIBRIO, "salen y llegan casi las mismas"),
 }
-# Colores que se leen igual en tema claro y en tema oscuro.
-COLORES_DIA = {"laborable": "#CC79A7", "fin_de_semana": "#009E73"}
+# Par propio de esta gráfica: ni los colores de las políticas ni los del mapa.
+COLORES_DIA = {"laborable": "#1B7F8C", "fin_de_semana": "#A0522D"}
 # Mapas base de Carto: no necesitan llave de Mapbox.
 MAPAS_BASE = {"light": "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
               "dark": "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"}
@@ -144,7 +144,7 @@ def _demanda_por_hora(usuario: str, hora_elegida: int | None) -> alt.Chart:
     if hora_elegida is not None:
         marca = pd.DataFrame({"hora": [int(hora_elegida)]})
         capas.insert(0, alt.Chart(marca).mark_rule(color=COLOR_EQUILIBRIO, strokeDash=[4, 4]).encode(x="hora:Q"))
-    return alt.layer(*capas).properties(height=330)
+    return datos.estilo_grafica(alt.layer(*capas).properties(height=330))
 
 
 datos.encabezado("Mapa de demanda", "viajes")
@@ -159,8 +159,6 @@ tipo_dia = c_dia.radio("Tipo de día", list(datos.TIPOS_DIA), index=list(datos.T
                        format_func=datos.TIPOS_DIA.get)
 usuario = c_usuario.radio("Tipo de usuario", list(datos.USUARIOS), key="mapa_usuario", horizontal=True,
                           format_func=datos.USUARIOS.get)
-st.caption("El tipo de usuario solo cambia las salidas: los datos no separan las llegadas por tipo de usuario. "
-           "Es demanda atendida (viajes que sí se hicieron), no toda la demanda.")
 
 mapa = datos.demanda_mapa(hora_elegida, tipo_dia, usuario)
 mapa = mapa[mapa["lat"].notna() & mapa["lon"].notna()]
@@ -176,22 +174,44 @@ estados = mapa["flujo_neto"].map(_estado)
 # --- Mapa y demanda por hora ------------------------------------------------ #
 c_mapa, c_lado = st.columns([3, 2], gap="large")
 
+se_vacian, se_llenan = int((estados == "se_vacia").sum()), int((estados == "se_llena").sum())
+dia_texto = datos.TIPOS_DIA[tipo_dia].lower()
+
+
+def _titular_del_pico() -> str:
+    """A qué hora hay más viajes en el tipo de día elegido; sin datos, un título neutro."""
+    columna = {"miembros": "salidas_miembros", "ocasionales": "salidas_ocasionales"}.get(usuario, "salidas")
+    sistema = datos.demanda_sistema()
+    del_dia = sistema[(sistema["tipo_dia"] == tipo_dia) & sistema[columna].notna()]
+    if del_dia.empty or float(del_dia[columna].max()) <= 0:
+        return "Demanda por hora del día"
+    pico = del_dia.loc[del_dia[columna].idxmax(), "hora"]
+    return f"En día {dia_texto}, la hora con más viajes es la de las {datos.hora(pico)}"
+
+
 with c_mapa:
-    st.subheader(f"Estaciones, {datos.TIPOS_DIA[tipo_dia].lower()}, {momento}")
-    st.pydeck_chart(_mapa(puntos, unidad), height=540)
+    cuando = "En todo el día" if hora_elegida is None else f"A las {datos.hora(hora_elegida)}"
+    st.subheader(f"{cuando} en día {dia_texto}, {datos.num(se_vacian)} "
+                 f"{'estación se vacía' if se_vacian == 1 else 'estaciones se vacían'} y "
+                 f"{datos.num(se_llenan)} {'se llena' if se_llenan == 1 else 'se llenan'}")
+    # La leyenda va ARRIBA del mapa: primero cómo se lee, después el mapa.
     leyenda = " &nbsp;·&nbsp; ".join(
-        f"<span style='white-space:nowrap'><span style='color:{color}'>●</span> <b>{nombre}</b>: {explicacion}</span>"
+        f"<span style='white-space:nowrap'><span style='color:{color};font-size:1.3em'>●</span> "
+        f"<b>{nombre}</b>: {explicacion}</span>"
         for nombre, color, explicacion in ESTADOS.values())
-    st.markdown(f"<small>{leyenda}.<br/>El tamaño del punto son las salidas promedio {unidad}; "
-                "el color usa a todos los usuarios.</small>", unsafe_allow_html=True)
+    st.markdown(f"{leyenda}. El tamaño del punto son las salidas promedio {unidad}.", unsafe_allow_html=True)
+    st.pydeck_chart(_mapa(puntos, unidad), height=540)
 
 with c_lado:
     st.metric(f"Salidas {unidad}", datos.num(mapa["salidas"].sum()))
-    se_vacian, se_llenan = int((estados == "se_vacia").sum()), int((estados == "se_llena").sum())
-    st.markdown(f"**{datos.num(se_vacian)} {'estación tiende' if se_vacian == 1 else 'estaciones tienden'} a "
-                f"vaciarse y {datos.num(se_llenan)} a llenarse.**")
-    st.caption(f"Promedios de {datos.num(len(mapa))} estaciones, {datos.TIPOS_DIA[tipo_dia].lower()}, {momento}.")
 
-    st.subheader("Demanda por hora del día")
+    st.subheader(_titular_del_pico())
     st.altair_chart(_demanda_por_hora(usuario, hora_elegida), width="stretch")
-    st.caption(f"Viajes iniciados en todo el sistema ({datos.USUARIOS[usuario].lower()}), promedio por día.")
+
+datos.como_se_calculo([
+    f"El mapa muestra promedios de {datos.num(len(mapa))} estaciones, {dia_texto}, {momento}.",
+    "El color del punto es el flujo neto (llegadas menos salidas) de todos los usuarios.",
+    "El tipo de usuario solo cambia las salidas: los datos no separan las llegadas por tipo de usuario.",
+    f"La gráfica son los viajes iniciados en todo el sistema ({datos.USUARIOS[usuario].lower()}), promedio por día.",
+    "Es demanda atendida (viajes que sí se hicieron), no toda la demanda.",
+])

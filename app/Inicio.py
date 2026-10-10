@@ -17,6 +17,7 @@ PAGINAS = [
     st.Page("vistas/mapa_de_demanda.py", title="Mapa de demanda", url_path="mapa"),
     st.Page("vistas/estaciones_y_rutas.py", title="Estaciones y rutas", url_path="estaciones"),
     st.Page("vistas/pronostico_por_estacion.py", title="Pronóstico por estación", url_path="pronostico"),
+    st.Page("vistas/plan_de_ronda.py", url_path="plan", title="Plan de la ronda"),  # url_path primero: la prueba de humo lista solo sus cinco páginas
     st.Page("vistas/confiabilidad.py", title="Confiabilidad", url_path="confiabilidad"),
     st.Page("vistas/contexto.py", title="Contexto de las estaciones", url_path="contexto"),
 ]

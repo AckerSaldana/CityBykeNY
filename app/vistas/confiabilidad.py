@@ -26,7 +26,7 @@ MEDIDAS = {
     "mae": ("Error medio", False, "Error medio (viajes por estación y hora)"),
     "cobertura": (f"Cobertura del intervalo {P_BAJO} a {P_ALTO}", True, "Horas dentro del intervalo"),
 }
-ALTURA = 300
+ALTURA = 320
 GRIS = "#8A8F98"  # líneas de referencia: se ve en tema claro y en oscuro
 
 
@@ -76,7 +76,13 @@ def barras(tabla: pd.DataFrame, *, grupos: dict, series: dict, colores: dict, co
 
     eje_y = alt.Axis(title=titulo_eje, labelExpr="format(datum.value * 100, ',.0f') + ' %'") if es_pct \
         else alt.Axis(title=titulo_eje, format=",.0f" if d["valor"].max() >= 10 else ",.1f")
-    x = alt.X("grupo:N", sort=orden_grupos, title=None, axis=alt.Axis(labelAngle=0, labelLimit=160))
+    # Una etiqueta como "Madrugada (00 a 05)" va en dos renglones para que quepan todas con letra grande.
+    en_dos = ("indexof(datum.label, ' (') >= 0 ? [split(datum.label, ' (')[0], '(' + split(datum.label, ' (')[1]] "
+              ": datum.label")
+    x = alt.X("grupo:N", sort=orden_grupos, title=None,
+              axis=alt.Axis(labelAngle=0, labelLimit=220, labelExpr=en_dos, labelOverlap=False))
+    # Con muchas barras las cifras se enciman: ahí van un poco más chicas.
+    letra = datos.FUENTE_EJE - 2 if len(orden_grupos) * len(orden_series) <= 9 else datos.FUENTE_EJE - 5
     desplazamiento = alt.XOffset("serie:N", sort=orden_series)
     ayuda = [alt.Tooltip("grupo:N", title=titulo_grupo), alt.Tooltip("serie:N", title=titulo_serie),
              alt.Tooltip("texto:N", title=titulo_eje)]
@@ -92,15 +98,15 @@ def barras(tabla: pd.DataFrame, *, grupos: dict, series: dict, colores: dict, co
     if con_intervalo and d[["bajo", "alto"]].notna().all(axis=None):
         capas.append(base.mark_rule(color=GRIS, strokeWidth=1.5).encode(
             x=x, xOffset=desplazamiento, y="bajo:Q", y2="alto:Q", tooltip=ayuda))
-        capas.append(base.mark_text(dy=-6, fontSize=11, baseline="bottom", color=color_de_texto()).encode(
+        capas.append(base.mark_text(dy=-6, fontSize=letra, baseline="bottom", color=color_de_texto()).encode(
             x=x, xOffset=desplazamiento, y="alto:Q", text="texto:N"))
     else:
-        capas.append(base.mark_text(dy=-4, fontSize=11, baseline="bottom", color=color_de_texto()).encode(
+        capas.append(base.mark_text(dy=-4, fontSize=letra, baseline="bottom", color=color_de_texto()).encode(
             x=x, xOffset=desplazamiento, y="valor:Q", text="texto:N"))
     if linea is not None:
         capas.append(alt.Chart(pd.DataFrame({"valor": [linea]})).mark_rule(
             strokeDash=[4, 4], color=GRIS).encode(y="valor:Q"))
-    return alt.layer(*capas).properties(height=ALTURA)
+    return datos.estilo_grafica(alt.layer(*capas).properties(height=ALTURA))
 
 
 def mostrar(grafica) -> None:
@@ -119,17 +125,34 @@ metricas = datos.metricas()
 # 1. Promedio histórico contra modelo
 # --------------------------------------------------------------------------- #
 
-st.subheader("El pronóstico: promedio histórico contra modelo")
-
 general = metricas[metricas["corte"] == "general"]
 validacion = ind.get("validacion") or {}
 horas_evaluadas = general["n"].max() if not general.empty else None
-st.markdown(
-    f"Los dos pronósticos se comparan con lo observado en {datos.num(validacion.get('dias'))} días de "
-    f"validación (del {datos.fecha(validacion.get('inicio'), con_dia=False)} al "
-    f"{datos.fecha(validacion.get('fin'), con_dia=False)}), sobre {datos.num(horas_evaluadas)} horas de "
-    "estación. Lo observado es demanda atendida: un viaje que no se pudo hacer no aparece en los datos."
-)
+
+
+def _wape(tabla: pd.DataFrame, modelo: str, objetivo: str = "salidas", grupo: str | None = None):
+    fila = tabla[(tabla["modelo"] == modelo) & (tabla["objetivo"] == objetivo)]
+    if grupo is not None:
+        fila = fila[fila["grupo"] == grupo]
+    return None if fila.empty or pd.isna(fila["wape"].iloc[0]) else float(fila["wape"].iloc[0])
+
+
+def titular_del_pronostico() -> str:
+    """Quién se equivoca menos al pronosticar salidas; sin las dos cifras, un título neutro."""
+    del_modelo, del_promedio = _wape(general, "lgbm"), _wape(general, "baseline")
+    modelo, promedio = datos.MODELOS["lgbm"].lower(), datos.MODELOS["baseline"].lower()
+    if del_modelo is None or del_promedio is None:
+        return "El pronóstico: promedio histórico contra modelo"
+    cifras = f"{datos.pct(del_modelo, 0)} de error contra {datos.pct(del_promedio, 0)}"
+    if datos.pct(del_modelo, 0) == datos.pct(del_promedio, 0):
+        return f"El {modelo} y el {promedio} se equivocan casi lo mismo"
+    if del_modelo < del_promedio:
+        return f"El {modelo} se equivoca menos que el {promedio}: {cifras}"
+    return f"El {modelo} se equivoca más que el {promedio}: {cifras}"
+
+
+st.subheader(titular_del_pronostico())
+st.caption(f"Los dos pronósticos, contra lo que pasó en {datos.num(validacion.get('dias'))} días de validación.")
 
 
 def cifra(modelo: str, objetivo: str, medida: str) -> str:
@@ -149,20 +172,23 @@ for columna, objetivo in zip(st.columns(2, gap="large"), datos.OBJETIVOS):
                           + " | ".join(cifra(m, objetivo, medida) for m in datos.MODELOS) + " |")
         st.markdown("\n".join(lineas))
 
-st.markdown(
-    "- **Error relativo (WAPE):** la suma de los errores dividida entre los viajes observados. Menor es mejor.\n"
-    "- **Error medio (MAE):** cuántos viajes se aleja el pronóstico de lo observado, en promedio, por "
-    "estación y hora. Menor es mejor.\n"
-    f"- **Cobertura del intervalo {P_BAJO} a {P_ALTO}:** porcentaje de horas en que lo observado cayó dentro "
+datos.como_se_calculo([
+    f"Validación: del {datos.fecha(validacion.get('inicio'), con_dia=False)} al "
+    f"{datos.fecha(validacion.get('fin'), con_dia=False)}, sobre {datos.num(horas_evaluadas)} horas de estación.",
+    "Lo observado es demanda atendida: un viaje que no se pudo hacer no aparece en los datos.",
+    "**Error relativo (WAPE):** la suma de los errores dividida entre los viajes observados. Menor es mejor.",
+    "**Error medio (MAE):** cuántos viajes se aleja el pronóstico de lo observado, en promedio, por "
+    "estación y hora. Menor es mejor.",
+    f"**Cobertura del intervalo {P_BAJO} a {P_ALTO}:** porcentaje de horas en que lo observado cayó dentro "
     f"del rango pronosticado. Lo esperado es {datos.pct(COBERTURA_ESPERADA, 0)}; por debajo, el rango es "
-    "demasiado estrecho."
-)
+    "demasiado estrecho.",
+])
 
 # --------------------------------------------------------------------------- #
 # 2. Error por bloque de horas y por volumen de demanda
 # --------------------------------------------------------------------------- #
 
-st.subheader("Dónde se equivoca más el pronóstico")
+titular_del_error = st.empty()  # se escribe abajo, cuando ya se eligió salidas o llegadas
 
 c_objetivo, c_medida = st.columns(2)
 # Las opciones son los textos en pantalla; aquí se regresan a su clave.
@@ -173,6 +199,16 @@ medida = por_nombre[c_medida.radio("Medida", list(por_nombre), horizontal=True)]
 _, es_pct, titulo_eje = MEDIDAS[medida]
 del_objetivo = metricas[metricas["objetivo"] == objetivo]
 linea = COBERTURA_ESPERADA if medida == "cobertura" else None
+
+# El titular habla del error relativo del modelo por volumen de demanda; solo afirma si la dirección es clara.
+por_volumen = del_objetivo[del_objetivo["corte"] == "volumen"]
+errores = [_wape(por_volumen, "lgbm", objetivo, grupo) for grupo in ("bajo", "medio", "alto")]
+if None not in errores and errores[0] > errores[1] > errores[2]:
+    titular_del_error.subheader("El pronóstico acierta más donde hay más viajes")
+elif None not in errores and errores[0] < errores[1] < errores[2]:
+    titular_del_error.subheader("El pronóstico acierta más donde hay menos viajes")
+else:
+    titular_del_error.subheader("Dónde se equivoca más el pronóstico")
 
 c_bloque, c_volumen = st.columns(2, gap="large")
 for columna, corte, grupos, titulo, titulo_grupo in (
@@ -187,29 +223,44 @@ for columna, corte, grupos, titulo, titulo_grupo in (
 
 if medida == "cobertura":
     st.caption(f"La línea punteada marca la cobertura esperada, {datos.pct(COBERTURA_ESPERADA, 0)}.")
-elif medida == "wape":
-    st.caption("El error relativo se divide entre los viajes observados: donde hay pocos viajes, un error de "
-               "un solo viaje pesa mucho.")
-else:
-    st.caption("El error medio se mide en viajes por estación y hora: no descuenta que unas estaciones "
-               "tienen más viajes que otras.")
+datos.como_se_calculo([
+    "El error relativo se divide entre los viajes observados: donde hay pocos viajes, un error de "
+    "un solo viaje pesa mucho.",
+    "El error medio se mide en viajes por estación y hora: no descuenta que unas estaciones "
+    "tienen más viajes que otras.",
+])
 
 # --------------------------------------------------------------------------- #
 # 3. Riesgo simulado por franja y por tipo de estación
 # --------------------------------------------------------------------------- #
 
-st.subheader("El riesgo simulado, por franja y por tipo de estación")
+def titular_del_riesgo() -> str:
+    """¿Baja el riesgo simulado con traslados en todas las franjas? Sin las cifras, un título neutro."""
+    horas = datos.riesgo_horas("franja")
+    if horas.empty:
+        return "El riesgo simulado, por franja y por tipo de estación"
+    tabla = horas.pivot_table(index="grupo", columns="politica", values="riesgo", aggfunc="first")
+    con_traslado = [p for p in ("historical", "model") if p in tabla.columns]
+    if "none" not in tabla.columns or not con_traslado:
+        return "El riesgo simulado, por franja y por tipo de estación"
+    tabla = tabla[tabla["none"].fillna(0) > 0].dropna(subset=con_traslado)
+    if len(tabla) and all((tabla[p] < tabla["none"]).all() for p in con_traslado):
+        return "Con traslados, el riesgo simulado baja en todas las franjas del día"
+    return "El riesgo simulado, por franja y por tipo de estación"
+
+
+st.subheader(titular_del_riesgo())
 
 referencia = ind.get("referencia") or {}
 politicas = referencia.get("politicas") or {}
 partes = [f"{datos.POLITICAS['none'].lower()}, {datos.num(referencia.get('riesgo_sin_intervencion'))}"]
 partes += [f"{datos.POLITICAS[p].lower()}, {datos.num((politicas.get(p) or {}).get('riesgo'))}"
            for p in ("historical", "model")]
-st.markdown(
-    "Una hora de estación está en riesgo cuando la estación queda casi vacía o casi llena. Riesgo simulado "
-    f"con un presupuesto de {datos.num(referencia.get('presupuesto'))} bicis al día, en horas de estación en "
-    f"riesgo por día: {'; '.join(partes)}."
-)
+st.caption(datos.explica_riesgo())
+notas_del_riesgo = [
+    f"Riesgo simulado con un presupuesto de {datos.num(referencia.get('presupuesto'))} bicis al día, en horas de "
+    f"estación en riesgo por día: {'; '.join(partes)}.",
+]
 
 
 def riesgo_por(corte: str, grupos: dict, titulo_grupo: str):
@@ -228,8 +279,7 @@ def riesgo_por(corte: str, grupos: dict, titulo_grupo: str):
                          titulo_eje="Horas de estación en riesgo por día", es_pct=False, decimales=0,
                          titulo_grupo=titulo_grupo, titulo_serie="Política", con_intervalo=True)
         if grafica is not None:
-            return grafica, ("Horas de estación en riesgo por día. La línea vertical es el intervalo de "
-                             "confianza.")
+            return grafica, "La línea vertical sobre cada barra es el intervalo de confianza."
     niveles = datos.riesgo_niveles(corte)
     grafica = barras(niveles, grupos=grupos, series=datos.POLITICAS, colores=datos.COLORES_POLITICA,
                      columna_serie="politica", columna_valor="pct_alto",
@@ -247,8 +297,9 @@ for columna, corte, grupos, titulo, titulo_grupo in (
         st.markdown(f"**{titulo}**")
         grafica, nota = riesgo_por(corte, grupos, titulo_grupo)
         mostrar(grafica)
-        if grafica is not None:
-            st.caption(nota)
+        if grafica is not None and nota not in notas_del_riesgo:
+            notas_del_riesgo.append(nota)
+datos.como_se_calculo(notas_del_riesgo)
 
 # --------------------------------------------------------------------------- #
 # 4. Limitaciones

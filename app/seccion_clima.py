@@ -14,7 +14,8 @@ import streamlit as st
 
 TIPOS_DIA = {"laborable": "Laborable", "fin_de_semana": "Fin de semana"}
 CONDICIONES = {"demanda_seco": "Horas secas", "demanda_lluvia": "Horas con lluvia"}
-COLORES = {"demanda_seco": "#E69F00", "demanda_lluvia": "#0072B2"}
+# Par propio: no repite el naranja y el azul de Regla histórica y Modelo.
+COLORES = {"demanda_seco": "#A0522D", "demanda_lluvia": "#1B7F8C"}
 FALTA = "Esta sección todavía no tiene datos: falta preparar la información del clima."
 
 
@@ -36,13 +37,15 @@ def mostrar(ruta: str | Path | None = None) -> None:
     import datos  # el único archivo de la app que lee tablas
 
     ruta = Path(ruta) if ruta else datos.CARPETA / "clima_demanda.parquet"
-    st.subheader("¿Se usan menos las bicis cuando llueve?")
+    neutro = "¿Se usan menos las bicis cuando llueve?"
     if not ruta.exists():
+        st.subheader(neutro)
         st.info(FALTA)
         return
     df = datos.tabla_pequena(ruta).copy()
     r = resumen(df) if len(df) else {"diferencia": None}
     if r["diferencia"] is None:
+        st.subheader(neutro)
         st.info(FALTA)
         return
     umbral = float(df["umbral_lluvia_mm"].iloc[0]) if "umbral_lluvia_mm" in df.columns else 0.1
@@ -52,11 +55,12 @@ def mostrar(ruta: str | Path | None = None) -> None:
         lectura = "salieron prácticamente las mismas bicis que en las horas secas"
     else:
         lectura = f"salieron en promedio {datos.pct(abs(d))} {'menos' if d < 0 else 'más'} bicis que en las horas secas"
-    st.markdown(
-        f"A la misma hora del día y el mismo tipo de día, en las horas con lluvia {lectura} "
-        f"(comparación sobre {datos.num(r['horas_lluvia'])} horas con lluvia y {datos.num(r['horas_seco'])} "
-        f"horas secas, en {datos.num(r['celdas'])} combinaciones de hora y tipo de día)."
-    )
+    # El titular dice la dirección que dan los datos; si casi no hay diferencia, lo dice así.
+    if abs(d) < 0.02:
+        st.subheader("Con lluvia se usan casi las mismas bicis")
+    else:
+        st.subheader(f"Con lluvia se usan {datos.pct(abs(d), 0)} {'menos' if d < 0 else 'más'} bicis")
+    st.caption("Salidas por hora en horas con lluvia y en horas secas, a la misma hora y el mismo tipo de día.")
 
     largo = df[df["comparable"]].melt(id_vars=["tipo_dia", "hora"], value_vars=list(CONDICIONES),
                                       var_name="condicion", value_name="salidas")
@@ -82,10 +86,15 @@ def mostrar(ruta: str | Path | None = None) -> None:
         .facet(column=alt.Column("tipo_texto:N", title=None, sort=list(TIPOS_DIA.values())))
         .resolve_scale(y="shared")
     )
-    st.altair_chart(grafica)
-    st.caption(
-        f"Clima observado (lo que realmente pasó), no clima pronosticado: es una descripción y no una entrada "
-        f"del modelo, que solo podría usar clima pronosticado. Una hora cuenta como con lluvia si cayeron al "
-        f"menos {datos.num(umbral, 1)} mm en esa hora. Es una asociación, no una prueba de causa. "
-        f"Fuente del clima: Open-Meteo."
-    )
+    grafica = grafica.configure_header(labelFontSize=datos.FUENTE_TITULO)
+    st.altair_chart(datos.estilo_grafica(grafica))
+    datos.como_se_calculo([
+        f"A la misma hora del día y el mismo tipo de día, en las horas con lluvia {lectura} "
+        f"(comparación sobre {datos.num(r['horas_lluvia'])} horas con lluvia y {datos.num(r['horas_seco'])} "
+        f"horas secas, en {datos.num(r['celdas'])} combinaciones de hora y tipo de día).",
+        "Clima observado (lo que realmente pasó), no clima pronosticado: es una descripción y no una entrada "
+        "del modelo, que solo podría usar clima pronosticado.",
+        f"Una hora cuenta como con lluvia si cayeron al menos {datos.num(umbral, 1)} mm en esa hora.",
+        "Es una asociación, no una prueba de causa.",
+        "Fuente del clima: Open-Meteo.",
+    ])

@@ -149,7 +149,9 @@ def test_abre_con_selectores_grafica_y_acciones(datos):
         sin_errores(at)
         del_dia = rec[(rec["fecha"] == dia_simulado(datos, estacion_id)) & (rec["politica"] == clave)]
         assert len(ACCION.findall(textos(at))) == len(del_dia) > 0
-        assert textos(at).count("Riesgo simulado:") == len(del_dia)
+        # Un renglón por tarjeta: el nivel previsto con esa política (antes del traslado) y sin intervenir.
+        assert textos(at).count("Riesgo previsto:") == len(del_dia)
+        assert textos(at).count("Sin intervenir:") == len(del_dia)
         for fila in del_dia.itertuples():  # "13 bicis antes, 2 después"
             assert datos.inventario(fila.inventario_antes, fila.inventario) in textos(at)
 
@@ -193,7 +195,8 @@ def test_cambiar_estacion_dia_y_objetivo_no_falla(datos):
     at = at.run()
     sin_errores(at)
     assert len(graficas(at)) == 1
-    assert "Llegadas por hora" in [s.value for s in at.subheader]
+    assert any("dentro del rango esperado" in s.value for s in at.subheader)
+    assert "La franja es el rango esperado; los puntos, lo que pasó." in [c.value for c in at.caption]
 
 
 def test_estacion_sin_dato_sin_historia_o_sin_simular(datos):

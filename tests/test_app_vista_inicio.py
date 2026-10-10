@@ -59,25 +59,34 @@ def test_inicio_muestra_indicadores_curva_y_hallazgos(datos):
     # Cuatro indicadores, con las cifras de los datos y sin valores vacíos de Python.
     ind = datos.indicadores()
     assert [m.label for m in at.metric] == [
-        "Viajes analizados", "Estaciones", "Riesgo simulado evitado", "Error del pronóstico por hora y estación"]
+        "Viajes analizados", "Estaciones", "Riesgo simulado evitado", "Error del pronóstico"]
     valores = [m.value for m in at.metric]
-    notas = " ".join(c.value for c in at.caption)
-    assert valores[0] == datos.num(ind["viajes_analizados"])
-    assert valores[1] == datos.num(ind["estaciones"])
+    # Bajo cada indicador va una línea; el detalle está en el desplegable "Cómo se calculó".
+    notas = " ".join([c.value for c in at.caption] + [m.value for m in at.markdown])
+    assert valores[0] == datos.redondo(ind["viajes_analizados"])
+    assert valores[1] == datos.redondo(ind["estaciones"])
+    assert f"{datos.num(ind['viajes_analizados'])} viajes" in notas
+    assert f"{datos.num(ind['estaciones'])} en total" in notas
+    assert datos.redondo(15017726) == "15 millones" and datos.redondo(2398) == "2,400"
+    assert datos.redondo(784929) == "785 mil" and datos.redondo(None) == "Sin dato"
     # El riesgo evitado es el de la regla histórica: el rango entre los inventarios iniciales supuestos
     # si la simulación lo reportó; si no, el valor con el presupuesto de referencia.
     rango = ind["sensibilidad"]["rango"].get("historical")
     if rango:
         assert valores[2] == datos.rango_pct(rango["pct_min"], rango["pct_max"])
-        assert "según el inventario inicial que se suponga" in notas
+        assert "depende del inventario inicial que se suponga" in notas
     else:
-        assert valores[2] == datos.pct(ind["referencia"]["politicas"]["historical"]["pct_evitado"])
+        assert valores[2] == datos.pct(ind["referencia"]["politicas"]["historical"]["pct_evitado"], 0)
     assert "Regla histórica, con" in notas
     if ind["comparacion"]["modelo_evita"] == "igual":
         assert "El modelo da prácticamente el mismo resultado" in notas
     # La frase bajo la curva es la que arman los datos (solo dice lo que las cifras sostienen).
     frase = datos.frase_de_la_curva()
-    assert frase and sum(c.value == frase for c in at.caption) == 1
+    assert frase and notas.count(frase) == 1
+    # El orden: los hallazgos van antes de la curva, y la página explica qué es una hora en riesgo.
+    titulos = [s.value for s in at.subheader]
+    assert len(titulos) >= 2 and "None" not in " ".join(titulos)
+    assert notas.count(f"Hora de estación en riesgo: {datos.QUE_ES_RIESGO}.") == 1
     veredictos = datos.modelo_contra_regla()
     assert ("con la mitad, el modelo evita más" in frase) == (
         veredictos["referencia"].get("validacion") == "igual" and veredictos["mitad"].get("validacion") == "mas")
@@ -88,7 +97,8 @@ def test_inicio_muestra_indicadores_curva_y_hallazgos(datos):
     if ind["piso_de_azar"]["pct_evitado"] is not None:
         assert f"Mover las mismas bicis al azar evita {datos.pct(ind['piso_de_azar']['pct_evitado'])}." in notas
     # El error es el del modelo, con el del promedio histórico y el de una sola media como contexto.
-    assert valores[3] == datos.pct(ind["pronostico"]["lgbm"]["salidas"]["wape"])
+    assert valores[3] == datos.pct(ind["pronostico"]["lgbm"]["salidas"]["wape"], 0)
+    assert f"Salidas, con el modelo: {datos.pct(ind['pronostico']['lgbm']['salidas']['wape'])}" in notas
     assert f"promedio histórico: {datos.pct(ind['pronostico']['baseline']['salidas']['wape'])}" in notas
     media_global = (ind["pronostico_piso"].get("media_global") or {}).get("salidas")
     if media_global:
@@ -155,7 +165,7 @@ def test_validacion_y_prueba_final_lado_a_lado(datos, monkeypatch):
     tabla = next(m.value for m in at.markdown if "| Validación | Prueba final |" in m.value)
     assert len(tabla.splitlines()) == 2 + 4
     assert "56.9&nbsp;%" in tabla and "None" not in tabla and "nan" not in tabla and "WAPE" not in tabla
-    assert any("3,241 bicis movidas al día" in c.value for c in at.caption)
+    assert any("3,241 bicis movidas al día" in m.value for m in at.markdown)
     assert any(c.value.startswith("Resultados de simulación: validación y prueba final") for c in at.caption)
 
     # Sin el archivo de la prueba final no hay ni título ni tabla vacía.

@@ -170,8 +170,10 @@ def test_el_riesgo_por_tipo_de_estacion_dice_que_se_muestra(datos):
     aviso = "porcentaje de franjas de estación que quedaron en riesgo alto"
 
     hay_horas = [not datos.riesgo_horas(corte).empty for corte in ("franja", "tipo_estacion")]
-    assert pantalla.count(aviso) == hay_horas.count(False)
-    assert pantalla.count("Horas de estación en riesgo por día.") == hay_horas.count(True)
+    # Las aclaraciones van una sola vez, en el desplegable "Cómo se calculó" de la sección.
+    assert pantalla.count(aviso) == (1 if hay_horas.count(False) else 0)
+    assert pantalla.count("es el intervalo de confianza.") == (1 if hay_horas.count(True) else 0)
+    assert pantalla.count(f"Hora de estación en riesgo: {datos.QUE_ES_RIESGO}.") == 1
 
 
 def test_sin_horas_ni_niveles_de_riesgo_la_pagina_dice_sin_dato(datos, monkeypatch):

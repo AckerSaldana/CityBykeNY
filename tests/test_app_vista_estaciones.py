@@ -95,5 +95,10 @@ def test_abre_con_dos_graficas_y_el_interruptor_vuelve_a_dibujar(datos):
 def test_las_cifras_salen_de_las_tablas(datos):
     at = abrir()
     cifras = {m.label: m.value for m in at.metric}
-    assert cifras["Viajes analizados"] == datos.num(datos.indicadores()["viajes_analizados"])
-    assert cifras["Estaciones"] == datos.num(len(datos.estaciones()))
+    # Cifra redonda en el indicador; la exacta, en la nota de abajo cuando no coinciden.
+    viajes, estaciones = datos.indicadores()["viajes_analizados"], len(datos.estaciones())
+    assert cifras["Viajes analizados"] == datos.redondo(viajes)
+    assert cifras["Estaciones"] == datos.redondo(estaciones)
+    notas = [c.value for c in at.caption]
+    for valor in (viajes, estaciones):
+        assert datos.redondo(valor) == datos.num(valor) or datos.num(valor) in notas
