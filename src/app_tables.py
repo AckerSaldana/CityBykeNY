@@ -419,6 +419,9 @@ def _simulacion(reporte: dict, curva: pd.DataFrame, rec: pd.DataFrame, salida: P
             for corte, clave in claves:
                 for grupo, v in (res.get(clave) or {}).items():
                     v = v if isinstance(v, dict) else {"media": v}
+                    v = v.get("riesgo_por_dia", v)  # por tipo de estación el reporte anida la estadística
+                    if corte == "tipo_estacion" and str(grupo) == "sin tipo":
+                        grupo = "sin_dato"
                     horas.append({"corte": corte, "grupo": str(grupo), "politica": politica,
                                   "riesgo": _f(v.get("media")), "ic_bajo": _f(v.get("ic_bajo")),
                                   "ic_alto": _f(v.get("ic_alto"))})

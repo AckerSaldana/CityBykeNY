@@ -18,6 +18,7 @@ PAGINAS = [
     st.Page("vistas/estaciones_y_rutas.py", title="Estaciones y rutas", url_path="estaciones"),
     st.Page("vistas/pronostico_por_estacion.py", title="Pronóstico por estación", url_path="pronostico"),
     st.Page("vistas/confiabilidad.py", title="Confiabilidad", url_path="confiabilidad"),
+    st.Page("vistas/contexto.py", title="Contexto de las estaciones", url_path="contexto"),
 ]
 
 st.navigation(PAGINAS).run()

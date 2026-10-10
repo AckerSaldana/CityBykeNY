@@ -1,0 +1,9 @@
+"""Página 6: ¿el tipo de estación coincide con los empleos y residentes de alrededor?
+
+El contenido vive en app/seccion_contexto.py (datos de empleo del Censo, LODES).
+"""
+import datos
+import seccion_contexto
+
+datos.encabezado("Contexto de las estaciones")
+seccion_contexto.mostrar()

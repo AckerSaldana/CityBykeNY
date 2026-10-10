@@ -170,6 +170,12 @@ def _tabla(ruta: str, cambio: float) -> pd.DataFrame:
     return pd.read_parquet(ruta)
 
 
+def tabla_pequena(ruta) -> pd.DataFrame:
+    """Lee una tabla agregada pequeña por su ruta. La usan secciones aparte, como la de contexto."""
+    ruta = Path(ruta)
+    return _tabla(str(ruta), ruta.stat().st_mtime)
+
+
 @st.cache_data(show_spinner=False, max_entries=200)
 def _tabla_de_estacion(ruta: str, cambio: float, estacion_id: str) -> pd.DataFrame:
     # El archivo está ordenado por estación: el filtro lee solo su pedazo.

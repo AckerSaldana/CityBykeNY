@@ -119,7 +119,7 @@ def test_no_se_ven_nombres_de_columnas_ni_de_archivos(datos, page):
 def test_el_menu_tiene_las_cinco_paginas_con_acentos():
     codigo = (APP / "Inicio.py").read_text(encoding="utf-8")
     titulos = re.findall(r'st\.Page\("([^"]+)", title="([^"]+)"', codigo)
-    assert [(titulo, ruta) for ruta, titulo in titulos] == list(PAGES.items())
+    assert [(titulo, ruta) for ruta, titulo in titulos][: len(PAGES)] == list(PAGES.items())  # la sexta es la sección de contexto
     assert "st.navigation" in codigo
     for ruta in PAGES.values():
         assert (APP / ruta).exists(), ruta
