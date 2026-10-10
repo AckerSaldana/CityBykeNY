@@ -1,0 +1,30 @@
+# --- Datos pesados: nunca van en Git ---
+# Se conserva solo el .gitkeep para que la carpeta exista al clonar.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+# data/sample SÍ va en Git: son datos sintéticos pequeños para el dashboard.
+
+# --- Entorno de Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Secretos y configuración local ---
+.env
+**/.streamlit/secrets.toml
+
+# --- Sistema operativo y editores ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- Temporales ---
+*.tmp
+*.part
+*.log

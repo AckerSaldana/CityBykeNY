@@ -1,0 +1,35 @@
+# Dependencias directas del proyecto, con versión fija.
+# Probadas con Python 3.12 (ver .python-version).
+#
+# Instalar SIEMPRE junto con constraints.txt, que fija también las
+# dependencias indirectas:
+#
+#     pip install -r requirements.txt -c constraints.txt
+#
+# Si agregas o actualizas un paquete: cambia aquí la versión, reinstala,
+# corre `pytest` y regenera constraints.txt con `pip freeze > constraints.txt`.
+
+# --- Datos ---
+duckdb==1.5.6
+pandas==3.0.6
+pyarrow==25.0.1
+numpy==2.5.3
+pytz==2026.5          # DuckDB lo necesita para devolver fechas con zona horaria
+PyYAML==6.0.3
+requests==2.34.2
+
+# --- Modelos ---
+lightgbm==4.7.0
+scikit-learn==1.9.1
+holidays==0.106
+
+# --- Dashboard ---
+streamlit==1.65.0
+pydeck==0.9.3
+altair==6.3.0
+plotly==7.1.0
+
+# --- Pruebas y notebooks ---
+pytest==9.1.1
+jupyterlab==4.6.4
+ipykernel==7.4.0
